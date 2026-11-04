@@ -115,4 +115,22 @@ describe('automatic action deltas', () => {
     expect(result.pageContent).toContain('Orders')
   })
 
+  it('reports a delta without synthesizing input for a background-dispatched action', async () => {
+    document.body.innerHTML = '<main>Before</main>'
+    const ids = new ElementIds()
+    await runAction('browser_snapshot', {}, { ids, budget: BUDGET })
+    document.querySelector('main')!.textContent = 'After'
+
+    const pending = runAction('browser_action_delta', {}, {
+      ids,
+      budget: BUDGET,
+      includePageDelta: true,
+    })
+    await vi.advanceTimersByTimeAsync(300)
+    const result = await pending
+
+    expect(result.text).toBe('')
+    expect(result.pageContent).toContain('After')
+  })
+
 })

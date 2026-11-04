@@ -2,6 +2,7 @@
   "$comment": "Wire shapes shared by the host plugin and the extension. Both packages have a test that reads this file so a one-sided rename fails a gate instead of silently degrading at runtime.",
   "uploadRequest": {
     "index": 4,
+    "frame": 2,
     "files": [
       {
         "name": "notes.txt",

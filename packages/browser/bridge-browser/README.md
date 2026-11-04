@@ -113,7 +113,7 @@ Tools added in 0.1.0 require extension 0.3.0. Against an older extension they fa
 - `browser_console` and `browser_network` capture only from the moment they are first called on a tab; the buffers are memory-only, cleared when the document's origin changes, and dropped when the tab closes.
 - `browser_evaluate` and `browser_upload_file` are state-changing tools and follow the extension's approval flow; `browser_evaluate` runs in the page world and cannot run on protected pages.
 - `browser_hover`, `browser_drag`, and `browser_click` with `button`/`count`/`modifiers` use real input events when the extension holds a debugger session on the controlled tab, and fall back to synthesized DOM events otherwise; the fallback result says so.
-- Accessible cross-origin iframes are snapshotted and operated with stable `(frame, index)` addresses. Restricted or short-lived frames are reported as unavailable without failing the whole page snapshot.
+- Accessible cross-origin iframes are snapshotted and operated with stable `(frame, index)` addresses. Restricted or short-lived frames are reported as unavailable without failing the whole page snapshot. Every element-addressed tool accepts the optional `frame` from that address — snapshot, find, get_text, click, type, press, hover, select, drag, upload_file and wait — and defaults to the top page.
 - Token rotation is manual (edit `~/.dsh/ext-bridge-token` or set `token` in config); no expiry.
 - The Playwright-driven extension e2e self-skips without a usable Chromium executable or a built extension bundle.
 - Approval is enforced in the extension service worker rather than delegated to model behavior. A future dsh tool-pipeline integration may surface the same policy in other clients.

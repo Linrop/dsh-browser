@@ -13,7 +13,6 @@ import type { ToolError } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
 import {
   allocateFrameBudgets,
   forgetRecoveredSubframe,
-  forgetTabFrames,
   frameDocumentKey,
   frameOrigin,
   listTabFrames,
@@ -38,6 +37,9 @@ import {
   installPageInstrumentation,
   modifierMask,
   movePointer,
+  NAMED_KEY_NAMES,
+  parseKeyStroke,
+  pressKey,
   CONSOLE_PATTERN_BUDGET_MS,
   CONSOLE_PATTERN_MATCH_PREFIX,
   CONSOLE_PATTERN_MAX_LENGTH,
@@ -50,6 +52,7 @@ import {
   type CdpMouseButton,
   type DragPointerMode,
   type EvaluateOutcome,
+  type KeyStroke,
   type ScreenshotCapture,
   type ScreenshotOptions,
 } from './cdp.ts'
@@ -174,7 +177,6 @@ const snapshotDocumentsByTab = new Map<number, Map<number, string>>()
 /** Forget delta/element state whenever the user explicitly follows a new tab. */
 export function resetTabSnapshot(tabId: number): void {
   snapshotDocumentsByTab.delete(tabId)
-  forgetTabFrames(tabId)
 }
 
 /** Whether a successful tool may have changed the controlled tab's page URL. */
@@ -300,6 +302,10 @@ function contentScriptGoneAfterDispatch(error: unknown): boolean {
  * @param call - the tool call, for the status line.
  * @param budget - snapshot budget for the replacement page.
  * @param targetStillAllowed - affinity re-check for the replacement page.
+ * @param before - frame records captured before the action was dispatched.
+ * @param beforeUrl - tab URL observed before the action was dispatched.
+ * @param mayReadPageContent - whether the page-content boundary allows reading
+ *   the replacement document; false returns a status-only success.
  * @returns the success answer carrying the new snapshot, or undefined.
  */
 async function answerNavigatedAfterDispatch(
@@ -309,6 +315,7 @@ async function answerNavigatedAfterDispatch(
   targetStillAllowed: (() => boolean) | undefined,
   before: TabFrame[],
   beforeUrl: string | undefined,
+  mayReadPageContent: boolean,
 ): Promise<ToolAnswer | undefined> {
   if (!NAVIGATION_CANDIDATE_TOOLS.has(call.name) && !STATE_CHANGING_PAGE_TOOLS.has(call.name)) return undefined
   if (targetStillAllowed?.() === false) return undefined
@@ -324,6 +331,12 @@ async function answerNavigatedAfterDispatch(
   // caller must keep its error rather than report a click that never happened.
   if (!replacement) return undefined
   const status = dispatchedActionStatus(call)
+  if (!mayReadPageContent) {
+    return {
+      ok: true,
+      result: { text: `${status} The page navigated. Page content sharing is disabled, so no snapshot was captured.` },
+    }
+  }
   try {
     const snapshot = await snapshotAfterNavigation(
       tabId,
@@ -359,6 +372,8 @@ async function tabDocumentReplaced(tabId: number, beforeUrl: string | undefined)
     const url = tab.url ?? tab.pendingUrl
     return url !== undefined && url !== beforeUrl
   } catch {
+    // A closed tab has no replacement document; treat it as not navigated so
+    // the caller keeps its original failure.
     return false
   }
 }
@@ -1060,6 +1075,29 @@ function parseRealClickOptions(args: Record<string, unknown>): { options: RealCl
 }
 
 /**
+ * Validate and resolve the `browser_press` key before any dispatch.
+ *
+ * An empty key and an unsupported multi-character name are both refused:
+ * synthesizing an arbitrary named key would report a press the browser never
+ * performed.
+ * @param args - tool arguments.
+ * @returns the resolved key, or the `bad-args` answer.
+ */
+function parsePressKeyArg(args: Record<string, unknown>): { stroke: KeyStroke } | { error: ToolAnswer } {
+  const key = typeof args.key === 'string' ? args.key : ''
+  if (key === '') return { error: badArgs('key must not be empty.') }
+  const stroke = parseKeyStroke(key)
+  if (stroke === undefined) {
+    return {
+      error: badArgs(
+        `Unsupported key "${key}". Use a single character, or one of: ${NAMED_KEY_NAMES.join(', ')}.`,
+      ),
+    }
+  }
+  return { stroke }
+}
+
+/**
  * Read the browser facts that decide whether real input reaches a tab.
  *
  * `chrome.windows` is absent on Firefox, and a tab whose window cannot be
@@ -1091,18 +1129,22 @@ async function readRealInputState(tabId: number): Promise<RealInputState> {
   return { tabActive, windowApiAvailable, windowFocused }
 }
 
+/** The focus condition that stopped real input, without the consequence clause. */
+function focusDegradationReason(reason: RealInputUnavailableReason): string {
+  return reason === 'tab-not-active'
+    ? 'the controlled tab is not focused because another tab is active in its window'
+    : reason === 'window-api-unavailable'
+      ? 'this browser build cannot report whether the controlled tab is focused'
+      : 'the controlled tab is not focused because its window is not focused'
+}
+
 /**
  * Explain why real input was replaced by synthesized events.
  * @param reason - blocking condition reported by `realInputVerdict`.
  * @returns the model-facing disclosure appended to the action result.
  */
 function pointerFocusDegradation(reason: RealInputUnavailableReason): string {
-  const detail = reason === 'tab-not-active'
-    ? 'the controlled tab is not focused because another tab is active in its window'
-    : reason === 'window-api-unavailable'
-      ? 'this browser build cannot report whether the controlled tab is focused'
-      : 'the controlled tab is not focused because its window is not focused'
-  return `(synthesized events: ${detail}, so real input would not reach the page)`
+  return `(synthesized events: ${focusDegradationReason(reason)}, so real input would not reach the page)`
 }
 
 /** The coordinate lookup arguments the internal action needs. */
@@ -1187,6 +1229,33 @@ function withPointerDegradation(answer: ToolAnswer, note: string | undefined): T
   }
 }
 
+/**
+ * Replace the synthesized press status with the documented degradation form.
+ *
+ * The content script reports `Sent key "X".`; when real key events were
+ * unavailable the answer must name the synthesized path and its reason
+ * instead of implying the browser performed the key.
+ * @param answer - the content-script path's answer.
+ * @param call - the tool call, for the key name.
+ * @param note - the reason clause, when real key events were unavailable.
+ * @returns the answer with the corrected status line.
+ */
+function withKeyDegradation(answer: ToolAnswer, call: ToolCall, note: string | undefined): ToolAnswer {
+  if (note === undefined || !answer.ok) return answer
+  const key = typeof call.args.key === 'string' ? call.args.key : ''
+  const text = answerText(answer)
+  if (text === undefined) return answer
+  const original = `Sent key ${JSON.stringify(key)}.`
+  const replacement = `Sent key ${JSON.stringify(key)} with synthesized key events ${note}.`
+  const updated = text.startsWith(original)
+    ? `${replacement}${text.slice(original.length)}`
+    : `${text}\n\n${replacement}`
+  return {
+    ...answer,
+    result: { ...(answer.result as Record<string, unknown>), text: updated },
+  }
+}
+
 /** Status line for a real-input action. */
 function pointerStatus(
   kind: PointerKind,
@@ -1210,6 +1279,92 @@ function pointerStatus(
   }
   const pipeline = dragMode === 'native' ? 'native drag events' : 'real mouse events'
   return `Dragged from (${rect.x}, ${rect.y}) to (${to?.x ?? '?'}, ${to?.y ?? '?'}) with ${pipeline} through the browser input pipeline.`
+}
+
+/** Ask the content script for the settled page delta after a real key press. */
+async function readActionDelta(tabId: number, frame: TabFrame, budget: ContentBudget): Promise<string | undefined> {
+  const answer = await sendAction(
+    tabId,
+    { id: 'browser_action_delta', name: 'browser_action_delta', args: {} },
+    frame,
+    budget,
+    true,
+  ) as ToolAnswer
+  return answerPageContent(answer)
+}
+
+/**
+ * Run `browser_press` through real CDP key events.
+ *
+ * Real key events are what move focus (Tab), scroll (arrows), or submit a form
+ * (Enter); a synthesized `KeyboardEvent` never triggers those defaults. When
+ * the debugger, focus, or frame target makes real input impossible, this
+ * function only contributes the degradation reason and the caller runs the
+ * content script's synthesized path.
+ * @param tabId - target tab.
+ * @param tabUrl - current URL, used to refuse protected pages.
+ * @param frames - the tab's frames.
+ * @param call - tool call being dispatched.
+ * @param budget - output budget used for the automatic page delta.
+ * @param includeActionDelta - whether automatic page context is allowed.
+ * @param signal - bridge lifetime.
+ * @param targetStillAllowed - final fail-closed guard.
+ * @param commitAction - marks the withdrawability boundary.
+ * @returns a settled answer, or a degradation notice when the content fallback must run.
+ */
+async function dispatchRealKeyTool(
+  tabId: number,
+  tabUrl: string | undefined,
+  frames: TabFrame[],
+  call: ToolCall,
+  budget: ContentBudget,
+  includeActionDelta: boolean,
+  signal: AbortSignal | undefined,
+  targetStillAllowed: (() => boolean) | undefined,
+  commitAction: (() => void) | undefined,
+): Promise<{ answer?: ToolAnswer; degradedNote?: string } | undefined> {
+  if (call.name !== 'browser_press') return undefined
+  const parsed = parsePressKeyArg(call.args)
+  if ('error' in parsed) return { answer: parsed.error }
+  // Keyboard events go to the focused document, so a non-main frame keeps the
+  // synthesized path whose target element lives in that frame.
+  const frame = frames.find((candidate) => candidate.frameId === 0)
+  if (frame === undefined || requestedFrame(call.args) !== 0 || !isInjectablePage(tabUrl)) {
+    return { degradedNote: KEY_IFRAME_DEGRADATION }
+  }
+  if (isCancelled(call, signal)) return { answer: cancelled() }
+  if (targetStillAllowed?.() === false) return { answer: targetChanged() }
+  const verdict = realInputVerdict(await readRealInputState(tabId))
+  if (!verdict.usable) return { degradedNote: `(${focusDegradationReason(verdict.reason)}, so real input would not reach the page)` }
+  try {
+    await ensureAttached(tabId)
+  } catch (error: unknown) {
+    if (error instanceof DebuggerUnavailableError) return { degradedNote: KEY_DEBUGGER_DEGRADATION }
+    return { answer: toolFailure(error) }
+  }
+  if (isCancelled(call, signal)) return { answer: cancelled() }
+  if (targetStillAllowed?.() === false) return { answer: targetChanged() }
+  if (STATE_CHANGING_PAGE_TOOLS.has(call.name)) commitAction?.()
+  try {
+    await pressKey(tabId, parsed.stroke)
+  } catch (error: unknown) {
+    return { answer: toolFailure(error) }
+  }
+  const key = typeof call.args.key === 'string' ? call.args.key : ''
+  const status = `Sent key ${JSON.stringify(key)} with real key events.`
+  const hasSnapshotBaseline = snapshotDocumentsByTab.get(tabId)?.get(0) === frameDocumentKey(frame)
+  if (!includeActionDelta || !hasSnapshotBaseline) return { answer: { ok: true, result: { text: status } } }
+  try {
+    const pageContent = await readActionDelta(tabId, frame, budget)
+    return {
+      answer: pageContent === undefined
+        ? { ok: true, result: { text: status } }
+        : { ok: true, result: { text: wrapActionDelta(status, pageContent, frame, budget.maxChars) } },
+    }
+  } catch {
+    // The key already landed; a missing delta is not a failure.
+    return { answer: { ok: true, result: { text: status } } }
+  }
 }
 
 /**
@@ -1333,6 +1488,8 @@ const POINTER_OFFSCREEN_DEGRADATION = 'The target could not be kept fully inside
 const POINTER_NATIVE_DRAG_DEGRADATION = 'The browser input pipeline could not dispatch native drag events for this target. This drag was replayed inside the page instead; canvas and system-level drop targets may ignore it.'
 const POINTER_SYNTHETIC_CLICK_SEMANTICS = 'The requested button, click count, and modifiers were simulated on those synthesized events instead of the browser input pipeline.'
 const POINTER_SYNTHETIC_DRAG_SEMANTICS = 'This drag used synthesized drag events inside the page.'
+const KEY_DEBUGGER_DEGRADATION = '(the browser debugger was unavailable, so this key was synthesized as DOM events inside the page)'
+const KEY_IFRAME_DEGRADATION = '(this target is an iframe, so this key was synthesized as DOM events inside that frame)'
 
 /**
  * Add the click-semantics disclosure to a synthesized click's degradation note.
@@ -1410,6 +1567,10 @@ export async function dispatchToolCall(
     const parsedClick = parseRealClickOptions(call.args)
     if ('error' in parsedClick) return parsedClick.error
   }
+  if (call.name === 'browser_press') {
+    const parsedPress = parsePressKeyArg(call.args)
+    if ('error' in parsedPress) return parsedPress.error
+  }
   if (!isInjectablePage(tab.url) && !TAB_NATIVE_TOOLS.has(call.name)) {
     return unavailable('The current page DOM is protected by the browser. DOM actions and text reads that need the content script are unavailable on this page, while snapshot metadata, navigate, back, forward, reload, screenshot, resize, console and network telemetry, and JavaScript evaluation remain available.')
   }
@@ -1461,12 +1622,27 @@ export async function dispatchToolCall(
   )
   if (pointerAttempt?.answer !== undefined) return pointerAttempt.answer
   const pointerDegradedNote = degradationNoteFor(call, pointerAttempt?.degradedNote)
+  const keyAttempt = await dispatchRealKeyTool(
+    tab.id,
+    tab.url,
+    executionFrames,
+    call,
+    effectiveBudget,
+    tabManagement.unrestrictedAccess || sharePageContent === 'auto',
+    signal,
+    targetStillAllowed,
+    tabManagement.commitAction,
+  )
+  if (keyAttempt?.answer !== undefined) return keyAttempt.answer
+  const keyDegradedNote = keyAttempt?.degradedNote
+  const finishAnswer = (answer: ToolAnswer): ToolAnswer =>
+    withKeyDegradation(withPointerDegradation(answer, pointerDegradedNote), call, keyDegradedNote)
   if (!isInjectablePage(tab.url)) {
     return await dispatchTabNativeTool(tab.id, tab.url, tab.title, tab.windowId, call, effectiveBudget, signal, targetStillAllowed, tabManagement.commitAction)
       ?? unavailable('The current page DOM is protected by the browser.')
   }
   try {
-    return withPointerDegradation(await dispatchOnce(
+    return finishAnswer(await dispatchOnce(
       tab.id,
       executionFrames,
       call,
@@ -1476,7 +1652,7 @@ export async function dispatchToolCall(
       tabManagement.unrestrictedAccess || sharePageContent === 'auto',
       tabManagement.commitAction,
       tabManagement.rollbackActionCommit,
-    ), pointerDegradedNote)
+    ))
   } catch (error: unknown) {
     if (isCancelled(call, signal)) return cancelled()
     // A dispatched action that navigates the page takes its answering document
@@ -1484,9 +1660,17 @@ export async function dispatchToolCall(
     // timeout on the response. When the document really was replaced, the action
     // succeeded: report it with the replacement page's snapshot instead of an
     // error the model would retry into a duplicate click.
-    if (contentScriptGoneAfterDispatch(error) || !contentScriptReceiverMissing(error)) {
-      const navigated = await answerNavigatedAfterDispatch(tab.id, call, effectiveBudget, targetStillAllowed, executionFrames, tab.url)
-      if (navigated !== undefined) return navigated
+    {
+      const navigated = await answerNavigatedAfterDispatch(
+        tab.id,
+        call,
+        effectiveBudget,
+        targetStillAllowed,
+        executionFrames,
+        tab.url,
+        tabManagement.unrestrictedAccess || sharePageContent === 'auto',
+      )
+      if (navigated !== undefined) return finishAnswer(navigated)
     }
     if (!contentScriptReceiverMissing(error)) {
       return unavailable('The content script stopped responding after the operation was dispatched. Call browser_snapshot before continuing.')
@@ -1516,7 +1700,7 @@ export async function dispatchToolCall(
           return unavailable('The page changed while the content script was loading. Call browser_snapshot again before retrying.')
         }
       }
-      return withPointerDegradation(await dispatchOnce(
+      return finishAnswer(await dispatchOnce(
         tab.id,
         refreshedFrames,
         call,
@@ -1526,7 +1710,7 @@ export async function dispatchToolCall(
         tabManagement.unrestrictedAccess || sharePageContent === 'auto',
         tabManagement.commitAction,
         tabManagement.rollbackActionCommit,
-      ), pointerDegradedNote)
+      ))
     } catch {
       return unavailable('The content script did not answer after it was loaded. Call browser_snapshot again before retrying.')
     }

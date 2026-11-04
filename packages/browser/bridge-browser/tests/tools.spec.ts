@@ -269,7 +269,7 @@ describe('registerBrowserTools', () => {
     const { ctx, bridge, registered } = makeHarness()
     registerBrowserTools(ctx, bridge, OPTIONS)
     const byName = new Map(registered.map((entry) => [entry.name, entry.definition]))
-    for (const name of ['browser_click', 'browser_type', 'browser_press', 'browser_scroll', 'browser_get_text', 'browser_wait']) {
+    for (const name of ['browser_click', 'browser_type', 'browser_press', 'browser_scroll', 'browser_get_text', 'browser_wait', 'browser_select', 'browser_hover', 'browser_drag', 'browser_upload_file', 'browser_find']) {
       const params = byName.get(name)!.parameters as { properties: { frame?: { type?: unknown } } }
       expect(params.properties.frame?.type).toBe('number')
     }
@@ -277,10 +277,58 @@ describe('registerBrowserTools', () => {
       const params = byName.get(name)!.parameters as { properties: { frame?: unknown } }
       expect(params.properties.frame).toBeUndefined()
     }
-    for (const name of ['browser_evaluate', 'browser_screenshot', 'browser_resize', 'browser_upload_file', 'browser_select', 'browser_hover', 'browser_drag', 'browser_find', 'browser_console', 'browser_network', 'browser_batch']) {
+    for (const name of ['browser_evaluate', 'browser_screenshot', 'browser_resize', 'browser_console', 'browser_network', 'browser_batch']) {
       const params = byName.get(name)!.parameters as { properties: { frame?: unknown } }
       expect(params.properties.frame).toBeUndefined()
     }
+  })
+
+  it('routes select, hover, drag, upload, and find into a caller-selected frame', async () => {
+    const { ctx, bridge, requestTool, registered } = makeHarness()
+    registerBrowserTools(ctx, bridge, OPTIONS)
+    const byName = new Map(registered.map((entry) => [entry.name, entry.definition]))
+    const exec = { signal: new AbortController().signal }
+    const upload = { files: [{ name: 'notes.txt', mime_type: 'text/plain', base64: 'aGVsbG8=' }] }
+    const cases: { name: string; noFrame: Record<string, unknown>; framed: Record<string, unknown> }[] = [
+      { name: 'browser_select', noFrame: { index: 5, value: 'b' }, framed: { index: 5, value: 'b', frame: 3 } },
+      { name: 'browser_hover', noFrame: { index: 6 }, framed: { index: 6, frame: 3 } },
+      { name: 'browser_drag', noFrame: { from_index: 1, to_index: 2 }, framed: { from_index: 1, to_index: 2, frame: 3 } },
+      { name: 'browser_upload_file', noFrame: { index: 4, ...upload }, framed: { index: 4, ...upload, frame: 3 } },
+      { name: 'browser_find', noFrame: { query: 'login' }, framed: { query: 'login', frame: 3 } },
+    ]
+    for (const entry of cases) {
+      const run = executable(byName.get(entry.name)!)
+      await run(entry.noFrame, exec)
+      expect(requestTool).toHaveBeenLastCalledWith(entry.name, entry.noFrame, exec.signal, 1_000)
+      // Only an explicit frame id belongs on the wire; omitting it keeps the
+      // old top-page message byte-for-byte.
+      expect(requestTool.mock.calls.at(-1)?.[1]).not.toHaveProperty('frame')
+      await run(entry.framed, exec)
+      expect(requestTool).toHaveBeenLastCalledWith(entry.name, entry.framed, exec.signal, 1_000)
+    }
+
+    // browser_batch dispatches raw args straight into the same handlers, over
+    // the batch's own scoped signal.
+    await executable(byName.get('browser_batch')!)({
+      actions: [{ name: 'browser_find', args: { query: 'login', frame: 2 } }],
+    }, exec)
+    expect(requestTool.mock.calls.at(-1)!.slice(0, 2))
+      .toEqual(['browser_find', { query: 'login', frame: 2 }])
+    const batchedInvalid = await executable(byName.get('browser_batch')!)({
+      actions: [{ name: 'browser_hover', args: { index: 1, frame: -1 } }],
+    }, exec)
+    expect(batchedInvalid.text).toContain('frame must be a non-negative integer')
+
+    // A frame the host cannot represent is refused before the bridge call:
+    // the declared `number` type rejects a string, and the handler rejects a
+    // negative or fractional id that the type alone cannot catch.
+    for (const entry of cases) {
+      for (const frame of [-1, 1.5, '2']) {
+        await expect(executable(byName.get(entry.name)!)({ ...entry.noFrame, frame }, exec))
+          .rejects.toThrow(/frame must be a non-negative integer|"frame" must be a number/)
+      }
+    }
+    expect(requestTool).toHaveBeenCalledTimes(cases.length * 2 + 1)
   })
 
   it('falls back to a no-text payload when the extension returns non-text', async () => {

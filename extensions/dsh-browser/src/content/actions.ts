@@ -184,6 +184,8 @@ export async function runAction(action: string, args: Record<string, unknown>, c
       return settledElementAction(hoverAction(args, ctx.ids), ctx)
     case 'browser_pointer_rect':
       return await pointerRectResult(args, ctx)
+    case 'browser_action_delta':
+      return await actionDeltaResult(ctx)
     case 'browser_drag':
       return settledElementAction(dragAction(args, ctx.ids), ctx)
     case 'browser_upload_file':
@@ -211,6 +213,20 @@ async function pointerRectResult(args: Record<string, unknown>, ctx: ActionConte
     || args.from !== undefined || args.to !== undefined
   const rects = drag ? dragRectsAction(args, ctx.ids) : pointerRectAction(args, ctx.ids)
   return withPageDelta(JSON.stringify(rects), ctx)
+}
+
+/**
+ * Report the page delta caused by a background-dispatched real input event.
+ *
+ * The background already sent the key through the browser input pipeline, so
+ * this action must only settle and share context, never synthesize the input
+ * a second time.
+ * @param ctx - action context carrying the id registry and delta gate.
+ * @returns the settled page delta, with an empty status when none is shared.
+ */
+async function actionDeltaResult(ctx: ActionContext): Promise<ActionResult> {
+  await waitForPageSettled(ACTION_SETTLE)
+  return withPageDelta('', ctx)
 }
 
 function snapshotAction(args: Record<string, unknown>, ctx: ActionContext): ActionResult {

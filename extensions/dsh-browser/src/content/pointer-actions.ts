@@ -40,7 +40,6 @@ const DRAG_EVENT_TYPES = ['dragstart', 'drag', 'dragenter', 'dragover', 'draglea
  * @returns true when the element or an ancestor looks like a native DnD target.
  */
 function hasNativeDragSemantics(el: Element | null): boolean {
-  if (el === null) return false
   for (let node: Element | null = el; node !== null; node = node.parentElement) {
     const draggable = node.getAttribute('draggable')
     if (draggable !== null && draggable !== 'false') return true
@@ -49,8 +48,9 @@ function hasNativeDragSemantics(el: Element | null): boolean {
       if (typeof Reflect.get(node, `on${type}`) === 'function') return true
     }
   }
-  // Drop zones often bind document- or window-level drag handlers.
-  for (const holder of [document, window]) {
+  // Drop zones often bind document- or window-level drag handlers; the
+  // document element carries the inline handlers written on `<html>`.
+  for (const holder of [document, document.documentElement, window]) {
     for (const type of DRAG_EVENT_TYPES) {
       if (typeof Reflect.get(holder, `on${type}`) === 'function') return true
     }

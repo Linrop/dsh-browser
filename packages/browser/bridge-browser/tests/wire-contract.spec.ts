@@ -18,6 +18,7 @@ const FIXTURE_URL = new URL('../../../../contract/wire-fixtures.json', import.me
 
 interface UploadFixture {
   index: number
+  frame: number
   files: { name: string; mime_type: string; base64: string }[]
 }
 
@@ -87,7 +88,11 @@ describe('wire fixtures', () => {
     const exec = { signal: new AbortController().signal }
 
     await executable(tool.definition)(
-      { index: fixtures.uploadRequest.index, files: fixtures.uploadRequest.files },
+      {
+        index: fixtures.uploadRequest.index,
+        frame: fixtures.uploadRequest.frame,
+        files: fixtures.uploadRequest.files,
+      },
       exec,
     )
 
@@ -113,7 +118,11 @@ describe('wire fixtures', () => {
     const exec = { signal: new AbortController().signal }
 
     const result = await executable(tool.definition)(
-      { index: fixtures.uploadRequest.index, files: fixtures.uploadRequest.files },
+      {
+        index: fixtures.uploadRequest.index,
+        frame: fixtures.uploadRequest.frame,
+        files: fixtures.uploadRequest.files,
+      },
       exec,
     )
 

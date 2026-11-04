@@ -29,6 +29,8 @@ import {
   installPageInstrumentation,
   isDebuggerAvailable,
   noteTabNavigation,
+  parseKeyStroke,
+  pressKey,
   pushConsoleEntry,
   readConsoleMessages,
   readNetworkRequests,
@@ -941,6 +943,81 @@ describe('real input through the Input domain', () => {
     await expect(dragPointer(id, { x: 1, y: 2 }, { x: 3, y: 4 }, { nativeDrag: true }))
       .rejects.toBeInstanceOf(NativeDragUnavailableError)
     await detachTab(id)
+  })
+})
+
+describe('real key injection', () => {
+  it('dispatches keyDown, char, and keyUp for a character', async () => {
+    const commands: Array<{ method: string; params?: object }> = []
+    sendCommandBehavior = async (method, params) => {
+      commands.push({ method, params })
+      return {}
+    }
+    const id = tabId()
+    await pressKey(id, parseKeyStroke('a')!)
+    const keyEvents = commands.filter((command) => command.method === 'Input.dispatchKeyEvent')
+    expect(keyEvents.map((command) => (command.params as { type: string }).type)).toEqual(['keyDown', 'char', 'keyUp'])
+    expect(keyEvents[0]?.params).toMatchObject({
+      key: 'a',
+      code: 'KeyA',
+      windowsVirtualKeyCode: 65,
+      nativeVirtualKeyCode: 65,
+    })
+    expect(keyEvents[1]?.params).toMatchObject({ text: 'a', unmodifiedText: 'a' })
+    await detachTab(id)
+  })
+
+  it('maps Tab to a keyDown and keyUp with its code and key code', async () => {
+    const commands: Array<{ method: string; params?: object }> = []
+    sendCommandBehavior = async (method, params) => {
+      commands.push({ method, params })
+      return {}
+    }
+    const id = tabId()
+    await pressKey(id, parseKeyStroke('Tab')!)
+    const keyEvents = commands.filter((command) => command.method === 'Input.dispatchKeyEvent')
+    expect(keyEvents.map((command) => (command.params as { type: string }).type)).toEqual(['keyDown', 'keyUp'])
+    expect(keyEvents[0]?.params).toMatchObject({
+      key: 'Tab',
+      code: 'Tab',
+      windowsVirtualKeyCode: 9,
+      nativeVirtualKeyCode: 9,
+    })
+    await detachTab(id)
+  })
+
+  it('refuses empty and unnamed multi-character keys', () => {
+    expect(parseKeyStroke('')).toBeUndefined()
+    expect(parseKeyStroke('F13')).toBeUndefined()
+    expect(parseKeyStroke('Tab')).toMatchObject({ key: 'Tab', code: 'Tab' })
+  })
+})
+
+describe('evaluate exception redaction', () => {
+  it('masks API keys and bearer tokens in a thrown error message', async () => {
+    const token = 'sk-live-abcdefghijklmnop'
+    const bearer = 'Bearer abcdefghijklmnop'
+    sendCommandBehavior = async (method) => {
+      if (method !== 'Runtime.evaluate') return {}
+      return {
+        exceptionDetails: {
+          exception: { description: `Error: request failed with ${token}\n    at send (${bearer})` },
+        },
+      }
+    }
+    const outcome = await evaluateInPage(tabId(), 'throw new Error("boom")', true)
+    expect(outcome.exception).toContain('[BLOCKED: api key]')
+    expect(outcome.exception).toContain('[BLOCKED: bearer token]')
+    expect(outcome.exception).not.toContain(token)
+    expect(outcome.exception).not.toContain(bearer)
+    expect(formatEvaluationResult({ exception: outcome.exception! })).not.toContain(token)
+  })
+
+  it('masks credentials in a formatted exception outcome', () => {
+    const token = 'sk-proj-abcdefghijklmnop'
+    const output = formatEvaluationResult({ exception: `JavaScript execution error: ${token}` })
+    expect(output).toContain('[BLOCKED: api key]')
+    expect(output).not.toContain(token)
   })
 })
 

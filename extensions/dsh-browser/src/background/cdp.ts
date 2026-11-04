@@ -33,7 +33,7 @@ export const MAX_LOGS_PER_TAB = 10_000
  * reattach. Keeping a bounded identity set makes that replay idempotent
  * without growing with the buffer or the page's lifetime.
  */
-export const MAX_CONSOLE_DEDUPE_KEYS = 5_000
+export const MAX_CONSOLE_DEDUPE_KEYS = MAX_LOGS_PER_TAB
 
 /** Network requests retained per tab. */
 export const MAX_REQUESTS_PER_TAB = 1_000
@@ -627,6 +627,105 @@ async function dispatchNativeDrag(
   await dispatchDragEvent(tabId, 'drop', to, modifiers)
 }
 
+// ---- Real keys through the Input domain ----
+
+/**
+ * One key the protocol can dispatch.
+ *
+ * `text` is set for keys that produce a character, so the caller can send a
+ * `char` event after the `keyDown` without inserting the character twice.
+ */
+export interface KeyStroke {
+  key: string
+  code: string
+  windowsVirtualKeyCode: number
+  nativeVirtualKeyCode: number
+  text?: string
+}
+
+/**
+ * Named keys with their US-layout virtual key codes.
+ *
+ * Only keys the tool documents are mapped; an unmapped multi-character name is
+ * refused rather than guessed, because a wrong code produces a different
+ * default action than the caller asked for.
+ */
+const NAMED_KEY_STROKES: Record<string, KeyStroke> = {
+  Tab: { key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9, nativeVirtualKeyCode: 9 },
+  Enter: { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, text: '\r' },
+  Escape: { key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 },
+  Backspace: { key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 },
+  Delete: { key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46, nativeVirtualKeyCode: 46 },
+  ArrowLeft: { key: 'ArrowLeft', code: 'ArrowLeft', windowsVirtualKeyCode: 37, nativeVirtualKeyCode: 37 },
+  ArrowUp: { key: 'ArrowUp', code: 'ArrowUp', windowsVirtualKeyCode: 38, nativeVirtualKeyCode: 38 },
+  ArrowRight: { key: 'ArrowRight', code: 'ArrowRight', windowsVirtualKeyCode: 39, nativeVirtualKeyCode: 39 },
+  ArrowDown: { key: 'ArrowDown', code: 'ArrowDown', windowsVirtualKeyCode: 40, nativeVirtualKeyCode: 40 },
+  Home: { key: 'Home', code: 'Home', windowsVirtualKeyCode: 36, nativeVirtualKeyCode: 36 },
+  End: { key: 'End', code: 'End', windowsVirtualKeyCode: 35, nativeVirtualKeyCode: 35 },
+  PageUp: { key: 'PageUp', code: 'PageUp', windowsVirtualKeyCode: 33, nativeVirtualKeyCode: 33 },
+  PageDown: { key: 'PageDown', code: 'PageDown', windowsVirtualKeyCode: 34, nativeVirtualKeyCode: 34 },
+  Space: { key: ' ', code: 'Space', windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32, text: ' ' },
+}
+
+/** Named keys accepted by {@link parseKeyStroke}. */
+export const NAMED_KEY_NAMES: readonly string[] = Object.keys(NAMED_KEY_STROKES)
+
+/**
+ * Resolve a `browser_press` key name to protocol key fields.
+ *
+ * A single character is typed as text; a known name gets its documented code;
+ * any other multi-character name is unsupported.
+ * @param key - the tool's `key` argument.
+ * @returns the key fields, or undefined for an empty or unsupported name.
+ */
+export function parseKeyStroke(key: string): KeyStroke | undefined {
+  const named = NAMED_KEY_STROKES[key]
+  if (named !== undefined) return named
+  const characters = Array.from(key)
+  if (characters.length !== 1) return undefined
+  const character = characters[0]!
+  const isLetter = /^[a-z]$/i.test(character)
+  const isDigit = /^[0-9]$/.test(character)
+  return {
+    key: character,
+    code: isLetter ? `Key${character.toUpperCase()}` : isDigit ? `Digit${character}` : '',
+    windowsVirtualKeyCode: isLetter || isDigit ? character.toUpperCase().charCodeAt(0) : 0,
+    nativeVirtualKeyCode: isLetter || isDigit ? character.toUpperCase().charCodeAt(0) : 0,
+    text: character,
+  }
+}
+
+/**
+ * Dispatch one real key press through the browser input pipeline.
+ *
+ * A `keyDown` without text lets the browser perform its default action (focus
+ * movement, form submission); a following `char` inserts character keys; the
+ * `keyUp` completes the gesture.
+ * @param tabId - target tab.
+ * @param stroke - key fields resolved by {@link parseKeyStroke}.
+ * @param modifiers - protocol modifier bit mask.
+ */
+export async function pressKey(tabId: number, stroke: KeyStroke, modifiers = 0): Promise<void> {
+  await ensureAttached(tabId)
+  const base = {
+    key: stroke.key,
+    code: stroke.code,
+    windowsVirtualKeyCode: stroke.windowsVirtualKeyCode,
+    nativeVirtualKeyCode: stroke.nativeVirtualKeyCode,
+    modifiers,
+  }
+  await send(tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', ...base })
+  if (stroke.text !== undefined) {
+    await send(tabId, 'Input.dispatchKeyEvent', {
+      type: 'char',
+      ...base,
+      text: stroke.text,
+      unmodifiedText: stroke.text,
+    })
+  }
+  await send(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', ...base })
+}
+
 // ---- Console and network telemetry ----
 
 /** One console message or page exception kept for `browser_console`. */
@@ -791,23 +890,30 @@ function consoleEntryKey(message: CapturedConsoleInput): string {
  * buffer, and the identity set stays bounded independently of the buffer.
  * @param tabId - tab the entry belongs to.
  * @param message - console entry, with no timestamp when the source omits one.
- * @param dedupeLimit - identities to remember, oldest evicted first.
+ * @param options - identity budget, or an options object.
+ * @param options.dedupeLimit - identities to remember, oldest evicted first.
+ * @param options.dedupe - whether the entry may be a protocol replay; the
+ *   page-world hook never replays, so it passes false.
  * @returns true when the entry was buffered, false for a replayed duplicate.
  */
 export function pushConsoleEntry(
   tabId: number,
   message: CapturedConsoleInput,
-  dedupeLimit = MAX_CONSOLE_DEDUPE_KEYS,
+  options: number | { dedupeLimit?: number; dedupe?: boolean } = {},
 ): boolean {
   const buffer = consoleBufferFor(tabId)
   const key = consoleEntryKey(message)
-  if (buffer.keys.has(key)) return false
+  const resolved = typeof options === 'number' ? { dedupeLimit: options } : options
+  const dedupe = resolved.dedupe ?? true
+  if (dedupe && buffer.keys.has(key)) return false
   buffer.messages.push({
     ...message,
     text: redactModelText(message.text),
     timestamp: message.timestamp ?? Date.now(),
     ...(message.url === undefined ? {} : { url: redactUrlForModel(message.url) }),
   })
+  if (!dedupe) return true
+  const dedupeLimit = resolved.dedupeLimit ?? MAX_CONSOLE_DEDUPE_KEYS
   buffer.keys.add(key)
   while (buffer.keys.size > dedupeLimit) {
     const oldest = buffer.keys.values().next()
@@ -1041,7 +1147,7 @@ export function recordInstrumentEntry(tabId: number, entry: InstrumentEntry): vo
       ...(entry.line === undefined ? {} : { line: entry.line }),
       ...(entry.column === undefined ? {} : { column: entry.column }),
       timestamp: entry.timestamp,
-    })
+    }, { dedupe: false })
     return
   }
   const requestId = `${entry.method} ${entry.url} ${entry.timestamp}`
@@ -1585,7 +1691,7 @@ export async function evaluateInPage(tabId: number, code: string, awaitPromise =
     const detail = error instanceof Error ? error.message : String(error)
     if (/object reference chain is too long|could not (?:be )?serializ|circular/i.test(detail)) {
       throw new JsResultNotSerializableError(
-        `The page value cannot be serialized. Return a string instead, for example: return JSON.stringify(value). (${detail})`,
+        `The page value cannot be serialized. Return a string instead, for example: return JSON.stringify(value). (${redactString(detail)})`,
       )
     }
     throw error
@@ -1600,7 +1706,10 @@ export async function evaluateInPage(tabId: number, code: string, awaitPromise =
     const exception = typeof details.exception === 'object' && details.exception !== null
       ? details.exception as RemoteObjectLike
       : undefined
-    const text = exception?.description ?? (typeof details.text === 'string' ? details.text : 'Uncaught exception')
+    const rawText = exception?.description ?? (typeof details.text === 'string' ? details.text : 'Uncaught exception')
+    // A thrown Error can embed a credential in its message or stack; the same
+    // text rules that cover results and console output cover it here.
+    const text = redactString(rawText)
     if (/timed out|timeout/i.test(text)) {
       return { exception: 'Execution timeout: code exceeded 30-second limit' }
     }
@@ -1621,6 +1730,8 @@ const COOKIE_KEY = /cookie/i
 const JWT_SHAPE = /^eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}$/
 const BASE64_SHAPE = /^[A-Za-z0-9+/]{40,}={0,2}$/
 const HEX_SHAPE = /^(?:0x)?[0-9a-fA-F]{32,}$/
+const API_KEY_SHAPE = /\b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}/g
+const BEARER_SHAPE = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi
 
 /** Longest single string kept before truncation. */
 export const MAX_STRING_VALUE = 1_000
@@ -1651,7 +1762,10 @@ function redactString(value: string): string {
   if (JWT_SHAPE.test(value)) return '[BLOCKED: jwt data]'
   if (BASE64_SHAPE.test(value)) return '[BLOCKED: base64 data]'
   if (HEX_SHAPE.test(value)) return '[BLOCKED: hex data]'
-  return value.length > MAX_STRING_VALUE ? `${value.slice(0, MAX_STRING_VALUE)}…[truncated]` : value
+  const masked = value
+    .replace(BEARER_SHAPE, '[BLOCKED: bearer token]')
+    .replace(API_KEY_SHAPE, '[BLOCKED: api key]')
+  return masked.length > MAX_STRING_VALUE ? `${masked.slice(0, MAX_STRING_VALUE)}…[truncated]` : masked
 }
 
 /**
@@ -1721,7 +1835,7 @@ export function redactForModel(
  * @returns the text, with credentials already replaced.
  */
 export function formatEvaluationResult(outcome: EvaluateOutcome): string {
-  if (outcome.exception !== undefined) return outcome.exception
+  if (outcome.exception !== undefined) return redactString(outcome.exception)
   if (outcome.description !== undefined) return `Result: ${JSON.stringify(redactString(outcome.description))}`
   const redacted = redactForModel(outcome.value)
   let json: string
