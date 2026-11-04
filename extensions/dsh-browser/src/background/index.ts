@@ -116,7 +116,7 @@ export interface Settings {
 }
 
 /** Visible-work surfaces the user may choose between. */
-export type IndicatorMode = 'badge' | 'badge-overlay' | 'off'
+export type IndicatorMode = 'badge-overlay' | 'off'
 
 const SETTINGS_DEFAULTS: Settings = {
   // 空地址 = 自动探测本机 dsh（零配置）；手动填地址时优先手动。
@@ -341,9 +341,10 @@ function normalizeSettings(candidate: Settings): Settings {
     trustedActionOrigins: trusted,
     approvalNotifications: candidate.approvalNotifications !== false,
     autoResumeSession: candidate.autoResumeSession !== false,
-    indicatorMode: candidate.indicatorMode === 'badge' || candidate.indicatorMode === 'off'
-      ? candidate.indicatorMode
-      : 'badge-overlay',
+    // The dot is the only visible-work surface that shows WHERE work happens,
+    // and there is no settings surface to switch it back on, so any legacy
+    // `badge` (or absent) value resolves to the overlay. `off` stays honoured.
+    indicatorMode: candidate.indicatorMode === 'off' ? 'off' : 'badge-overlay',
     tabIsolation: candidate.tabIsolation !== false,
     keepAliveEnabled: candidate.keepAliveEnabled !== false,
   }

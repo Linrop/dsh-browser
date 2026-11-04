@@ -170,10 +170,8 @@ afterEach(() => {
 })
 
 describe('visible work indicator', () => {
-  it('shows the brand badge while a tool call runs and clears it afterwards', async () => {
-    const chromeMock = mockChrome({
-      settings: { trustedActionOrigins: ['https://app.example'], indicatorMode: 'badge' },
-    })
+  it('shows the brand badge and the in-page dot while a tool call runs', async () => {
+    const chromeMock = mockChrome({ settings: { trustedActionOrigins: ['https://app.example'] } })
     vi.stubGlobal('WebSocket', FakeWebSocket)
     await import('../src/background/index.ts')
     const { socket, sessionId } = await connectWithSession(chromeMock)
@@ -193,8 +191,8 @@ describe('visible work indicator', () => {
     expect(chromeMock.action.setBadgeBackgroundColor).toHaveBeenCalledWith({ color: '#4d6bfe' })
     expect(chromeMock.action.setBadgeTextColor).toHaveBeenCalledWith({ color: '#ffffff' })
     expect(chromeMock.action.setBadgeText).toHaveBeenLastCalledWith({ text: '' })
-    // Badge-only mode asks for no in-page dot.
-    expect(indicatorStates(chromeMock)).toEqual([])
+    // A tool call pulses the dot, then leaves it static while the binding lasts.
+    expect(indicatorStates(chromeMock)).toEqual(['pulsing', 'static'])
   })
 
   it('labels the worked tab group and drives the in-page dot in overlay mode', async () => {
