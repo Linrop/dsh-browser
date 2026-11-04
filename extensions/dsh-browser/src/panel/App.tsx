@@ -578,7 +578,7 @@ export function App(): React.JSX.Element {
         trustedActionOrigins: raw?.trustedActionOrigins ?? [],
         approvalNotifications: raw?.approvalNotifications ?? true,
         autoResumeSession: raw?.autoResumeSession ?? true,
-        indicatorMode: raw?.indicatorMode ?? 'badge',
+        indicatorMode: raw?.indicatorMode ?? 'badge-overlay',
         tabIsolation: raw?.tabIsolation ?? true,
         keepAliveEnabled: raw?.keepAliveEnabled ?? true,
       })

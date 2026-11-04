@@ -127,7 +127,7 @@ const SETTINGS_DEFAULTS: Settings = {
   trustedActionOrigins: [],
   approvalNotifications: true,
   autoResumeSession: true,
-  indicatorMode: 'badge',
+  indicatorMode: 'badge-overlay',
   tabIsolation: true,
   keepAliveEnabled: true,
 }
@@ -341,9 +341,9 @@ function normalizeSettings(candidate: Settings): Settings {
     trustedActionOrigins: trusted,
     approvalNotifications: candidate.approvalNotifications !== false,
     autoResumeSession: candidate.autoResumeSession !== false,
-    indicatorMode: candidate.indicatorMode === 'badge-overlay' || candidate.indicatorMode === 'off'
+    indicatorMode: candidate.indicatorMode === 'badge' || candidate.indicatorMode === 'off'
       ? candidate.indicatorMode
-      : 'badge',
+      : 'badge-overlay',
     tabIsolation: candidate.tabIsolation !== false,
     keepAliveEnabled: candidate.keepAliveEnabled !== false,
   }

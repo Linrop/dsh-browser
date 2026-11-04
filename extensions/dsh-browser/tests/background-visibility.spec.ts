@@ -171,7 +171,9 @@ afterEach(() => {
 
 describe('visible work indicator', () => {
   it('shows the brand badge while a tool call runs and clears it afterwards', async () => {
-    const chromeMock = mockChrome({ settings: { trustedActionOrigins: ['https://app.example'] } })
+    const chromeMock = mockChrome({
+      settings: { trustedActionOrigins: ['https://app.example'], indicatorMode: 'badge' },
+    })
     vi.stubGlobal('WebSocket', FakeWebSocket)
     await import('../src/background/index.ts')
     const { socket, sessionId } = await connectWithSession(chromeMock)
@@ -191,7 +193,7 @@ describe('visible work indicator', () => {
     expect(chromeMock.action.setBadgeBackgroundColor).toHaveBeenCalledWith({ color: '#4d6bfe' })
     expect(chromeMock.action.setBadgeTextColor).toHaveBeenCalledWith({ color: '#ffffff' })
     expect(chromeMock.action.setBadgeText).toHaveBeenLastCalledWith({ text: '' })
-    // The default mode is badge-only, so no in-page dot is requested.
+    // Badge-only mode asks for no in-page dot.
     expect(indicatorStates(chromeMock)).toEqual([])
   })
 
