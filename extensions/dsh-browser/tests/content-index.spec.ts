@@ -122,6 +122,29 @@ describe('in-page work dot', () => {
     expect(document.getElementById('dsh-phantom-cursor')?.style.transform).toBe('translate(100px, 20px)')
     vi.useRealTimers()
   })
+
+  it('aims the dot at hover, select, upload and coordinate actions', async () => {
+    vi.useFakeTimers()
+    const dispatch = stubIndicatorChrome()
+    await import('../src/content/index.ts')
+
+    dispatch({ type: 'DSH_INDICATOR', state: 'static' })
+    vi.advanceTimersByTime(100)
+    const dot = () => document.getElementById('dsh-phantom-cursor')?.style.transform
+
+    const select = document.createElement('select')
+    select.setAttribute('data-dsh-el', '4')
+    document.body.appendChild(select)
+    dispatch({ type: 'DSH_ACTION', action: 'browser_select', args: { index: 4 } })
+    expect(dot()).toBe('translate(100px, 20px)')
+
+    dispatch({ type: 'DSH_ACTION', action: 'browser_hover', args: { x: 42, y: 24 } })
+    expect(dot()).toBe('translate(42px, 24px)')
+
+    dispatch({ type: 'DSH_ACTION', action: 'browser_drag', args: { from: [10, 12], to: [30, 40] } })
+    expect(dot()).toBe('translate(10px, 12px)')
+    vi.useRealTimers()
+  })
 })
 
 describe('instrument channel forwarding', () => {

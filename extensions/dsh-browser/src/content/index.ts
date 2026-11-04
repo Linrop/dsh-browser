@@ -26,13 +26,40 @@ const ids = new ElementIds()
 /** Working dot; mounted only while the background sends a live state. */
 const indicator = new PhantomCursorIndicator()
 
-/** Centre one inventoried element under the visible dot, when it is on screen. */
-function moveIndicatorToElement(index: number): void {
-  const element = document.querySelector(`[data-dsh-el="${index}"]`)
-  if (element === null) return
-  const rect = element.getBoundingClientRect()
-  if (rect.width === 0 && rect.height === 0) return
-  indicator.moveTo({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 })
+/** Actions that address one inventoried element the dot should point at. */
+const AIMED_INDEX_ACTIONS = new Set([
+  'browser_click',
+  'browser_type',
+  'browser_press',
+  'browser_select',
+  'browser_hover',
+  'browser_upload_file',
+  // The background resolves element geometry through this internal action
+  // before it dispatches real input, so the dot must follow the same target.
+  'browser_pointer_rect',
+])
+
+/** Resolve the viewport point an action operates, when it names one. */
+function actionPoint(action: string, args: Record<string, unknown>): { x: number; y: number } | undefined {
+  if (AIMED_INDEX_ACTIONS.has(action) && typeof args.index === 'number') {
+    const element = document.querySelector(`[data-dsh-el="${args.index}"]`)
+    if (element !== null) {
+      const rect = element.getBoundingClientRect()
+      if (rect.width !== 0 || rect.height !== 0) {
+        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+      }
+    }
+    return undefined
+  }
+  const point = (value: unknown): { x: number; y: number } | undefined => {
+    if (!Array.isArray(value) || value.length !== 2) return undefined
+    const [x, y] = value as unknown[]
+    return typeof x === 'number' && typeof y === 'number' ? { x, y } : undefined
+  }
+  if (typeof args.x === 'number' && typeof args.y === 'number') return { x: args.x, y: args.y }
+  if (Array.isArray(args.from)) return point(args.from)
+  if (Array.isArray(args.to)) return point(args.to)
+  return undefined
 }
 
 function isIndicatorState(value: unknown): value is IndicatorState {
@@ -133,10 +160,9 @@ function onMessage(message: unknown, _sender: chrome.runtime.MessageSender, send
   const args = actionMsg.args ?? {}
   // Aim the visible dot at the element a click/typing action addresses, so the
   // pointer path ends where the action lands instead of at the last position.
-  if ((action === 'browser_click' || action === 'browser_type' || action === 'browser_press')
-    && typeof args.index === 'number'
-    && indicator.state !== 'off') {
-    moveIndicatorToElement(args.index)
+  if (indicator.state !== 'off') {
+    const point = actionPoint(action, args)
+    if (point !== undefined) indicator.moveTo(point)
   }
   const actionBudget = actionMsg.budget === undefined ? budget : { ...budget, ...actionMsg.budget }
   void runAction(action, args, {
