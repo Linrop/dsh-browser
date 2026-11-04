@@ -327,3 +327,46 @@ describe('purgeSessionFiles', () => {
     }
   }, 15_000)
 })
+
+describe('purgeSessionFiles onPurged hook', () => {
+  it('runs the post-success hook once after data removal', async () => {
+    const root = await makeSessionsRoot()
+    await makeSession(root, 'workspace-a', SESSION_A)
+    const onPurged = vi.fn(async () => {})
+    await purgeSessionFiles({
+      sessionsRoot: root, runningSessionIds: new Set(), acquireOwnership, archiveSession, onPurged,
+    }, SESSION_A)
+    expect(onPurged).toHaveBeenCalledTimes(1)
+  })
+
+  it('never runs the hook when the purge refuses or fails', async () => {
+    const root = await makeSessionsRoot()
+    await makeSession(root, 'workspace-a', SESSION_A)
+    const onPurged = vi.fn(async () => {})
+    await expect(purgeSessionFiles({
+      sessionsRoot: root, runningSessionIds: new Set([SESSION_A]), acquireOwnership, archiveSession, onPurged,
+    }, SESSION_A)).rejects.toMatchObject({ code: 'running' })
+    expect(onPurged).not.toHaveBeenCalled()
+
+    await expect(purgeSessionFiles({
+      sessionsRoot: root,
+      runningSessionIds: new Set(),
+      acquireOwnership,
+      archiveSession: async () => { throw new Error('archive failed') },
+      onPurged,
+    }, SESSION_A)).rejects.toMatchObject({ code: 'internal' })
+    expect(onPurged).not.toHaveBeenCalled()
+  })
+
+  it('contains a hook failure so a completed purge stays successful', async () => {
+    const root = await makeSessionsRoot()
+    await makeSession(root, 'workspace-a', SESSION_A)
+    await expect(purgeSessionFiles({
+      sessionsRoot: root,
+      runningSessionIds: new Set(),
+      acquireOwnership,
+      archiveSession,
+      onPurged: async () => { throw new Error('sweep failed') },
+    }, SESSION_A)).resolves.toBeUndefined()
+  })
+})

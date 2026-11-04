@@ -5,7 +5,24 @@ import type { TabFrame } from './frames.ts'
 import type { ApprovalPrompt } from '../security/approval.ts'
 import { getUiLocale, type UiLocale } from '../i18n.ts'
 
-const PAGE_READS = new Set(['browser_snapshot', 'browser_get_text'])
+/**
+ * Tools whose answer contains page content.
+ *
+ * The privacy setting and the approval prompt both read this one set, so a
+ * read tool added here is blocked when sharing is off without updating two
+ * hand-maintained lists.
+ */
+export const PAGE_READS = new Set([
+  'browser_snapshot',
+  'browser_get_text',
+  'browser_find',
+  'browser_console',
+  'browser_network',
+  'browser_evaluate',
+  // A screenshot returns page pixels; it belongs to the same read boundary as
+  // the textual readers even though the contract lists only the four tools.
+  'browser_screenshot',
+])
 const STATE_CHANGING_ACTIONS = new Set([
   'browser_click',
   'browser_type',
@@ -15,7 +32,35 @@ const STATE_CHANGING_ACTIONS = new Set([
   'browser_back',
   'browser_forward',
   'browser_reload',
+  'browser_upload_file',
+  'browser_select',
+  'browser_drag',
+  'browser_evaluate',
+  'browser_resize',
 ])
+
+/** A prompt that crosses from the page's origin to a different one. */
+export interface CrossOriginPrompt extends ApprovalPrompt {
+  /** True when the page origin and the operation's target origin differ. */
+  crossOrigin: true
+  /** Origin the user is looking at now, when the page exposes one. */
+  fromOrigin: string
+  /** Origin the operation moves to. */
+  toOrigin: string
+}
+
+/**
+ * Whether a prompt migrates the controlled page to another origin.
+ *
+ * Cross-origin work always asks, once, for this one operation: the persistent
+ * allowlist may cover same-origin actions, but it must never silently move a
+ * page across origins.
+ * @param prompt - the prompt a tool call produced.
+ * @returns true when the prompt is a cross-origin migration.
+ */
+export function isCrossOriginPrompt(prompt: ApprovalPrompt): prompt is CrossOriginPrompt {
+  return (prompt as Partial<CrossOriginPrompt>).crossOrigin === true
+}
 
 /** Return an approval prompt, or undefined when this call needs no prompt. */
 export function approvalPromptForCall(
@@ -24,54 +69,106 @@ export function approvalPromptForCall(
   frames: TabFrame[],
   locale: UiLocale = getUiLocale(),
 ): ApprovalPrompt | undefined {
-  if (PAGE_READS.has(call.name)) {
-    if (sharePageContent !== 'ask') return undefined
-    const targetFrames = call.name === 'browser_snapshot'
-      ? frames
-      : frames.filter((frame) => frame.frameId === requestedFrame(call.args))
-    return {
-      kind: 'read',
-      action: call.name,
-      summary: call.name === 'browser_snapshot'
-        ? localized(locale, 'Read the current page and accessible iframes', '读取当前页面及可访问 iframe')
-        : localized(locale, 'Read text from the specified area of the current page', '读取当前页面的指定文本区域'),
-      origins: uniqueOrigins(targetFrames, frames),
-      canTrust: false,
+  // A tool that both reads and changes the page (browser_evaluate) is approved
+  // for its state-changing effect first: the read prompt grants no write
+  // trust, so it must never be the prompt that covers a mutation.
+  if (!STATE_CHANGING_ACTIONS.has(call.name)) {
+    // A page-read prompt is only needed while sharing is not automatic.
+    if (PAGE_READS.has(call.name) && sharePageContent === 'ask') {
+      const targetFrames = call.name === 'browser_snapshot'
+        ? frames
+        : frames.filter((frame) => frame.frameId === requestedFrame(call.args))
+      return {
+        kind: 'read',
+        action: call.name,
+        summary: readSummary(call, locale),
+        origins: uniqueOrigins(targetFrames, frames),
+        canTrust: false,
+      }
     }
+    return undefined
   }
-
-  if (!STATE_CHANGING_ACTIONS.has(call.name)) return undefined
+  const pageOrigin = topPageOrigin(frames)
   if (call.name === 'browser_open_tab') {
     const destination = originFromUrl(typeof call.args.url === 'string' ? call.args.url : '')
+    const crossOrigin = pageOrigin !== undefined && destination !== undefined && pageOrigin !== destination
     return {
       kind: 'action',
       action: call.name,
-      summary: summarizeAction(call, locale),
+      summary: crossOrigin
+        ? crossOriginSummary(call, pageOrigin, destination, locale)
+        : summarizeAction(call, locale),
       // A new tab does not mutate the current page; only the destination matters.
       origins: destination === undefined ? [] : [destination],
-      canTrust: destination !== undefined,
+      canTrust: destination !== undefined && !crossOrigin,
+      ...(crossOrigin ? { crossOrigin: true as const, fromOrigin: pageOrigin, toOrigin: destination } : {}),
     }
   }
   const frameId = requestedFrame(call.args)
   const target = frames.find((frame) => frame.frameId === frameId) ?? frames.find((frame) => frame.frameId === 0)
   const origins = uniqueOrigins(target === undefined ? [] : [target], frames)
-  let canTrust = origins.length === 1 && call.name !== 'browser_back' && call.name !== 'browser_forward'
+  // A window resize is browser-level, not origin-scoped, so it must never
+  // expand persistent per-origin trust.
+  let canTrust = origins.length === 1
+    && call.name !== 'browser_back'
+    && call.name !== 'browser_forward'
+    && call.name !== 'browser_resize'
+  let destinationOrigin: string | undefined
   if (call.name === 'browser_navigate') {
-    const destination = originFromUrl(typeof call.args.url === 'string' ? call.args.url : '')
-    if (destination !== undefined && !origins.includes(destination)) origins.push(destination)
+    destinationOrigin = originFromUrl(typeof call.args.url === 'string' ? call.args.url : '')
+    if (destinationOrigin !== undefined && !origins.includes(destinationOrigin)) origins.push(destinationOrigin)
     // Do not let an invalid, opaque, or cross-origin navigation become a
     // back door for adding the current page to the persistent allowlist.
-    canTrust = destination !== undefined && origins.length === 1 && origins[0] === destination
+    canTrust = destinationOrigin !== undefined && origins.length === 1 && origins[0] === destinationOrigin
   }
+  // Only a page-level migration leaves the current origin. An action inside an
+  // embedded frame operates that frame's own origin and follows the ordinary
+  // per-origin rules; treating it as a migration would prompt on every click in
+  // a third-party iframe and could never be satisfied by the allowlist.
+  const crossOrigin = call.name === 'browser_navigate'
+    && pageOrigin !== undefined
+    && destinationOrigin !== undefined
+    && pageOrigin !== destinationOrigin
   return {
     kind: 'action',
     action: call.name,
-    summary: summarizeAction(call, locale),
+    summary: crossOrigin && destinationOrigin !== undefined
+      ? crossOriginSummary(call, pageOrigin, destinationOrigin, locale)
+      : summarizeAction(call, locale),
     origins,
     // Cross-origin/invalid navigation and unknown history destinations always
     // require a fresh decision; they must never expand trust implicitly.
-    canTrust,
+    canTrust: canTrust && !crossOrigin,
+    ...(crossOrigin ? { crossOrigin: true as const, fromOrigin: pageOrigin, toOrigin: destinationOrigin } : {}),
   }
+}
+
+/** Origin of the page itself (frame 0), which defines "where the user is". */
+function topPageOrigin(frames: TabFrame[]): string | undefined {
+  const top = frames.find((frame) => frame.frameId === 0)
+  return top === undefined ? undefined : effectiveFrameOrigin(top, frames)
+}
+
+/** Host part used in the panel prompt; origins are already normalized. */
+function domainOf(origin: string): string {
+  try {
+    return new URL(origin).hostname
+  } catch {
+    return origin
+  }
+}
+
+/** Name both sides of a cross-origin migration inside the bounded summary. */
+function crossOriginSummary(
+  call: ToolCall,
+  fromOrigin: string,
+  toOrigin: string,
+  locale: UiLocale,
+): string {
+  const from = domainOf(fromOrigin)
+  const to = domainOf(toOrigin)
+  const base = summarizeAction(call, locale)
+  return localized(locale, `${base} (cross-origin ${from} → ${to})`, `${base}（跨域 ${from} → ${to}）`).slice(0, 200)
 }
 
 function requestedFrame(args: Record<string, unknown>): number {
@@ -103,6 +200,36 @@ export function originFromUrl(value: string): string | undefined {
     return url.origin === 'null' ? undefined : url.origin
   } catch {
     return undefined
+  }
+}
+
+/** One-line panel summary for a page-content read. */
+function readSummary(call: ToolCall, locale: UiLocale): string {
+  switch (call.name) {
+    case 'browser_snapshot':
+      return localized(locale, 'Read the current page and accessible iframes', '读取当前页面及可访问 iframe')
+    case 'browser_get_text':
+      return localized(locale, 'Read text from the specified area of the current page', '读取当前页面的指定文本区域')
+    case 'browser_find':
+      return localized(
+        locale,
+        `Search the current page for elements matching “${safeInline(typeof call.args.query === 'string' ? call.args.query : '')}”`,
+        `在当前页面中搜索匹配「${safeInline(typeof call.args.query === 'string' ? call.args.query : '')}」的元素`,
+      )
+    case 'browser_console':
+      return localized(locale, 'Read captured console messages from the current tab', '读取当前标签页已捕获的控制台消息')
+    case 'browser_network':
+      return localized(locale, 'Read captured network requests from the current tab', '读取当前标签页已捕获的网络请求')
+    case 'browser_evaluate':
+      return localized(
+        locale,
+        'Run JavaScript in the current page (the code is not shown in this dialog)',
+        '在当前页面中执行 JavaScript（代码不会显示在确认框）',
+      )
+    case 'browser_screenshot':
+      return localized(locale, 'Capture a screenshot of the current tab', '截取当前标签页的屏幕截图')
+    default:
+      return call.name
   }
 }
 
@@ -148,6 +275,39 @@ function summarizeAction(call: ToolCall, locale: UiLocale): string {
     case 'browser_back': return localized(locale, 'Go back in browser history (destination domain unknown)', '返回浏览历史上一页（目标域名未知）')
     case 'browser_forward': return localized(locale, 'Go forward in browser history (destination domain unknown)', '前进到浏览历史下一页（目标域名未知）')
     case 'browser_reload': return localized(locale, 'Reload the current page', '重新加载当前页面')
+    case 'browser_select': return localized(locale, `Select an option in element [${index}]${frame}`, `在元素 [${index}] 中选择选项${frame}`)
+    case 'browser_hover': return typeof call.args.index === 'number'
+      ? localized(locale, `Hover over element [${index}]${frame}`, `悬停在元素 [${index}] 上${frame}`)
+      : localized(
+        locale,
+        `Hover at (${typeof call.args.x === 'number' ? call.args.x : '?'}, ${typeof call.args.y === 'number' ? call.args.y : '?'})`,
+        `在坐标 (${typeof call.args.x === 'number' ? call.args.x : '?'}, ${typeof call.args.y === 'number' ? call.args.y : '?'}) 悬停`,
+      )
+    case 'browser_drag': {
+      const fromIndex = typeof call.args.from_index === 'number' ? call.args.from_index : undefined
+      const toIndex = typeof call.args.to_index === 'number' ? call.args.to_index : undefined
+      const from = fromIndex === undefined ? 'a point' : `element [${fromIndex}]`
+      const to = toIndex === undefined ? 'another point' : `element [${toIndex}]`
+      return localized(locale, `Drag from ${from} to ${to}${frame}`, `从 ${from} 拖拽到 ${to}${frame}`)
+    }
+    case 'browser_upload_file': {
+      const count = Array.isArray(call.args.files) ? call.args.files.length : 0
+      return localized(
+        locale,
+        `Upload ${count} file(s) to element [${index}]${frame} (file contents are not shown in this dialog)`,
+        `向元素 [${index}] 上传 ${count} 个文件${frame}（文件内容不会显示在确认框）`,
+      )
+    }
+    case 'browser_evaluate': return localized(
+      locale,
+      'Run JavaScript in the current page (the code is not shown in this dialog)',
+      '在当前页面中执行 JavaScript（代码不会显示在确认框）',
+    )
+    case 'browser_resize': return localized(
+      locale,
+      `Resize the browser window to ${typeof call.args.width === 'number' ? Math.floor(call.args.width) : '?'}x${typeof call.args.height === 'number' ? Math.floor(call.args.height) : '?'}`,
+      `把浏览器窗口调整为 ${typeof call.args.width === 'number' ? Math.floor(call.args.width) : '?'}x${typeof call.args.height === 'number' ? Math.floor(call.args.height) : '?'}`,
+    )
     default: return call.name
   }
 }

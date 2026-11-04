@@ -66,6 +66,11 @@ describe('attaching a page selection in the composer', () => {
       setActiveSession: vi.fn(async () => {}),
       updateSettings: vi.fn(async () => {}),
       requestStatus: vi.fn(async () => {}),
+      onRecording: vi.fn(() => unsubscribe),
+      onDiagnostics: vi.fn(() => unsubscribe),
+      startRecording: vi.fn(async () => {}),
+      exportRecording: vi.fn(async () => {}),
+      clearRecording: vi.fn(async () => {}),
     }
     root = createRoot(document.querySelector('#root')!)
   })
@@ -211,5 +216,81 @@ describe('attaching a page selection in the composer', () => {
 
     await vi.waitFor(() => { expect(panelApi.clearSelection).toHaveBeenCalledWith() })
     expect(document.querySelector('.composer-box .page-selection')).toBeNull()
+  })
+
+  describe('pasting clipboard files into the composer', () => {
+    const IMAGE_LIMITS = {
+      maxImageBytes: 1024,
+      maxImagesPerMessage: 2,
+      maxMessageImageBytes: 1536,
+      maxImagePixels: 1_000_000,
+      maxImageDimension: 1200,
+      mediaTypes: ['image/png', 'image/jpeg'],
+    }
+
+    beforeEach(() => {
+      vi.stubGlobal('createImageBitmap', vi.fn(async () => ({ width: 4, height: 4, close: (): void => {} })))
+      rpc.mockImplementation(async (method: string) => {
+        if (method === 'session.create') return { sessionId: 'session-current' }
+        if (method === 'session.history') {
+          return { events: [], projections: { asOfSeq: 0, values: { imageLimits: IMAGE_LIMITS } } }
+        }
+        if (method === 'session.prompt') return {}
+        throw new Error(`unexpected RPC: ${method}`)
+      })
+    })
+
+    function pasteEvent(files: File[] | null): Event {
+      const event = new Event('paste', { bubbles: true, cancelable: true })
+      Object.defineProperty(event, 'clipboardData', { value: files === null ? null : { files } })
+      return event
+    }
+
+    async function startWithImageLimits(): Promise<HTMLTextAreaElement> {
+      await startPanel()
+      await vi.waitFor(() => {
+        expect(document.querySelector<HTMLInputElement>('.image-file-input')?.accept).toBe('image/png,image/jpeg')
+      })
+      return document.querySelector<HTMLTextAreaElement>('.composer textarea')!
+    }
+
+    it('ingests a pasted image file through the picker path', async () => {
+      const composer = await startWithImageLimits()
+      const event = pasteEvent([new File([new Uint8Array([1, 2, 3])], 'clip.png', { type: 'image/png' })])
+
+      await act(async () => {
+        composer.dispatchEvent(event)
+        // 文件读取在事件之后异步完成，把状态更新留在 act 内。
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      })
+
+      expect(event.defaultPrevented).toBe(true)
+      expect(document.querySelector('.draft-images .draft-image img')?.getAttribute('alt')).toBe('clip.png')
+    })
+
+    it('leaves a plain text paste to native textarea behavior', async () => {
+      const composer = await startWithImageLimits()
+      const event = pasteEvent(null)
+
+      await act(async () => { composer.dispatchEvent(event) })
+
+      expect(event.defaultPrevented).toBe(false)
+      expect(document.querySelector('.draft-images')).toBeNull()
+      expect(document.querySelector('.error')).toBeNull()
+    })
+
+    it('routes a pasted unsupported file through the existing error path', async () => {
+      const composer = await startWithImageLimits()
+      const event = pasteEvent([new File(['x'], 'note.txt', { type: 'text/plain' })])
+
+      await act(async () => {
+        composer.dispatchEvent(event)
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      })
+
+      expect(event.defaultPrevented).toBe(true)
+      expect(document.querySelector('.error')?.textContent).toContain('note.txt')
+      expect(document.querySelector('.draft-images')).toBeNull()
+    })
   })
 })

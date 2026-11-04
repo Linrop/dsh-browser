@@ -38,6 +38,7 @@ import {
 import { withSessionDeferral } from './session-deferral.ts'
 import { withSessionWorkspace } from './session-workspace.ts'
 import { purgeSessionFiles, type SessionPurgeDeps } from './session-purge.ts'
+import { sweepArtifacts, type ArtifactLimits, type ArtifactSweepResult } from './artifact-budget.ts'
 import { resolveToken } from './token.ts'
 import {
   createRemoteHostApi,
@@ -67,6 +68,18 @@ const SESSIONS_ROOT = dshHomePath('sessions')
 /** Default: sessions materialize only on the first message (open-and-close leaves no trace). */
 const DEFAULT_DEFER_SESSION_CREATE = true
 
+/** Default byte budget for artifacts written into the session workspace (2 GiB). */
+const DEFAULT_ARTIFACT_MAX_BYTES = 2_147_483_648
+
+/** Default artifact file-count budget. */
+const DEFAULT_ARTIFACT_MAX_FILES = 2_000
+
+/** Default artifact TTL: one week. */
+const DEFAULT_ARTIFACT_TTL_MS = 604_800_000
+
+/** Default artifact sweep period: ten minutes. */
+const DEFAULT_ARTIFACT_SWEEP_INTERVAL_MS = 600_000
+
 /** Plugin config: deployment-varying tunables only; the wire contract stays fixed. */
 export interface Config {
   /** Fixed bearer token. When absent, a token is generated on first boot and persisted under the dsh home (0600). */
@@ -81,6 +94,16 @@ export interface Config {
   sessionWorkspacePath?: string
   /** Defer real session creation until the first prompt. Defaults to true. */
   deferSessionCreate?: boolean
+  /** Total bytes the artifact sweep leaves in the session workspace. Defaults to 2147483648. */
+  artifactMaxBytes?: number
+  /** Total artifact files the sweep leaves in the session workspace. Defaults to 2000. */
+  artifactMaxFiles?: number
+  /** Age after which an artifact is evicted regardless of the budgets. Defaults to 604800000. */
+  artifactTtlMs?: number
+  /** Period between artifact sweeps. Defaults to 600000. */
+  artifactSweepIntervalMs?: number
+  /** Sweep root and deletion boundary. Empty falls back to `sessionWorkspacePath`, which is then both. */
+  artifactRoot?: string
 }
 
 export const Config: z<Config> = z.object({
@@ -90,6 +113,11 @@ export const Config: z<Config> = z.object({
   maxInteractiveItems: z.number().step(1).min(1).default(DEFAULT_MAX_INTERACTIVE_ITEMS),
   sessionWorkspacePath: z.string().default(DEFAULT_SESSION_WORKSPACE_PATH),
   deferSessionCreate: z.boolean().default(DEFAULT_DEFER_SESSION_CREATE),
+  artifactMaxBytes: z.number().step(1).min(1).default(DEFAULT_ARTIFACT_MAX_BYTES),
+  artifactMaxFiles: z.number().step(1).min(1).default(DEFAULT_ARTIFACT_MAX_FILES),
+  artifactTtlMs: z.number().step(1).min(1).default(DEFAULT_ARTIFACT_TTL_MS),
+  artifactSweepIntervalMs: z.number().step(1).min(1).default(DEFAULT_ARTIFACT_SWEEP_INTERVAL_MS),
+  artifactRoot: z.string().default(''),
 })
 
 /** The shape after schemastery applies its defaults to every field. */
@@ -115,6 +143,11 @@ export function resolveConfig(config: Config): ResolvedConfig {
     maxInteractiveItems: config.maxInteractiveItems ?? DEFAULT_MAX_INTERACTIVE_ITEMS,
     sessionWorkspacePath: config.sessionWorkspacePath ?? DEFAULT_SESSION_WORKSPACE_PATH,
     deferSessionCreate: config.deferSessionCreate ?? DEFAULT_DEFER_SESSION_CREATE,
+    artifactMaxBytes: config.artifactMaxBytes ?? DEFAULT_ARTIFACT_MAX_BYTES,
+    artifactMaxFiles: config.artifactMaxFiles ?? DEFAULT_ARTIFACT_MAX_FILES,
+    artifactTtlMs: config.artifactTtlMs ?? DEFAULT_ARTIFACT_TTL_MS,
+    artifactSweepIntervalMs: config.artifactSweepIntervalMs ?? DEFAULT_ARTIFACT_SWEEP_INTERVAL_MS,
+    artifactRoot: config.artifactRoot ?? '',
   }
   assertPositiveInteger('toolTimeoutMs', resolved.toolTimeoutMs)
   assertPositiveInteger('snapshotMaxChars', resolved.snapshotMaxChars)
@@ -122,6 +155,10 @@ export function resolveConfig(config: Config): ResolvedConfig {
     throw new Error(`bridge-browser: snapshotMaxChars must be at least ${MIN_SNAPSHOT_MAX_CHARS}`)
   }
   assertPositiveInteger('maxInteractiveItems', resolved.maxInteractiveItems)
+  assertPositiveInteger('artifactMaxBytes', resolved.artifactMaxBytes)
+  assertPositiveInteger('artifactMaxFiles', resolved.artifactMaxFiles)
+  assertPositiveInteger('artifactTtlMs', resolved.artifactTtlMs)
+  assertPositiveInteger('artifactSweepIntervalMs', resolved.artifactSweepIntervalMs)
   return resolved
 }
 
@@ -171,6 +208,58 @@ function mountBridge(
     browserContext.activate(agent)
   })
 
+  // The extension writes screenshots and page dumps into its session
+  // workspace; keep that cache within budget and age instead of letting a long
+  // QA run accumulate files forever. An empty workspace path opts the feature
+  // out, in which case no sweep runs at all.
+  // The sweep root is `artifactRoot` when configured, otherwise the session
+  // workspace. That fallback is also the deletion boundary: without an explicit
+  // root nothing else supplies one, and a boundary-less sweep refuses forever,
+  // so the screenshots directory would grow without limit.
+  const configuredArtifactRoot = resolved.artifactRoot.trim()
+  const artifactRoot = configuredArtifactRoot !== '' ? resolved.artifactRoot : resolved.sessionWorkspacePath
+  const artifactBoundaryConfig = configuredArtifactRoot !== '' ? resolved.artifactRoot : resolved.sessionWorkspacePath
+  const artifactLimits: ArtifactLimits = {
+    maxBytes: resolved.artifactMaxBytes,
+    maxFiles: resolved.artifactMaxFiles,
+    ttlMs: resolved.artifactTtlMs,
+  }
+  const sweepLog = { warn: (message: string): void => { ctx.logger.warn(message) } }
+  const sweepArtifactsOnce = async (): Promise<void> => {
+    try {
+      const result: ArtifactSweepResult = await sweepArtifacts(
+        artifactRoot, artifactLimits, Date.now(), sweepLog, artifactBoundaryConfig,
+      )
+      ctx.logger.info(
+        `browser bridge: artifact sweep root=${artifactRoot} scanned ${result.scanned}, kept ${result.kept}, `
+        + `deleted ${result.deleted}, freed ${result.bytesFreed} bytes, refused ${result.refused}, `
+        + `skippedGit=${result.skippedGit}`,
+      )
+      if (result.deleted > 0) {
+        ctx.logger.warn(
+          `browser bridge: artifact sweep evicted ${result.deleted} file(s) (${result.bytesFreed} bytes) from `
+          + `root=${artifactRoot} to stay within artifactMaxBytes/artifactMaxFiles/artifactTtlMs`,
+        )
+      }
+    } catch (error: unknown) {
+      ctx.logger.warn(`browser bridge: artifact sweep failed: ${String(error)}`)
+    }
+  }
+  if (artifactRoot !== '') {
+    ctx.effect(() => {
+      let sweeping = false
+      const run = (): void => {
+        if (sweeping) return
+        sweeping = true
+        void sweepArtifactsOnce().finally(() => { sweeping = false })
+      }
+      run()
+      const timer = setInterval(run, resolved.artifactSweepIntervalMs)
+      timer.unref?.()
+      return () => { clearInterval(timer) }
+    }, 'bridge-browser: artifact sweep')
+  }
+
   const purgeSession = async (sessionId: string): Promise<void> => {
     const runningSessionIds = new Set<string>()
     try {
@@ -212,6 +301,10 @@ function mountBridge(
       },
     }
     await purgeSessionFiles(deps, sessionId)
+    // A purged session leaves its artifacts behind; sweep once so the cache
+    // returns to budget with the session gone. The sweep reports its own
+    // failures and never fails the purge.
+    if (artifactRoot !== '') await sweepArtifactsOnce()
   }
 
   const server = new BridgeServer({
@@ -254,6 +347,10 @@ function mountBridge(
       toolTimeoutMs: resolved.toolTimeoutMs,
       snapshotMaxChars: resolved.snapshotMaxChars,
       maxInteractiveItems: resolved.maxInteractiveItems,
+      // Screenshots join the same artifact root the retention sweep owns, so
+      // they share its byte/count/TTL budget and never need a second root.
+      screenshotRoot: artifactRoot,
+      artifactBoundary: artifactBoundaryConfig,
     })
     return () => { for (const dispose of disposers.values()) dispose() }
   }, 'bridge-browser: browser tools')

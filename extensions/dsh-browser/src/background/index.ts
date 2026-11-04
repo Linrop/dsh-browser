@@ -39,8 +39,9 @@ import {
   type RespondResult,
 } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
 import type { ServerFrame } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
+import { MAX_FRAME_BYTES, type ToolError } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
 import { BRIDGE_CONFIG_PATH, BRIDGE_PATH } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
-import { BridgeClient, type BridgeState } from './bridge.ts'
+import { BRIDGE_LOG_NAMESPACE, BridgeClient, type BridgeState } from './bridge.ts'
 import { createRpc } from './rpc.ts'
 import {
   dispatchOpenTab,
@@ -58,11 +59,23 @@ import {
   type ApprovalRequest,
 } from '../security/approval.ts'
 import { getUiLocale } from '../i18n.ts'
+import {
+  OFFSCREEN_GIF_MESSAGE,
+  OFFSCREEN_GIF_SWEPT_MESSAGE,
+  RecordingBuffer,
+  recordingStatus,
+  type RecordingStatus,
+} from '../content/recorder.ts'
+import { bumpEvent, eventCounters } from './events.ts'
 import { InteractionResponseRouter } from './responses.ts'
+import { normalizeToolError } from './error-map.ts'
+import { forgetTab, noteTabNavigation, recordInstrumentEntry } from './cdp.ts'
+import { isInstrumentEntry } from '../content/instrument.ts'
 import {
   actionCoveredByTrustedOrigins,
   normalizeTrustedOrigin,
 } from '../security/trusted-origins.ts'
+import { isCrossOriginPrompt } from './authorization.ts'
 import { TransientEventCache } from './transient-events.ts'
 import {
   TabAffinityController,
@@ -94,7 +107,16 @@ export interface Settings {
   approvalNotifications: boolean
   /** Restore the current tab and page path's conversation when the panel reopens. */
   autoResumeSession: boolean
+  /** Where work is shown: toolbar badge only, badge plus in-page dot, or nowhere. */
+  indicatorMode: IndicatorMode
+  /** Refuse browser tools aimed at tabs this session never bound, opened, or followed. */
+  tabIsolation: boolean
+  /** Keep the service worker warm through the offscreen heartbeat while a panel is open. */
+  keepAliveEnabled: boolean
 }
+
+/** Visible-work surfaces the user may choose between. */
+export type IndicatorMode = 'badge' | 'badge-overlay' | 'off'
 
 const SETTINGS_DEFAULTS: Settings = {
   // 空地址 = 自动探测本机 dsh（零配置）；手动填地址时优先手动。
@@ -105,6 +127,9 @@ const SETTINGS_DEFAULTS: Settings = {
   trustedActionOrigins: [],
   approvalNotifications: true,
   autoResumeSession: true,
+  indicatorMode: 'badge-overlay',
+  tabIsolation: true,
+  keepAliveEnabled: true,
 }
 
 /**
@@ -176,6 +201,9 @@ let bridgeStartRevision = 0
 const interactionResponses = new InteractionResponseRouter()
 const transientEvents = new TransientEventCache()
 const tabAffinity = new TabAffinityController()
+// A tab whose ownership is released (closed, replaced, or dropped with the
+// connection) must not keep a debugger session attached to it.
+tabAffinity.onOwnershipReleased = (tabId) => { forgetTab(tabId) }
 const focusedWindow = new FocusedWindowTracker()
 const selections = new SelectionTracker()
 const pageSessionContexts = new PageSessionContextTracker({
@@ -313,6 +341,11 @@ function normalizeSettings(candidate: Settings): Settings {
     trustedActionOrigins: trusted,
     approvalNotifications: candidate.approvalNotifications !== false,
     autoResumeSession: candidate.autoResumeSession !== false,
+    indicatorMode: candidate.indicatorMode === 'badge' || candidate.indicatorMode === 'off'
+      ? candidate.indicatorMode
+      : 'badge-overlay',
+    tabIsolation: candidate.tabIsolation !== false,
+    keepAliveEnabled: candidate.keepAliveEnabled !== false,
   }
 }
 
@@ -326,10 +359,308 @@ const settingsReady = loadSettings().then((loaded) => {
 
 function armBridgeKeepalive(): void {
   chrome.alarms.create(BRIDGE_KEEPALIVE_ALARM, { periodInMinutes: 0.5 })
+  void syncOffscreenKeepAlive()
 }
 
 function disarmBridgeKeepalive(): void {
   void Promise.resolve(chrome.alarms.clear(BRIDGE_KEEPALIVE_ALARM)).catch(() => {})
+  // The lease is over: the heartbeat document must not outlive it, otherwise
+  // the service worker would never sleep again in this browser session.
+  void syncOffscreenKeepAlive()
+}
+
+/**
+ * Last `SW_KEEPALIVE` from the offscreen document. Kept in memory only: it is
+ * a liveness hint for the current worker generation, never durable state.
+ */
+let lastKeepAliveAt = 0
+
+/**
+ * Record one offscreen keepalive.
+ * @param at - observation time (injectable for tests).
+ * @returns the recorded timestamp.
+ */
+export function noteSwKeepAlive(at: number = Date.now()): number {
+  lastKeepAliveAt = at
+  return lastKeepAliveAt
+}
+
+/** Timestamp of the last offscreen keepalive, or 0 before the first one. */
+export function swKeepAliveAt(): number {
+  return lastKeepAliveAt
+}
+
+/** Outbound-silence window after which the heartbeat document is released. */
+export const KEEPALIVE_IDLE_MS = 5 * 60_000
+
+/** Last tool call or live connection change; the idle window starts here. */
+let lastToolActivityAt = 0
+
+/** Record that the bridge just did real work, which extends the idle window. */
+function noteToolActivity(): void {
+  lastToolActivityAt = Date.now()
+}
+
+/**
+ * Whether the service worker still needs the offscreen heartbeat.
+ * @returns true only while a panel, a recording, an in-flight call, the recent
+ *   activity window, or a just-finished export needs the worker awake.
+ */
+export function keepAliveWanted(): boolean {
+  // The recording encoder lives in the same document, so a recording needs it
+  // regardless of the keepalive toggle; `keepAliveEnabled` only controls the
+  // worker-warming lease, never the encoder.
+  if (recording !== null) return true
+  // A just-exported recording keeps its blob URL alive for the download; the
+  // document that owns it must survive until that grace period ends.
+  const clearedAt = lastRecordingOutcome.clearedAt
+  if (clearedAt !== undefined && Date.now() - clearedAt < RECORDING_BLOB_GRACE_MS) return true
+  if (!settings.keepAliveEnabled) return false
+  if (panelPorts.size > 0) return true
+  if (activeToolCalls.size > 0) return true
+  // A live socket is deliberately not part of the lease: a panel closing keeps
+  // the socket open (suspendReconnect), so counting the connection would keep
+  // the heartbeat document alive forever and the worker would never sleep.
+  // Without a panel the half-minute alarm re-arms the reconnect loop instead.
+  return lastToolActivityAt > 0 && Date.now() - lastToolActivityAt < KEEPALIVE_IDLE_MS
+}
+
+/** How long an exported recording's blob URL needs its offscreen document. */
+const RECORDING_BLOB_GRACE_MS = 120_000
+
+/** Periodic lease re-evaluation while the heartbeat document exists. */
+let keepaliveSweep: ReturnType<typeof setInterval> | undefined
+
+function startKeepaliveSweep(): void {
+  if (keepaliveSweep !== undefined) return
+  keepaliveSweep = setInterval(() => { void syncOffscreenKeepAlive() }, 30_000)
+}
+
+function stopKeepaliveSweep(): void {
+  if (keepaliveSweep === undefined) return
+  clearInterval(keepaliveSweep)
+  keepaliveSweep = undefined
+}
+
+/**
+ * Create or release the offscreen heartbeat document to match the lease.
+ *
+ * The document keeps the MV3 worker warm, so it may exist only while a panel,
+ * a recording, an in-flight tool call, or a live connection needs it; once the
+ * lease ends it is closed so the worker can sleep again. Firefox has no
+ * offscreen API: there the half-minute alarm is the only keepalive.
+ */
+async function syncOffscreenKeepAlive(): Promise<void> {
+  const offscreen = chrome.offscreen
+  if (offscreen === undefined
+    || typeof offscreen.createDocument !== 'function'
+    || typeof offscreen.closeDocument !== 'function') return
+  const wanted = keepAliveWanted()
+  try {
+    const open = typeof offscreen.hasDocument === 'function' ? await offscreen.hasDocument() : false
+    if (wanted && !open) {
+      await offscreen.createDocument({
+        url: 'offscreen.html',
+        reasons: ['WORKERS' as chrome.offscreen.Reason],
+        justification: 'Keep the MV3 service worker warm while a side panel lease is open.',
+      })
+    } else if (!wanted && open) {
+      // Ask the document to stop ticking before teardown. The literal mirrors
+      // SW_KEEPALIVE_STOP_MESSAGE in src/offscreen/index.ts; importing that
+      // module here would pull its DOM/worker code into the service worker.
+      await chrome.runtime.sendMessage({ type: 'SW_KEEPALIVE_STOP' }).catch(() => {})
+      await offscreen.closeDocument()
+    }
+    if (wanted) startKeepaliveSweep()
+    else stopKeepaliveSweep()
+  } catch {
+    /* A concurrent create/close already decided the document, or this build has
+       no page; the half-minute alarm still re-arms the reconnect loop. */
+  }
+}
+
+// ---- Recording: tab frames → offscreen GIF ----
+
+/** Capture cadence while a recording is active. */
+export const RECORDING_CAPTURE_INTERVAL_MS = 1_000
+/** Chrome allows two visible-tab captures per second; stay under that. */
+export const RECORDING_MIN_CAPTURE_GAP_MS = 500
+
+interface RecordingState {
+  buffer: RecordingBuffer
+  /** Window whose visible tab is captured; the panel reporting it owns the lease. */
+  windowId: number
+  timer: ReturnType<typeof setInterval>
+  lastCaptureAt: number
+  exporting: boolean
+}
+
+/** Active recording, or null when no recording is running. */
+let recording: RecordingState | null = null
+/** Outcome of the last recording, kept after its frames are released. */
+let lastRecordingOutcome: Pick<RecordingStatus, 'clearedAt' | 'filename'> = {}
+
+/** Panel-facing recording state, including the last export outcome. */
+export function currentRecordingStatus(): RecordingStatus {
+  const state = recording
+  if (state === null) {
+    return recordingStatus(false, { frames: 0, bytes: 0, dropped: 0, expired: 0 }, lastRecordingOutcome)
+  }
+  const status = recordingStatus(!state.exporting, state.buffer.stats, lastRecordingOutcome)
+  return state.exporting ? { ...status, exporting: true } : status
+}
+
+/** Push the current recording state to every panel. */
+function broadcastRecording(error?: string): void {
+  const payload = {
+    type: 'recording',
+    status: currentRecordingStatus(),
+    ...(error === undefined ? {} : { error }),
+  }
+  for (const port of panelPorts) {
+    try { port.postMessage(payload) } catch { /* port already closed */ }
+  }
+}
+
+/** Push the local event counters to every panel. */
+function broadcastDiagnostics(): void {
+  const payload = { type: 'diagnostics', counts: eventCounters.snapshot() }
+  for (const port of panelPorts) {
+    try { port.postMessage(payload) } catch { /* port already closed */ }
+  }
+}
+
+/** Read the recorded page's viewport metrics; missing metrics fall back to the tab. */
+async function readViewportMetrics(tabId: number | undefined, tab: chrome.tabs.Tab | undefined): Promise<{
+  viewportWidth: number
+  viewportHeight: number
+  devicePixelRatio: number
+}> {
+  const fallback = {
+    viewportWidth: tab?.width ?? 0,
+    viewportHeight: tab?.height ?? 0,
+    devicePixelRatio: 1,
+  }
+  if (tabId === undefined) return fallback
+  try {
+    const [injected] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => ({
+        width: window.innerWidth,
+        height: window.innerHeight,
+        devicePixelRatio: window.devicePixelRatio,
+      }),
+    })
+    const measured = injected?.result
+    if (measured === undefined) return fallback
+    return { viewportWidth: measured.width, viewportHeight: measured.height, devicePixelRatio: measured.devicePixelRatio }
+  } catch {
+    // Restricted pages cannot be scripted; the tab rectangle still describes the frame.
+    return fallback
+  }
+}
+
+/**
+ * Capture one frame of the recording window's visible tab.
+ *
+ * Failures are silent by design: a recording must never break the tool call
+ * that triggered the capture, and restricted pages simply contribute no frame.
+ * @param action - tool name, or `timer` for cadence frames.
+ */
+async function captureRecordingFrame(action: string): Promise<void> {
+  const state = recording
+  if (state === null || state.exporting) return
+  const at = Date.now()
+  if (at - state.lastCaptureAt < RECORDING_MIN_CAPTURE_GAP_MS) return
+  state.lastCaptureAt = at
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, windowId: state.windowId })
+    const metrics = await readViewportMetrics(tab?.id, tab)
+    const dataUrl = await chrome.tabs.captureVisibleTab(state.windowId, { format: 'png' })
+    const separator = dataUrl.indexOf(',')
+    if (separator < 0) return
+    if (recording !== state) return
+    state.buffer.push({ base64: dataUrl.slice(separator + 1), action, ...metrics }, at)
+  } catch {
+    /* Capture throttling, a restricted page, or a closing window: skip. */
+  }
+  broadcastRecording()
+}
+
+/** Start recording the visible tab of one window. */
+function startRecording(windowId: number): void {
+  if (recording !== null || windowId < 0) {
+    broadcastRecording()
+    return
+  }
+  lastRecordingOutcome = {}
+  const state: RecordingState = {
+    buffer: new RecordingBuffer(),
+    windowId,
+    lastCaptureAt: 0,
+    exporting: false,
+    timer: setInterval(() => { void captureRecordingFrame('timer') }, RECORDING_CAPTURE_INTERVAL_MS),
+  }
+  recording = state
+  void syncOffscreenKeepAlive()
+  bumpEvent('recording.started')
+  broadcastRecording()
+  void captureRecordingFrame('start')
+}
+
+/** Release the frames without producing a file. */
+function clearRecording(): void {
+  const state = recording
+  if (state !== null) {
+    clearInterval(state.timer)
+    state.buffer.clear()
+    recording = null
+    void syncOffscreenKeepAlive()
+  }
+  if (state !== null || lastRecordingOutcome.clearedAt !== undefined) {
+    lastRecordingOutcome = { clearedAt: Date.now() }
+    bumpEvent('recording.cleared')
+  }
+  broadcastRecording()
+}
+
+/** Encode the captured frames offscreen and download the GIF. */
+async function exportRecording(): Promise<void> {
+  const state = recording
+  if (state === null || state.exporting) return
+  const frames = state.buffer.frames()
+  if (frames.length === 0) {
+    broadcastRecording(getUiLocale() === 'zh' ? '还没有录制到画面' : 'Nothing has been recorded yet')
+    return
+  }
+  state.exporting = true
+  clearInterval(state.timer)
+  broadcastRecording()
+  try {
+    await syncOffscreenKeepAlive()
+    const reply = await chrome.runtime.sendMessage({
+      type: OFFSCREEN_GIF_MESSAGE,
+      frames: frames.map((frame) => ({ base64: frame.base64, delayMs: frame.delay })),
+    }) as { ok?: unknown; filename?: unknown; error?: unknown } | undefined
+    if (reply?.ok !== true) {
+      throw new Error(typeof reply?.error === 'string' ? reply.error : 'The GIF could not be written')
+    }
+    bumpEvent('recording.exported')
+    lastRecordingOutcome = {
+      clearedAt: Date.now(),
+      ...(typeof reply.filename === 'string' ? { filename: reply.filename } : {}),
+    }
+    state.buffer.clear()
+    recording = null
+    bumpEvent('recording.cleared')
+    broadcastRecording()
+  } catch (cause) {
+    // Keep the frames so the user can retry after the cause is fixed.
+    state.exporting = false
+    state.timer = setInterval(() => { void captureRecordingFrame('timer') }, RECORDING_CAPTURE_INTERVAL_MS)
+    broadcastRecording(cause instanceof Error ? cause.message : String(cause))
+  }
+  broadcastDiagnostics()
 }
 
 function broadcastStatus(): void {
@@ -344,6 +675,185 @@ function broadcastTabAffinity(): void {
   for (const port of panelPorts) {
     try { port.postMessage(payload) } catch { /* port already closed */ }
   }
+}
+
+// ---- Visible work: toolbar badge, tab group, in-page dot ----
+
+/** Filled dot shown while a tool call runs; cleared when the connection idles. */
+const WORK_BADGE_TEXT = '●'
+const WORK_BADGE_BACKGROUND = '#4d6bfe'
+const WORK_BADGE_FOREGROUND = '#ffffff'
+const TAB_GROUP_TITLE = 'DSH Browser'
+/** Chrome's sentinel for "this tab is not in any group". */
+const TAB_GROUP_NONE = -1
+/** Groups this connection labelled; user-owned groups are never restyled. */
+const labelledTabGroups = new Set<number>()
+/** Tabs currently carrying a live dot, so a mode switch cannot leave one behind. */
+const dotTabs = new Set<number>()
+let badgeActive = false
+
+function overlayEnabled(): boolean {
+  return settings.indicatorMode === 'badge-overlay'
+}
+
+/**
+ * Paint or clear the toolbar badge.
+ *
+ * Chrome omits `chrome.action` in Firefox builds and in some test harnesses,
+ * so a missing API leaves the rest of the visibility path untouched.
+ * @param active - whether browser work is currently running.
+ */
+function setWorkBadge(active: boolean): void {
+  const next = settings.indicatorMode === 'off' ? false : active
+  if (next === badgeActive) return
+  badgeActive = next
+  const action = chrome.action
+  if (action === undefined || typeof action.setBadgeText !== 'function') return
+  try {
+    void Promise.resolve(action.setBadgeText({ text: next ? WORK_BADGE_TEXT : '' })).catch(() => {})
+    if (!next) return
+    void Promise.resolve(action.setBadgeBackgroundColor({ color: WORK_BADGE_BACKGROUND })).catch(() => {})
+    if (typeof action.setBadgeTextColor === 'function') {
+      void Promise.resolve(action.setBadgeTextColor({ color: WORK_BADGE_FOREGROUND })).catch(() => {})
+    }
+  } catch {
+    // A build without badge colours still shows or clears the dot text.
+  }
+}
+
+/**
+ * Put the worked tab in a `DSH Browser` group so the user can see what runs.
+ *
+ * A tab the user already grouped keeps its own group: silently retitling a
+ * user's group would be worse than showing no group at all.
+ * @param tabId - the tab a tool call is operating.
+ */
+async function labelWorkTabGroup(tabId: number): Promise<void> {
+  if (settings.indicatorMode === 'off') return
+  const tabs = chrome.tabs as typeof chrome.tabs & {
+    group?: (options: { tabIds: number[] }) => Promise<number>
+  }
+  const groups = chrome.tabGroups as typeof chrome.tabGroups | undefined
+  if (tabs.group === undefined || groups === undefined || typeof groups.update !== 'function') return
+  try {
+    const tab = await chrome.tabs.get(tabId)
+    const current = typeof tab.groupId === 'number' ? tab.groupId : TAB_GROUP_NONE
+    let groupId: number | undefined
+    if (current >= 0) {
+      if (labelledTabGroups.has(current)) groupId = current
+    } else {
+      const created = await tabs.group({ tabIds: [tabId] })
+      groupId = typeof created === 'number' ? created : undefined
+    }
+    if (groupId === undefined || groupId < 0) return
+    labelledTabGroups.add(groupId)
+    await groups.update(groupId, { title: TAB_GROUP_TITLE, color: 'blue' })
+  } catch {
+    // Grouping is cosmetic; a Chrome build without tab groups must not fail a tool call.
+  }
+}
+
+/** Drop labels from groups that no longer hold an owned tab. */
+async function clearIdleTabGroups(): Promise<void> {
+  const groups = chrome.tabGroups as typeof chrome.tabGroups | undefined
+  const pending = [...labelledTabGroups]
+  labelledTabGroups.clear()
+  if (groups === undefined || typeof groups.update !== 'function') return
+  for (const groupId of pending) {
+    try {
+      await groups.update(groupId, { title: '' })
+    } catch {
+      // Chrome already removed the group, or the tab left it.
+    }
+  }
+}
+
+/**
+ * Drive the in-page dot for one tab.
+ *
+ * `off` is always delivered so a page that still holds a dot can remove it,
+ * even after the user switches the overlay off.
+ * @param tabId - target tab, when one is known.
+ * @param state - requested dot state.
+ */
+async function postIndicatorState(tabId: number | undefined, state: 'static' | 'pulsing' | 'off'): Promise<void> {
+  if (tabId === undefined) return
+  if (state !== 'off' && !overlayEnabled()) return
+  if (state === 'off') dotTabs.delete(tabId)
+  else dotTabs.add(tabId)
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: 'DSH_INDICATOR', state })
+  } catch {
+    // The tab is gone, protected, or has no content script yet.
+  }
+}
+
+/** Tab that currently receives visible feedback, when one is resolvable. */
+function workTabId(): number | undefined {
+  const resolution = tabAffinity.resolveTarget()
+  return resolution.kind === 'target' ? resolution.tab.tabId : tabAffinity.snapshot().controlled?.tabId
+}
+
+/**
+ * Show or stop showing active work.
+ * @param active - true while a tool call runs on `tabId`.
+ * @param tabId - tab the call operates; defaults to the controlled tab.
+ */
+function setWorkVisibility(active: boolean, tabId?: number): void {
+  const target = tabId ?? workTabId()
+  setWorkBadge(active)
+  if (active) {
+    if (target !== undefined) void labelWorkTabGroup(target)
+    void postIndicatorState(target, 'pulsing')
+    return
+  }
+  if (overlayEnabled()) void postIndicatorState(target, 'static')
+  else if (target !== undefined && dotTabs.has(target)) void postIndicatorState(target, 'off')
+}
+
+/** Run one dispatch between the two visible-work edges. */
+async function withWorkVisibility<T>(tabId: number | undefined, run: () => Promise<T>): Promise<T> {
+  setWorkVisibility(true, tabId)
+  try {
+    return await run()
+  } finally {
+    setWorkVisibility(false, tabId)
+  }
+}
+
+/**
+ * Drop every connection-scoped trace of work.
+ *
+ * Called when the bridge connection ends or the last panel closes: the badge,
+ * the in-page dot, the owned-tab set, and the labels on now-idle tab groups all
+ * belong to the connection that just ended.
+ * @param reason - which ending observed the reset (for logs and tests).
+ */
+/**
+ * Re-claim the tabs the affinity controller still controls.
+ *
+ * The controlled tab and every session binding survive a socket generation, so
+ * a reconnect must restore their ownership; otherwise a healthy binding would
+ * look like a foreign tab to tab isolation.
+ */
+function claimEstablishedBindings(): void {
+  const state = tabAffinity.snapshot()
+  if (state.controlled !== null) tabAffinity.claimTab(state.controlled.tabId, 'bound')
+  for (const tab of Object.values(tabAffinity.sessionMap())) tabAffinity.claimTab(tab.tabId, 'bound')
+}
+
+function resetSessionScopedState(reason: 'disconnected'): void {
+  const owned = new Set([...tabAffinity.ownedTabOrigins().map((entry) => entry.tabId), ...dotTabs])
+  setWorkBadge(false)
+  // A debugger session is session-scoped: ending the session must release
+  // every attached tab and drop its in-memory telemetry.
+  for (const tabId of owned) {
+    void postIndicatorState(tabId, 'off')
+    forgetTab(tabId)
+  }
+  tabAffinity.clearOwnedTabs()
+  void clearIdleTabGroups()
+  console.log(`browser: session-scoped visibility reset (${reason})`)
 }
 
 /** Which window each panel port belongs to, so a quote stays in its window. */
@@ -816,6 +1326,7 @@ async function resolveToolTab(sessionId?: string): Promise<Pick<chrome.tabs.Tab,
     } catch {
       const affectedSessions = tabAffinity.sessionIdsForTab(resolution.tab.tabId)
       if (tabAffinity.removeTab(resolution.tab.tabId)) {
+        forgetTab(resolution.tab.tabId)
         for (const sid of affectedSessions) {
           activeFollowRefreshes.get(sid)?.controller.abort()
           cancelPendingApprovals(sid)
@@ -861,6 +1372,7 @@ function bindOpenedTab(
 ): boolean {
   const summary = summarizeTab(tab)
   if (summary === null) return false
+  tabAffinity.claimTab(summary.tabId, 'opened')
   const sid = sessionId?.trim()
   bindOpenedTabAffinity(tabAffinity, summary, {
     active: options.active,
@@ -885,7 +1397,10 @@ async function authorizeToolCall(
 ): Promise<ApprovalAuthorization> {
   if (signal.aborted) return 'cancelled'
   if (unrestrictedAccess) return 'approved'
-  if (actionCoveredByTrustedOrigins(
+  // A cross-origin migration always asks for this one operation. The allowlist
+  // covers same-origin work only; moving a page to another origin is a new
+  // decision every time it happens.
+  if (!isCrossOriginPrompt(prompt) && actionCoveredByTrustedOrigins(
     prompt,
     sessionTrustedActionOrigins,
     settings.trustedActionOrigins,
@@ -1055,8 +1570,78 @@ async function pushBudgetToControlledTab(negotiated: BridgeCaps): Promise<void> 
 }
 
 /** Route one tool.call frame to the user-approved controlled tab. */
+/** One `tool.result` frame on the wire. */
+type ToolResultFrame =
+  | { t: 'tool.result'; id: string; ok: true; result: unknown }
+  | { t: 'tool.result'; id: string; ok: false; error: ToolError }
+
+/** Count UTF-8 bytes without materializing a second copy for callers. */
+function utf8Length(text: string): number {
+  return new TextEncoder().encode(text).length
+}
+
+/**
+ * Send one tool result, refusing results that exceed the shared frame cap.
+ *
+ * The bridge enforces the same cap inbound, so an oversized result is replaced
+ * here by a small `send_failed` error frame: the model learns why the answer is
+ * missing instead of the call hanging until the Host timeout.
+ * @param frame - the result frame to send.
+ */
+function sendToolResultFrame(frame: ToolResultFrame): void {
+  const socket = bridge
+  if (socket === null) return
+  let bytes: number
+  try {
+    bytes = utf8Length(JSON.stringify(frame))
+  } catch {
+    socket.send({
+      t: 'tool.result',
+      id: frame.id,
+      ok: false,
+      error: { code: 'js-result-not-serializable', message: 'The tool result could not be serialized' },
+    })
+    return
+  }
+  if (bytes > MAX_FRAME_BYTES) {
+    socket.send({
+      t: 'tool.result',
+      id: frame.id,
+      ok: false,
+      error: {
+        code: 'send_failed',
+        message: `tool result of ${bytes} bytes exceeds the ${MAX_FRAME_BYTES} byte frame cap`,
+      },
+    })
+    return
+  }
+  socket.send(frame)
+}
+
+/**
+ * Settle the tool call whose frame the bridge refused.
+ *
+ * The notice names one call: a backpressure drop must not abort unrelated
+ * work that is still executing. A notice without an id (older peer) is only
+ * recorded as an orphan event and never aborts anything.
+ * @param toolCallId - the refused call id, when the bridge named one.
+ * @param message - the bridge's explanation of the refused frame.
+ */
+function settleInFlightAsSendFailed(toolCallId: string | undefined, message: string): void {
+  const call = toolCallId === undefined ? undefined : activeToolCalls.get(toolCallId)
+  if (call === undefined) {
+    console.warn(`[${BRIDGE_LOG_NAMESPACE}.send_failed_orphan] ${JSON.stringify({ toolCallId, message })}`)
+    return
+  }
+  activeToolCalls.delete(toolCallId as string)
+  call.controller.abort()
+  sendToolResultFrame({ t: 'tool.result', id: toolCallId as string, ok: false, error: { code: 'send_failed', message } })
+}
+
 function routeToolCall(call: ToolCall): void {
   if (bridge === null) return
+  noteToolActivity()
+  void syncOffscreenKeepAlive()
   activeToolCalls.get(call.id)?.controller.abort()
   const controller = new AbortController()
   const unrestrictedAccess = unrestrictedAccessEnabled()
@@ -1107,8 +1692,14 @@ function routeToolCall(call: ToolCall): void {
       undefined,
       {
         unrestrictedAccess,
+        tabIsolation: settings.tabIsolation,
+        ownsTab: (tabId) => tabAffinity.ownsTab(tabId),
         ...(controlledTabId === undefined ? {} : { controlledTabId }),
-        followTab: (tab) => followModelSelectedTab(tab, call.sessionId),
+        followTab: (tab) => {
+          // browser_follow_tab is the one model-facing way to widen the owned set.
+          if (tab.id !== undefined) tabAffinity.claimTab(tab.id, 'followed')
+          return followModelSelectedTab(tab, call.sessionId)
+        },
         commitAction,
         rollbackActionCommit,
       },
@@ -1117,9 +1708,9 @@ function routeToolCall(call: ToolCall): void {
   void (isTabManagementTool(call.name)
     ? managementDispatch()
     : call.name === 'browser_open_tab'
-    ? resolveOpenTabWindow(call.sessionId).then((target) => 'ok' in target
+    ? resolveOpenTabWindow(call.sessionId).then(async (target) => 'ok' in target
       ? target
-      : dispatchOpenTab(
+      : withWorkVisibility(target.windowId === undefined ? undefined : workTabId(), () => dispatchOpenTab(
           call,
           target.windowId,
           sharePageContent,
@@ -1129,10 +1720,10 @@ function routeToolCall(call: ToolCall): void {
           (tab) => bindOpenedTab(tab, call.sessionId, { active: call.args.active !== false }),
           (tabId) => tabAffinity.allowsTarget(tabId, call.sessionId),
           commitAction,
-        ))
-    : resolveToolTab(call.sessionId).then((target) => 'ok' in target
+        )))
+    : resolveToolTab(call.sessionId).then(async (target) => 'ok' in target
       ? target
-      : dispatchToolCall(
+      : withWorkVisibility(target.id, () => dispatchToolCall(
           call,
           sharePageContent,
           budget,
@@ -1140,16 +1731,25 @@ function routeToolCall(call: ToolCall): void {
           controller.signal,
           target,
           () => target.id !== undefined && tabAffinity.allowsTarget(target.id, call.sessionId),
-          { unrestrictedAccess, commitAction, rollbackActionCommit },
-        ))
+          {
+            unrestrictedAccess,
+            tabIsolation: settings.tabIsolation,
+            ownsTab: (tabId) => tabAffinity.ownsTab(tabId),
+            commitAction,
+            rollbackActionCommit,
+          },
+        )))
   ).then(
     async (answer) => {
+      // Recording hook: captures are throttled inside captureRecordingFrame, so
+      // a burst of tool calls only yields the frames it has budget for.
+      if (recording !== null) void captureRecordingFrame(call.name)
       if (activeToolCalls.get(call.id) !== activeCall) return
       // A committed browser_open_tab already rebound affinity; prefer that
       // factual success over a generic cancel that would leave the model wrong.
       if (controller.signal.aborted && !(call.name === 'browser_open_tab' && answer.ok)) {
         if (activeToolCalls.get(call.id) === activeCall) {
-          bridge?.send({
+          sendToolResultFrame({
             t: 'tool.result',
             id: call.id,
             ok: false,
@@ -1163,18 +1763,19 @@ function routeToolCall(call: ToolCall): void {
         if (activeToolCalls.get(call.id) !== activeCall) return
         const socket = bridge
         if (socket === null) return
-        socket.send({ t: 'tool.result', id: call.id, ok: true, result: answer.result })
+        sendToolResultFrame({ t: 'tool.result', id: call.id, ok: true, result: answer.result })
       } else {
         const socket = bridge
         if (socket === null) return
-        socket.send({ t: 'tool.result', id: call.id, ok: false, error: answer.error! })
+        const normalized = normalizeToolError(answer.error)
+        sendToolResultFrame({ t: 'tool.result', id: call.id, ok: false, error: normalized })
       }
     },
     (error: unknown) => {
       if (activeToolCalls.get(call.id) !== activeCall) return
       if (controller.signal.aborted) {
         if (activeToolCalls.get(call.id) === activeCall) {
-          bridge?.send({
+          sendToolResultFrame({
             t: 'tool.result',
             id: call.id,
             ok: false,
@@ -1183,11 +1784,11 @@ function routeToolCall(call: ToolCall): void {
         }
         return
       }
-      bridge?.send({
+      sendToolResultFrame({
         t: 'tool.result',
         id: call.id,
         ok: false,
-        error: { code: 'internal', message: error instanceof Error ? error.message : String(error) },
+        error: normalizeToolError(error),
       })
     },
   ).finally(() => {
@@ -1258,6 +1859,14 @@ async function startBridge(): Promise<void> {
           cancelAllToolCalls()
           interactionResponses.failAll(responseMessages().disconnected)
           transientEvents.clear()
+          // `connecting`/`reconnecting` are transient generations of the same
+          // session: the user's controlled tab and bindings are still valid, so
+          // ownership must survive them. Only a stopped connection (or an
+          // explicit session clear) ends the session-scoped state.
+          if (state === 'stopped') resetSessionScopedState('disconnected')
+        } else {
+          // A reconnect re-establishes the session; re-claim what it still controls.
+          claimEstablishedBindings()
         }
         broadcastStatus()
         if (state === 'stopped') refreshPanelResumeHints()
@@ -1271,6 +1880,13 @@ async function startBridge(): Promise<void> {
         else if (frame.t === 'tool.call') routeToolCall(frame)
         else if (frame.t === 'tool.cancel') cancelToolCall(frame.id)
         else if (frame.t === 'respond.result') interactionResponses.route(frame)
+        else if (frame.t === 'error') {
+          // A refused outbound frame carries no tool id: every in-flight call
+          // can no longer be answered, so settle them all instead of waiting
+          // for the per-call timeout. Other error codes keep the existing
+          // semantics: the socket state, not this frame, drives reconnection.
+          if (frame.code === 'send_failed') settleInFlightAsSendFailed(frame.id, frame.message)
+        }
         // rpc.result is settled by the rpc facade (wrapped below).
       },
       onHelloOk: (negotiated) => {
@@ -1300,8 +1916,31 @@ async function gatewayRpc(method: string, payload: unknown): Promise<unknown> {
 chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
   if (typeof message !== 'object' || message === null) return
   if (sender.id !== chrome.runtime.id) return
-  if (sender.tab?.id === undefined) return
   const type = (message as { type?: unknown }).type
+  if (type === 'SW_KEEPALIVE') {
+    // The offscreen document has no tab, so this branch must precede the
+    // tab-scoped content-script handling below.
+    const at = noteSwKeepAlive()
+    sendResponse({ ok: true, at })
+    return
+  }
+  if (type === OFFSCREEN_GIF_SWEPT_MESSAGE) {
+    // The downloaded recording's blob URL was released; the offscreen document
+    // has no tab, so this branch must also precede the tab-scoped handling.
+    bumpEvent('artifact.swept')
+    broadcastDiagnostics()
+    sendResponse({ ok: true })
+    return
+  }
+  if (sender.tab?.id === undefined) return
+  if (type === 'DSH_INSTRUMENT_EVENT') {
+    // MAIN-world hook entries (debugger-unavailable fallback) arrive from the
+    // content script, which forwards the page's postMessage payload.
+    const entry = (message as { entry?: unknown }).entry
+    if (isInstrumentEntry(entry)) recordInstrumentEntry(sender.tab.id, entry)
+    sendResponse({ ok: true })
+    return
+  }
   if (type === 'DSH_CONTENT_READY') {
     // navigation.ts also listens for this frame-ready announcement; only this
     // listener answers it, telling a fresh document whether to watch
@@ -1328,6 +1967,8 @@ chrome.runtime.onConnect.addListener((port) => {
   }>()
   panelPorts.add(port)
   if (wasIdle) armBridgeKeepalive()
+  // Receipts that arrived while no panel was connected are replayed once.
+  interactionResponses.flush(port)
   void settingsReady.then(syncSelectionWatch)
   void settingsReady.then(() => {
     if (!panelPorts.has(port)) return
@@ -1560,9 +2201,28 @@ chrome.runtime.onConnect.addListener((port) => {
         })
         break
       }
+      case 'recording.start': {
+        const recordingWindowId = panelWindows.get(port)
+        if (recordingWindowId === undefined) {
+          broadcastRecording(getUiLocale() === 'zh'
+            ? '侧边栏窗口尚未就绪，请重新打开面板后再录制'
+            : 'The panel window is not ready yet; reopen the panel and try again')
+          break
+        }
+        startRecording(recordingWindowId)
+        break
+      }
+      case 'recording.export':
+        void exportRecording()
+        break
+      case 'recording.clear':
+        clearRecording()
+        break
       case 'request-status':
         try {
           port.postMessage({ type: 'status', state: bridge?.state ?? ('stopped' as BridgeState), caps })
+          port.postMessage({ type: 'recording', status: currentRecordingStatus() })
+          port.postMessage({ type: 'diagnostics', counts: eventCounters.snapshot() })
           port.postMessage({ type: 'tab-affinity', state: tabAffinity.snapshot() })
           const statusWindowId = panelWindows.get(port)
           if (statusWindowId !== undefined) {
@@ -1603,6 +2263,9 @@ chrome.runtime.onConnect.addListener((port) => {
       bridge?.suspendReconnect()
       sessionTrustedActionOrigins.clear()
       approvals.notifyPending()
+      // Closing a panel does not end the session: the bridge socket may still be
+      // connected and the agent may keep working. Only the connection ending
+      // clears ownership and visible-work state.
       if (bridge?.state !== 'connected') disarmBridgeKeepalive()
     }
   })
@@ -1658,6 +2321,7 @@ chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
       activeFollowRefreshes.get(sid)?.controller.abort()
       cancelPendingApprovals(sid)
     }
+    forgetTab(removedTabId)
     resetTabSnapshot(removedTabId)
     resetTabSnapshot(addedTabId)
     persistTabAffinity()
@@ -1670,6 +2334,7 @@ chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
 })
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  forgetTab(tabId)
   broadcastSelections(selections.clearTab(tabId))
   void pageSessionContexts.ready.then(() => {
     pageSessionContexts.removeTab(tabId)
@@ -1690,7 +2355,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // fragment update does not, and must not drop a quote still on the screen.
 // Matching the exact frame keeps an iframe's navigation from invalidating a
 // quote taken from its parent page, and vice versa.
-chrome.webNavigation.onCommitted.addListener(({ tabId, frameId }) => {
+chrome.webNavigation.onCommitted.addListener(({ tabId, frameId, url }) => {
+  if (frameId === 0) noteTabNavigation(tabId, url)
   broadcastSelections(selections.clearTab(tabId, frameId))
 })
 
@@ -1710,6 +2376,9 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== BRIDGE_KEEPALIVE_ALARM) return
+  // The idle window is evaluated on the same tick as the reconnect re-arm so a
+  // quiet connected worker releases the heartbeat without any panel event.
+  void syncOffscreenKeepAlive()
   if (panelPorts.size === 0) {
     if (bridge === null || bridge.state !== 'connected') disarmBridgeKeepalive()
     return

@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { isClientFrame, isServerFrame, parseBridgeFrame } from '../src/protocol.ts'
+import {
+  MAX_FRAME_BYTES,
+  MAX_INFLIGHT_SENDS,
+  isClientFrame,
+  isServerFrame,
+  parseBridgeFrame,
+} from '../src/protocol.ts'
 
 describe('parseBridgeFrame', () => {
   it('parses a valid hello frame', () => {
@@ -151,3 +157,59 @@ function clientShape(t: 'hello' | 'rpc' | 'respond' | 'tool.result' | 'pong'): R
     case 'pong': return { t }
   }
 }
+
+describe('tool error vocabulary and send budget', () => {
+  it('accepts every added code as an open-set tool error', () => {
+    for (const code of [
+      'tab_outside',
+      'protected-page',
+      'js-result-not-serializable',
+      'debugger-unavailable',
+      'send_failed',
+    ]) {
+      const text = JSON.stringify({ t: 'tool.result', id: 'x', ok: false, error: { code, message: 'm' } })
+      expect(parseBridgeFrame(text)).toEqual({
+        t: 'tool.result',
+        id: 'x',
+        ok: false,
+        error: { code, message: 'm' },
+      })
+    }
+  })
+
+  it('still accepts a code minted by a newer peer', () => {
+    const text = JSON.stringify({
+      t: 'tool.result',
+      id: 'x',
+      ok: false,
+      error: { code: 'code-from-a-future-peer', message: 'm' },
+    })
+    expect(parseBridgeFrame(text)).toEqual({
+      t: 'tool.result',
+      id: 'x',
+      ok: false,
+      error: { code: 'code-from-a-future-peer', message: 'm' },
+    })
+  })
+
+  it('pins the shared frame cap and send budget', () => {
+    expect(MAX_FRAME_BYTES).toBe(16 * 1024 * 1024)
+    expect(MAX_INFLIGHT_SENDS).toBe(8)
+  })
+})
+
+describe('send_failed notices', () => {
+  it('parses an error frame that names the refused tool call', () => {
+    expect(parseBridgeFrame(JSON.stringify({ t: 'error', code: 'send_failed', message: 'too large', id: 'call-1' })))
+      .toEqual({ t: 'error', code: 'send_failed', message: 'too large', id: 'call-1' })
+  })
+
+  it('still parses an older error frame without an id', () => {
+    expect(parseBridgeFrame(JSON.stringify({ t: 'error', code: 'send_failed', message: 'too large' })))
+      .toEqual({ t: 'error', code: 'send_failed', message: 'too large' })
+  })
+
+  it('rejects a non-string id instead of dropping the code', () => {
+    expect(parseBridgeFrame(JSON.stringify({ t: 'error', code: 'x', message: 'm', id: 7 }))).toBeUndefined()
+  })
+})

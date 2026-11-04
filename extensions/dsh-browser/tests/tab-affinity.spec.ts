@@ -328,3 +328,40 @@ describe('TabAffinityController', () => {
     expect(restoredAffinity.allowsTarget(2, 'session-missing')).toBe(false)
   })
 })
+
+describe('ownership release notices', () => {
+  it('reports a tab whose claim is dropped by removeTab or replaceTab', () => {
+    const affinity = new TabAffinityController()
+    const released: number[] = []
+    affinity.onOwnershipReleased = (tabId) => { released.push(tabId) }
+    affinity.claimTab(4, 'opened')
+    affinity.claimTab(5, 'opened')
+
+    expect(affinity.removeTab(4)).toBe(true)
+    expect(released).toEqual([4])
+
+    affinity.replaceTab(5, 6)
+    expect(released).toEqual([4, 5])
+    expect(affinity.ownsTab(6)).toBe(true)
+    expect(affinity.ownsTab(5)).toBe(false)
+  })
+
+  it('reports every claim dropped with the connection', () => {
+    const affinity = new TabAffinityController()
+    const released: number[] = []
+    affinity.onOwnershipReleased = (tabId) => { released.push(tabId) }
+    affinity.claimTab(7, 'bound')
+    affinity.claimTab(8, 'followed')
+    affinity.clearOwnedTabs()
+    expect(released.sort((left, right) => left - right)).toEqual([7, 8])
+    expect(affinity.ownsTab(7)).toBe(false)
+  })
+
+  it('keeps the state machine usable when a release callback throws', () => {
+    const affinity = new TabAffinityController()
+    affinity.onOwnershipReleased = () => { throw new Error('cleanup failed') }
+    affinity.claimTab(9, 'opened')
+    expect(() => affinity.clearOwnedTabs()).not.toThrow()
+    expect(affinity.ownsTab(9)).toBe(false)
+  })
+})

@@ -6,6 +6,13 @@
  * The reconnect policy mirrors the dsh GUI's own ConnectionController: base
  * 500ms, ×2 per attempt, capped at 10s, jittered 0.5–1×.
  *
+ * Liveness is owned by two deadlines rather than by hope: a socket that has
+ * not completed the `hello` handshake within {@link CONNECT_TIMEOUT_MS} is
+ * declared dead, and a connected socket that shows no inbound traffic for
+ * {@link IDLE_TIMEOUT_MS} is closed so the reconnect loop rebuilds it. Every
+ * lifecycle decision is logged under `bridge_browser.bridge.*` so a field
+ * report can be reconstructed from the service worker console alone.
+ *
  * @module
  */
 
@@ -15,6 +22,7 @@ import {
   isServerFrame,
   parseBridgeFrame,
 } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
+import { bumpEvent } from './events.ts'
 
 /** Coarse connection state for the UI. */
 export type BridgeState = 'connecting' | 'connected' | 'reconnecting' | 'stopped'
@@ -31,7 +39,23 @@ type BridgeProbe = (url: string) => Promise<boolean>
 
 const BACKOFF_BASE_MS = 500
 const BACKOFF_MAX_MS = 10_000
-const HELLO_ACK_TIMEOUT_MS = 5_000
+
+/** Deadline for socket open + `hello.ok`; a socket past it is treated as dead. */
+export const CONNECT_TIMEOUT_MS = 30_000
+/** Inbound silence after which a connected socket is rebuilt. */
+export const IDLE_TIMEOUT_MS = 90_000
+/** How often the idle deadline is evaluated. */
+export const WATCHDOG_INTERVAL_MS = 5_000
+/** Namespace prefix of every lifecycle log line. */
+export const BRIDGE_LOG_NAMESPACE = 'bridge_browser.bridge'
+
+/** Emit one namespaced lifecycle line (local console only; no telemetry). */
+function logEvent(event: string, detail?: Record<string, unknown>, level: 'info' | 'warn' = 'info'): void {
+  const suffix = detail === undefined ? '' : ` ${JSON.stringify(detail)}`
+  const line = `[${BRIDGE_LOG_NAMESPACE}.${event}]${suffix}`
+  if (level === 'warn') console.warn(line)
+  else console.info(line)
+}
 
 /**
  * Owns one WebSocket connection generation and the reconnect loop.
@@ -44,7 +68,12 @@ export class BridgeClient {
   private generation = 0
   private url = ''
   private token = ''
-  private ackTimer: ReturnType<typeof setTimeout> | undefined
+  private connectTimer: ReturnType<typeof setTimeout> | undefined
+  private watchdog: ReturnType<typeof setInterval> | undefined
+  /** Last inbound frame, which is what proves the peer is alive. */
+  private lastActivityAt = 0
+  /** Last successful outbound write; diagnostics only, never an idle deadline input. */
+  private lastSendAt = 0
 
   constructor(
     readonly sinks: BridgeSinks,
@@ -68,14 +97,18 @@ export class BridgeClient {
     this.token = token
     this.running = true
     this.attempt = 0
+    this.lastActivityAt = Date.now()
     this.generation += 1
+    logEvent('connect.start', { attempt: this.attempt })
+    this.startWatchdog()
     void this.loop(this.generation)
   }
 
   /** Stop the loop and close the current socket. */
   stop(): void {
     this.running = false
-    this.clearAckTimer()
+    this.clearConnectTimer()
+    this.stopWatchdog()
     this.ws?.close()
     this.ws = null
     this.emitState('stopped')
@@ -96,6 +129,11 @@ export class BridgeClient {
     return this.ws !== null && this.ws.readyState === WebSocket.OPEN
   }
 
+  /** Timestamp of the last successful outbound write (diagnostics only). */
+  get lastOutboundAt(): number {
+    return this.lastSendAt
+  }
+
   /**
    * Send one client frame.
    * @param frame - frame to send.
@@ -104,8 +142,20 @@ export class BridgeClient {
   send(frame: ClientFrame): boolean {
     const socket = this.ws
     if (socket === null || socket.readyState !== WebSocket.OPEN) return false
-    socket.send(JSON.stringify(frame))
-    return true
+    try {
+      socket.send(JSON.stringify(frame))
+      // Outbound traffic proves nothing about the peer: only an inbound frame
+      // refreshes the idle deadline, so a peer that stopped reading is still
+      // detected. This timestamp exists for diagnostics only.
+      this.lastSendAt = Date.now()
+      return true
+    } catch (error: unknown) {
+      logEvent('send.failed', {
+        frame: frame.t,
+        error: error instanceof Error ? error.message : String(error),
+      }, 'warn')
+      return false
+    }
   }
 
   private async loop(generation: number): Promise<void> {
@@ -122,14 +172,16 @@ export class BridgeClient {
 
       const socket = new WebSocket(this.url)
       this.ws = socket
+      this.armConnectTimeout(socket)
       // A replacement is an ownership handoff, not a transient transport
       // failure. Yield permanently so two open profiles cannot reconnect in a
       // tight loop and repeatedly evict one another.
       socket.addEventListener('close', (event) => {
         if (event.code !== 4000 || this.ws !== socket || !this.running) return
         this.running = false
-        this.clearAckTimer()
+        this.clearConnectTimer()
         this.ws = null
+        logEvent('replaced', { code: event.code }, 'warn')
         this.emitState('stopped')
       }, { once: true })
       this.emitState('connecting')
@@ -160,10 +212,12 @@ export class BridgeClient {
         const onMessage = (event: MessageEvent): void => {
           const frame = parseBridgeFrame(String(event.data))
           if (frame === undefined) return
+          this.lastActivityAt = Date.now()
           if (!authed) {
             if (frame.t === 'hello.ok') {
               authed = true
-              this.clearAckTimer()
+              this.clearConnectTimer()
+              logEvent('hello.ok', { snapshotMaxChars: frame.caps.snapshotMaxChars })
               resolve(true)
               this.sinks.onHelloOk(frame.caps)
             } else if (frame.t === 'error' || frame.t === 'rpc.result' || frame.t === 'event') {
@@ -179,10 +233,9 @@ export class BridgeClient {
         }
         socket.addEventListener('message', onMessage)
         socket.addEventListener('close', () => {
-          this.clearAckTimer()
+          this.clearConnectTimer()
           resolve(false)
         }, { once: true })
-        this.ackTimer = setTimeout(() => resolve(false), HELLO_ACK_TIMEOUT_MS)
       })
       if (!accepted || !this.running || generation !== this.generation) {
         await this.fail(socket)
@@ -190,6 +243,8 @@ export class BridgeClient {
       }
 
       this.attempt = 0
+      this.lastActivityAt = Date.now()
+      bumpEvent('bridge.connected')
       this.emitState('connected')
 
       await new Promise<void>((resolve) => {
@@ -206,11 +261,13 @@ export class BridgeClient {
 
   private async fail(socket: WebSocket): Promise<void> {
     if (this.ws === socket) this.ws = null
+    this.clearConnectTimer()
     if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
       socket.close()
     }
     if (!this.running) return
     if (!this.retryAllowed()) return
+    logEvent('reconnect.scheduled', { attempt: this.attempt + 1 }, 'warn')
     this.emitState('reconnecting')
     await this.waitBeforeRetry()
   }
@@ -229,11 +286,47 @@ export class BridgeClient {
     await new Promise<void>((resolve) => { setTimeout(resolve, delay) })
   }
 
-  private clearAckTimer(): void {
-    if (this.ackTimer !== undefined) {
-      clearTimeout(this.ackTimer)
-      this.ackTimer = undefined
+  /** Start the handshake deadline for one socket generation. */
+  private armConnectTimeout(socket: WebSocket): void {
+    this.clearConnectTimer()
+    this.connectTimer = setTimeout(() => {
+      this.connectTimer = undefined
+      bumpEvent('bridge.connect_timeout')
+      logEvent('connect.timeout', { deadlineMs: CONNECT_TIMEOUT_MS }, 'warn')
+      // Closing resolves the handshake promise; the loop's fail() path then
+      // schedules the bounded reconnect instead of leaving a half-open socket.
+      socket.close(4008, 'connect timeout')
+    }, CONNECT_TIMEOUT_MS)
+  }
+
+  private clearConnectTimer(): void {
+    if (this.connectTimer !== undefined) {
+      clearTimeout(this.connectTimer)
+      this.connectTimer = undefined
     }
+  }
+
+  private startWatchdog(): void {
+    this.stopWatchdog()
+    this.watchdog = setInterval(() => { this.checkIdle() }, WATCHDOG_INTERVAL_MS)
+  }
+
+  private stopWatchdog(): void {
+    if (this.watchdog !== undefined) {
+      clearInterval(this.watchdog)
+      this.watchdog = undefined
+    }
+  }
+
+  /** Close a connected socket that has shown no inbound traffic within the deadline. */
+  private checkIdle(): void {
+    if (this.state !== 'connected' || this.ws === null) return
+    const idleMs = Date.now() - this.lastActivityAt
+    if (idleMs < IDLE_TIMEOUT_MS) return
+    bumpEvent('bridge.stale_reconnect')
+    logEvent('idle.timeout', { idleMs, deadlineMs: IDLE_TIMEOUT_MS }, 'warn')
+    this.clearConnectTimer()
+    this.ws.close(4009, 'idle timeout')
   }
 
   private emitState(state: BridgeState): void {

@@ -8,7 +8,7 @@ Connect [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) to t
 
 `dsh` is DeepSeek AI's open-source, plugin-based agent harness. This repository provides a companion browser bridge plugin and Chrome/Firefox MV3 extension as one standalone pnpm workspace.
 
-Browser operation remains text-only: pages become structured text with a numbered inventory of interactive elements, and the model addresses those elements by number. dsh 0.2.0 multimodal chat is separate from that page channel—the side panel accepts PNG, JPEG, WebP, and GIF attachments when the host advertises image support, while browser tools still never capture screenshots.
+Browser operation stays text-first: pages become structured text with a numbered inventory of interactive elements, and the model addresses those elements by number. dsh 0.2.0 multimodal chat is separate from that page channel—the side panel accepts PNG, JPEG, WebP, and GIF attachments when the host advertises image support. The only page pixels the model can obtain are an explicit `browser_screenshot` call, which saves a file the model must read back with `read_image`.
 
 > [!IMPORTANT]
 > The workspace pins dsh 0.2.0-rc.2, the minimum supported runtime. Older DSH releases are not supported.
@@ -60,6 +60,16 @@ The paired Playwright / extension duration ratio was **1.24** (95% CI **1.16–1
 | Close tab | `browser_close_tab` | Close a tab returned by `browser_list_tabs` |
 | Read region | `browser_get_text` | Lazy-loaded or partial page text |
 | Wait for stability | `browser_wait` | Page-load and render-settle detection |
+| Choose an option | `browser_select` | Select by option value, label, or index; an unmatched value lists what is available |
+| Search the inventory | `browser_find` | Rank inventory elements against a query and return the closest indices |
+| Attach files | `browser_upload_file` | Set a file input from files inside the session workspace or artifact root, or from inline bytes capped at 10 MB |
+| Hover and drag | `browser_hover` / `browser_drag` | By inventory index or viewport coordinates; real input events through a debugger session, synthesized DOM events otherwise |
+| Click variants | `browser_click` with `button` / `count` / `modifiers` | Right/middle click, double/triple click, and modifier chords |
+| Run page JavaScript | `browser_evaluate` | Requires approval; results are redacted and length-capped |
+| Screenshot | `browser_screenshot` | Whole viewport or a clipped region, written by the host as a file path |
+| Console and network | `browser_console` / `browser_network` | Buffered per tab from the first call; credentials redacted, request bodies recorded as byte counts |
+| Resize the window | `browser_resize` | Resize the window holding the controlled tab |
+| Batch calls | `browser_batch` | Up to 25 sequential tool calls, stop at the first failure |
 | Send images | `session.prompt` / `session.attachment` | Host-capability-gated image drafts, image-only prompts, and durable history previews |
 | Quote a selection | side panel composer | Text you highlight in the page appears in the composer and is sent with your next message as fenced, attributed page content |
 
@@ -185,9 +195,10 @@ If you encounter `cache.hydratePrepared is not a function`, update the repositor
 - The bridge path sits outside the `/api` trust boundary and performs its own bearer-token authentication.
 - Local Chrome extension origins retain zero-configuration loopback access; Firefox origins are per-install UUIDs and must present the bearer token.
 - Privileged gateway methods such as `settings.*`, `credentials.*`, and `host.open*` reject non-loopback sources.
-- The browser-page pipeline is text-only and never captures screenshots; explicitly attached chat images use dsh's durable attachment service. Password and payment-card values never leave the page.
+- The browser-page pipeline reads pages as text by default; the only page pixels come from an explicit `browser_screenshot` call, which the host saves as a file the model reads back through `read_image`. Explicitly attached chat images use dsh's durable attachment service. Password and payment-card values never leave the page.
 - When work begins, the assistant binds to the active tab (at prompt submission, or at the first direct browser-tool call). If you switch tabs manually, later browser actions pause and the side panel asks whether the assistant should continue on the original tab or follow the new one. Choosing the original tab permits background operation; the extension never silently retargets or changes your visible tab. Closing the controlled tab also pauses tools until you explicitly select the current page.
 - Text you highlight is captured only while a side panel is open and page sharing is not `off`, and never from password or payment-card fields. It stays inside the extension until you send the message, is dropped when you dismiss it or its page navigates or closes, and reaches the model inside the same untrusted-content boundary as page snapshots — including its source title and URL, which the page also controls.
 - Page-authored text is wrapped as untrusted input. The default `auto` mode reads only the controlled tab without an extra prompt; privacy-sensitive users can select `ask` for per-read confirmation or `off` to block reads entirely. In `ask` mode, the read dialog can allow one read or persistently switch back to `auto`; this can be reversed in Settings. Read page text is sent to the selected model.
-- Click, type, keypress, navigation, history, and reload calls fail closed until the user approves them. An origin may be trusted for the current side-panel session (cleared when the last panel closes or the service worker restarts), while permanent trust is managed explicitly in Settings. Explicit cross-origin `browser_navigate` calls and unknown history destinations always prompt again.
+- Click, type, keypress, select, drag, file upload, page JavaScript, navigation, history, reload, and window resize calls fail closed until the user approves them. An origin may be trusted for the current side-panel session (cleared when the last panel closes or the service worker restarts), while permanent trust is managed explicitly in Settings. Explicit cross-origin `browser_navigate` calls and unknown history destinations always prompt again.
+- Real pointer input, page JavaScript execution, clip/scale screenshots, and the console/network buffers use a `debugger` session scoped to the controlled tab: it attaches on demand, detaches after 60 seconds idle or when the tab leaves the session's ownership, and never targets a tab the user has not handed to this session. Chrome shows its "started debugging this browser" bar while attached; dismissing it drops those tools to the DOM-only implementation and the result says so.
 - **Allow unrestricted browser control** is an explicit global opt-in. It becomes active only after the setting is saved successfully; while enabled, page reads, page actions, and tab list/follow/close operations run without approval prompts. Calls capture their access mode when received, so enabling unrestricted control never retroactively elevates an existing restricted call. Disabling it takes effect immediately, cancels calls that have not dispatched an action, waits for already-dispatched browser operations to settle, and only then saves the restrictive setting. A rapid re-enable remains restricted until that revocation finishes, and concurrent saves persist in request order. Browser-protected DOM content remains inaccessible in either mode.

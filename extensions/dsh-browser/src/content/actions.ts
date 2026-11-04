@@ -1,8 +1,9 @@
 /**
- * Page actions: click/type/press/scroll/navigate/get_text/wait, executed in
- * the content script against the real page (preserving login state), each
- * returning a short text status. Navigations return a fresh full snapshot
- * because the document — and the id registry — reset.
+ * Page actions: click/type/press/scroll/navigate/get_text/wait plus
+ * select/hover/drag/upload_file/find, executed in the content script against
+ * the real page (preserving login state), each returning a short text status.
+ * Navigations return a fresh full snapshot because the document — and the id
+ * registry — reset.
  *
  * All browser action results use structured text, so a
  * status line tells the model what happened and what state remains.
@@ -10,10 +11,16 @@
  * @module
  */
 
+import { ActionError, elementOrThrow, numberArg } from './action-support.ts'
+import { selectAction, uploadFileAction } from './element-actions.ts'
 import { pageText, truncate } from './extract.ts'
+import { findAction } from './find.ts'
 import type { ElementIds } from './ids.ts'
+import { dragAction, dragRectsAction, hoverAction, pointerRectAction } from './pointer-actions.ts'
 import type { SnapshotBudget } from './snapshot.ts'
 import { buildSnapshot, renderSnapshot } from './snapshot.ts'
+
+export { ActionError } from './action-support.ts'
 
 /** A settled action result. */
 export interface ActionResult {
@@ -123,25 +130,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => { setTimeout(resolve, ms) })
 }
 
-function elementOrThrow(ids: ElementIds, index: number): Element {
-  const el = ids.elementByIndex(index)
-  if (el === undefined) {
-    throw new ActionError('action-failed', `Element [${index}] does not exist; the page may have changed. Call browser_snapshot again to get current indices.`)
-  }
-  return el
-}
-
-/** Error carrying a stable wire code. */
-export class ActionError extends Error {
-  constructor(
-    readonly code: 'action-failed' | 'bad-args',
-    message: string,
-  ) {
-    super(message)
-    this.name = 'ActionError'
-  }
-}
-
 /** React-compatible value write: native setter + input/change events. */
 function setNativeValue(input: HTMLInputElement | HTMLTextAreaElement, value: string): void {
   const prototype = input instanceof HTMLTextAreaElement
@@ -190,9 +178,39 @@ export async function runAction(action: string, args: Record<string, unknown>, c
       return getTextAction(args)
     case 'browser_wait':
       return waitAction(args, ctx)
+    case 'browser_select':
+      return settledElementAction(selectAction(args, ctx.ids), ctx)
+    case 'browser_hover':
+      return settledElementAction(hoverAction(args, ctx.ids), ctx)
+    case 'browser_pointer_rect':
+      return await pointerRectResult(args, ctx)
+    case 'browser_drag':
+      return settledElementAction(dragAction(args, ctx.ids), ctx)
+    case 'browser_upload_file':
+      return settledElementAction(uploadFileAction(args, ctx.ids), ctx)
+    case 'browser_find':
+      return { text: findAction(args, ctx.ids, ctx.budget) }
     default:
       throw new ActionError('bad-args', `Unknown action: ${action}`)
   }
+}
+
+/**
+ * Answer the background's internal coordinate lookup for real input dispatch.
+ *
+ * Runs `settle` when the background asks for the post-dispatch page delta, and
+ * shares `withPageDelta` so a CDP-driven hover/drag still returns the same
+ * automatic page context as the synthesized path.
+ * @param args - `index`/`x`/`y`, or a drag endpoint form, plus `settle`.
+ * @param ctx - action context carrying the id registry and delta gate.
+ * @returns the viewport geometry as JSON text, plus any permitted page delta.
+ */
+async function pointerRectResult(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
+  if (args.settle === true) await waitForPageSettled(ACTION_SETTLE)
+  const drag = args.from_index !== undefined || args.to_index !== undefined
+    || args.from !== undefined || args.to !== undefined
+  const rects = drag ? dragRectsAction(args, ctx.ids) : pointerRectAction(args, ctx.ids)
+  return withPageDelta(JSON.stringify(rects), ctx)
 }
 
 function snapshotAction(args: Record<string, unknown>, ctx: ActionContext): ActionResult {
@@ -223,10 +241,171 @@ function withPageDelta(text: string, ctx: ActionContext): ActionResult {
   }
 }
 
+/**
+ * Run an element action, then report the page delta it caused.
+ *
+ * Element actions share one settle-and-delta path so the returned context and
+ * the delta baseline stay consistent with click/type.
+ *
+ * @param work - the element action, already addressed through `ctx.ids`.
+ * @param ctx - action context carrying the id registry and delta gate.
+ * @returns the action's status line plus any permitted page delta.
+ */
+async function settledElementAction(work: string | Promise<string>, ctx: ActionContext): Promise<ActionResult> {
+  const text = await work
+  await waitForPageSettled(ACTION_SETTLE)
+  return withPageDelta(text, ctx)
+}
+
+/** Modifier booleans a synthesized click event carries. */
+interface ClickModifiers {
+  altKey: boolean
+  ctrlKey: boolean
+  metaKey: boolean
+  shiftKey: boolean
+}
+
+/** Parsed `browser_click` pointer options. */
+interface ClickOptions {
+  button: 'left' | 'right' | 'middle'
+  count: number
+  modifiers: ClickModifiers
+  /** True when any option argument was supplied, which selects the synthesized path. */
+  explicit: boolean
+}
+
+/** `MouseEvent.button` values for the three supported buttons. */
+const CLICK_BUTTON_EVENT: Record<ClickOptions['button'], number> = { left: 0, middle: 1, right: 2 }
+
+/** `MouseEvent.buttons` bits for the three supported buttons. */
+const CLICK_BUTTON_BITS: Record<ClickOptions['button'], number> = { left: 1, middle: 4, right: 2 }
+
+/**
+ * Read the click-only `button`, `count`, and `modifiers` arguments.
+ *
+ * The background validates these before dispatch, but the content script also
+ * refuses malformed values because it is the component that synthesizes the
+ * events and must never guess their semantics.
+ * @param args - action arguments.
+ * @returns the parsed options.
+ */
+function clickOptions(args: Record<string, unknown>): ClickOptions {
+  const rawButton = args.button === undefined ? 'left' : args.button
+  if (rawButton !== 'left' && rawButton !== 'right' && rawButton !== 'middle') {
+    throw new ActionError('bad-args', 'button must be "left", "right", or "middle".')
+  }
+  const count = args.count === undefined ? 1 : args.count
+  if (typeof count !== 'number' || !Number.isInteger(count) || count < 1 || count > 3) {
+    throw new ActionError('bad-args', 'count must be an integer from 1 to 3.')
+  }
+  const modifiers = parseClickModifiers(args.modifiers)
+  if (modifiers === undefined) {
+    throw new ActionError('bad-args', 'modifiers contains an unknown key; use alt, ctrl, meta, or shift, joined by "+".')
+  }
+  return {
+    button: rawButton,
+    count,
+    modifiers,
+    explicit: args.button !== undefined || args.count !== undefined || args.modifiers !== undefined,
+  }
+}
+
+/**
+ * Map a modifier spec such as `ctrl+shift` onto event boolean flags.
+ * @param value - the `modifiers` argument, when supplied.
+ * @returns the flags, or undefined when a key is unknown.
+ */
+function parseClickModifiers(value: unknown): ClickModifiers | undefined {
+  const flags: ClickModifiers = { altKey: false, ctrlKey: false, metaKey: false, shiftKey: false }
+  if (value === undefined) return flags
+  if (typeof value !== 'string') return undefined
+  for (const name of value.split(/[+,]/).map((part) => part.trim().toLowerCase())) {
+    if (name === '') continue
+    if (name === 'alt') flags.altKey = true
+    else if (name === 'ctrl' || name === 'control') flags.ctrlKey = true
+    else if (name === 'meta' || name === 'cmd' || name === 'command' || name === 'win') flags.metaKey = true
+    else if (name === 'shift') flags.shiftKey = true
+    else return undefined
+  }
+  return flags
+}
+
+/** Build a pointer event, falling back to `MouseEvent` where `PointerEvent` is absent. */
+function syntheticPointerEvent(type: string, init: MouseEventInit): MouseEvent {
+  if (typeof PointerEvent === 'function') {
+    return new PointerEvent(type, { ...init, pointerId: 1, pointerType: 'mouse', isPrimary: true })
+  }
+  return new MouseEvent(type, init)
+}
+
+/**
+ * Synthesize the DOM events a real pointer would produce for one click.
+ *
+ * The page observes the requested button, click count (`detail`), and modifier
+ * booleans; a right click additionally gets `contextmenu`, and middle/right
+ * clicks get `auxclick` instead of the primary-button `click`. Synthetic
+ * events cannot trigger browser-level defaults such as navigation or a real
+ * context menu, which the caller reports.
+ * @param el - click target.
+ * @param options - button, count, and modifiers.
+ */
+function synthesizeClick(el: Element, options: ClickOptions): void {
+  const rect = el.getBoundingClientRect()
+  const clientX = Math.round(rect.left + rect.width / 2)
+  const clientY = Math.round(rect.top + rect.height / 2)
+  if (el instanceof HTMLElement) {
+    try { el.focus({ preventScroll: true }) } catch { /* non-focusable targets are valid */ }
+  }
+  const buttons = CLICK_BUTTON_BITS[options.button]
+  const base: MouseEventInit = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    clientX,
+    clientY,
+    screenX: clientX,
+    screenY: clientY,
+    button: CLICK_BUTTON_EVENT[options.button],
+    ...options.modifiers,
+  }
+  for (let detail = 1; detail <= options.count; detail += 1) {
+    const pressed: MouseEventInit = { ...base, buttons, detail }
+    const released: MouseEventInit = { ...base, buttons: 0, detail }
+    el.dispatchEvent(syntheticPointerEvent('pointerdown', pressed))
+    el.dispatchEvent(new MouseEvent('mousedown', pressed))
+    el.dispatchEvent(syntheticPointerEvent('pointerup', released))
+    el.dispatchEvent(new MouseEvent('mouseup', released))
+    if (options.button === 'right') el.dispatchEvent(new MouseEvent('contextmenu', released))
+    el.dispatchEvent(new MouseEvent(options.button === 'left' ? 'click' : 'auxclick', released))
+  }
+}
+
+/** A model-facing description of the synthesized click semantics. */
+function describeClick(options: ClickOptions): string {
+  const modifierNames = Object.entries(options.modifiers)
+    .filter(([, enabled]) => enabled)
+    .map(([name]) => name.replace('Key', ''))
+  const clicks = `${options.count} click${options.count === 1 ? '' : 's'}`
+  const modifiers = modifierNames.length === 0 ? '' : `, modifiers: ${modifierNames.join('+')}`
+  return `${options.button}-button events (${clicks}${modifiers})`
+}
+
 async function clickAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
   const index = numberArg(args, 'index')
+  const options = clickOptions(args)
   const el = elementOrThrow(ctx.ids, index)
   el.scrollIntoView({ block: 'center', behavior: 'instant' })
+  if (options.explicit) {
+    if (el instanceof HTMLButtonElement && el.disabled) {
+      throw new ActionError('action-failed', `Button [${index}] is disabled.`)
+    }
+    synthesizeClick(el, options)
+    await waitForPageSettled(ACTION_SETTLE)
+    return withPageDelta(
+      `Clicked [${index}] with synthesized ${describeClick(options)}. Browser-level defaults such as navigation and real context menus are not triggered by synthetic events.`,
+      ctx,
+    )
+  }
   if (el instanceof HTMLAnchorElement) {
     const target = el.target.trim().toLowerCase()
     const sameFrameTarget = target === '' || target === '_self'
@@ -473,10 +652,3 @@ async function waitAction(args: Record<string, unknown>, ctx: ActionContext): Pr
   return withPageDelta(`The page is stable${ms > 0 ? ` after an additional ${ms}ms wait` : ''}.`, ctx)
 }
 
-function numberArg(args: Record<string, unknown>, name: string): number {
-  const value = args[name]
-  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
-    throw new ActionError('bad-args', `${name} must be a non-negative integer; received ${String(value)}.`)
-  }
-  return value
-}

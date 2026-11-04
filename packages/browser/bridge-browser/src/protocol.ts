@@ -39,6 +39,20 @@ export const DEFAULT_SNAPSHOT_MAX_CHARS = 32_000
 /** Smallest snapshot budget that can carry both trust boundaries and page text. */
 export const MIN_SNAPSHOT_MAX_CHARS = 500
 
+/**
+ * Largest single frame either side may send, in UTF-8 bytes. A frame over the
+ * cap is refused locally with a `send_failed` error frame instead of being
+ * written to a socket that the peer would have to buffer whole.
+ */
+export const MAX_FRAME_BYTES = 16 * 1024 * 1024
+
+/**
+ * Outbound send budget of one connection: frames beyond this many pending
+ * socket writes queue in order, and a full queue is refused with `send_failed`
+ * rather than growing without bound.
+ */
+export const MAX_INFLIGHT_SENDS = 8
+
 /** Error codes a tool call may settle with. Open set: consumers must tolerate unknown codes. */
 export type ToolErrorCode =
   | 'no-active-tab'
@@ -48,6 +62,16 @@ export type ToolErrorCode =
   | 'bridge-closed'
   | 'bad-args'
   | 'internal'
+  /** The requested tab is not part of the session's controlled tab set. */
+  | 'tab_outside'
+  /** The page is a browser-owned surface (`chrome://`, extension pages) with no injectable DOM. */
+  | 'protected-page'
+  /** A page-side value could not cross the extension messaging boundary (e.g. a live DOM node). */
+  | 'js-result-not-serializable'
+  /** Another debugger session already owns the target, so CDP actions cannot attach. */
+  | 'debugger-unavailable'
+  /** The bridge could not deliver a frame (too large or too many pending writes). */
+  | 'send_failed'
 
 /** One tool-call failure: stable machine code plus human text for the model. */
 export interface ToolError {
@@ -102,8 +126,12 @@ export type ServerFrame =
   | { t: 'tool.cancel'; id: string }
   /** Liveness probe. */
   | { t: 'ping' }
-  /** Fatal connection error; the client should re-authenticate. */
-  | { t: 'error'; code: string; message: string }
+  /**
+   * Fatal connection error, or a refused outbound frame (`send_failed`). The
+   * optional `id` names the tool call whose frame was refused; an older peer
+   * that omits it keeps the broadcast semantics.
+   */
+  | { t: 'error'; code: string; message: string; id?: string }
 
 /** Any frame on the wire. */
 export type BridgeFrame = ClientFrame | ServerFrame
@@ -219,9 +247,12 @@ export function parseBridgeFrame(text: string): BridgeFrame | undefined {
     case 'ping':
       return { t: 'ping' }
     case 'error':
-      return typeof frame.code === 'string' && typeof frame.message === 'string'
+      if (typeof frame.code !== 'string' || typeof frame.message !== 'string') return undefined
+      return frame.id === undefined
         ? { t: 'error', code: frame.code, message: frame.message }
-        : undefined
+        : typeof frame.id === 'string'
+          ? { t: 'error', code: frame.code, message: frame.message, id: frame.id }
+          : undefined
     default:
       return undefined
   }

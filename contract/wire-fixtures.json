@@ -1,0 +1,43 @@
+{
+  "$comment": "Wire shapes shared by the host plugin and the extension. Both packages have a test that reads this file so a one-sided rename fails a gate instead of silently degrading at runtime.",
+  "uploadRequest": {
+    "index": 4,
+    "files": [
+      {
+        "name": "notes.txt",
+        "mime_type": "text/plain",
+        "base64": "aGVsbG8gdXBsb2Fk"
+      }
+    ]
+  },
+  "uploadResult": {
+    "text": "Uploaded 1 file(s) to file input [4]: notes.txt (0.0 KB total)."
+  },
+  "screenshotResult": {
+    "text": "Screenshot captured (800x600 px, jpeg). Viewport: 800x600 CSS px (dpr 2).",
+    "image": {
+      "base64": "aGVsbG8=",
+      "mimeType": "image/jpeg",
+      "width": 800,
+      "height": 600
+    },
+    "frame": {
+      "viewportWidth": 800,
+      "viewportHeight": 600,
+      "screenshotWidth": 800,
+      "screenshotHeight": 600,
+      "dpr": 2
+    }
+  },
+  "consoleRequest": {
+    "only_errors": false,
+    "clear": false,
+    "pattern": "error",
+    "limit": 100
+  },
+  "networkRequest": {
+    "url_pattern": "api",
+    "clear": false,
+    "limit": 100
+  }
+}

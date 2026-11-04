@@ -4,7 +4,7 @@
 
 dsh 的**浏览器操作端**：让模型直接读取并操作你在浏览器里打开的页面——抓取内容、点击元素、填写表单、滚动与导航，全部在真实页面执行、登录态保留。侧边栏面板是与模型对话的入口。
 
-**两条明确分离的通道**：浏览器页面仍以结构化文本呈现（带编号的交互元素清单），浏览器工具不会截图；另一方面，dsh 0.1.2 宿主可声明多模态图片限制，侧栏据此接收 PNG、JPEG、WebP 和 GIF，并渲染会话中的持久图片附件。
+**两条明确分离的通道**：浏览器页面仍以结构化文本呈现（带编号的交互元素清单），浏览器读取保持文本形态，只有模型显式调用 `browser_screenshot` 时才截图，并由宿主落盘为文件；另一方面，dsh 0.1.2 宿主可声明多模态图片限制，侧栏据此接收 PNG、JPEG、WebP 和 GIF，并渲染会话中的持久图片附件。
 
 ## 模型能做什么
 
@@ -21,6 +21,16 @@ dsh 的**浏览器操作端**：让模型直接读取并操作你在浏览器里
 | 关闭标签页 | `browser_close_tab` | 关闭已列出的标签页 |
 | 读区域 | `browser_get_text` | 懒加载内容 / 局部文本 |
 | 等待 | `browser_wait` | 页面加载与渲染稳定检测 |
+| 选择选项 | `browser_select` | 按 value、label 或序号选择；未命中会列出可用选项 |
+| 检索清单 | `browser_find` | 用查询词给清单元素打分，返回最接近的编号 |
+| 附件上传 | `browser_upload_file` | 用宿主发来的字节构造 `File` 并写入文件输入框 |
+| 悬停 / 拖拽 | `browser_hover` / `browser_drag` | 对受控标签页持有调试会话时发送真实输入事件，附加失败时退化为合成 DOM 事件 |
+| 点击变体 | 带 `button` / `count` / `modifiers` 的 `browser_click` | 右键/中键、双击/三击与修饰键组合，走调试会话 |
+| 执行页面 JS | `browser_evaluate` | 需用户审批；结果脱敏并限制长度 |
+| 截图 | `browser_screenshot` | 整视口或裁剪区域，由宿主落盘并返回文件路径 |
+| console 与 network | `browser_console` / `browser_network` | 首次调用起按标签页缓冲；请求头与 URL 凭据脱敏，请求正文只记字节数 |
+| 调整窗口 | `browser_resize` | 调整承载受控标签页的窗口尺寸 |
+| 批量 | `browser_batch` | 顺序执行工具调用，首个失败即停 |
 | 图片对话 | `session.prompt` / `session.attachment` | 按宿主能力启用图片选择、纯图片发送和持久历史预览 |
 | 引用你划选的内容 | 侧栏输入框 | 你在页面里选中的文字会变成输入框里的引用，随下一条消息一起发送 |
 
@@ -119,7 +129,7 @@ pnpm --filter dsh-browser-extension run test
 
 ## 权限说明
 
-Chrome 使用 `sidePanel`，Firefox 使用 `sidebar_action`。两者都申请 `storage`（设置与最近会话续接）、`notifications`（侧栏关闭时可选的审批提醒）、`tabs` + `activeTab` + `scripting`（观察切页，并向用户显式选择的受控标签页注入/发消息；安装前已打开的页面也会按需补注入）、`webNavigation`（枚举该标签页中的 frame，并把消息绑定到具体文档）、`alarms`（后台保活）和 `http/https`（内容脚本注入普通网页）。Firefox AMO manifest 如实声明扩展会把浏览活动、网页内容/操作和对话内容发送给用户配置的 dsh/模型服务。扩展绝不改变用户正在看的标签页，也不会静默跟随手动切页；只有用户选择继续原页面后，助手才会在后台操作。
+Chrome 使用 `sidePanel`，Firefox 使用 `sidebar_action`。两者都申请 `storage`（设置与最近会话续接）、`notifications`（侧栏关闭时可选的审批提醒）、`tabs` + `activeTab` + `scripting`（观察切页，并向用户显式选择的受控标签页注入/发消息；安装前已打开的页面也会按需补注入）、`webNavigation`（枚举该标签页中的 frame，并把消息绑定到具体文档）、`alarms`（后台保活）和 `http/https`（内容脚本注入普通网页）。两者也申请 `debugger`，但只用于受控标签页：真实指针输入、页面 JavaScript 执行、带裁剪/缩放的截图，以及 console/network 缓冲。附加调试会话期间 Chrome 会显示「正在调试此浏览器」信息栏；点掉该信息栏会 detach 会话，需要它的工具随即回退到纯 DOM 实现并在结果中说明。Firefox 不提供 `chrome.debugger`：扩展探测到 API 缺失后，把所有依赖调试器的工具降级到纯 DOM 实现，不会抛崩。Firefox AMO manifest 如实声明扩展会把浏览活动、网页内容/操作和对话内容发送给用户配置的 dsh/模型服务。扩展绝不改变用户正在看的标签页，也不会静默跟随手动切页；只有用户选择继续原页面后，助手才会在后台操作。
 
 ## 已知限制
 
@@ -130,3 +140,6 @@ Chrome 使用 `sidePanel`，Firefox 使用 `sidebar_action`。两者都申请 `s
 - 令牌无自动轮换。
 - `browser_press` 的合成按键不触发浏览器原生默认行为（Tab 焦点移动、方向键、Enter 激活等），仅用于框架内的键盘事件；依赖原生行为的场景请手动操作。
 - `browser_wait` 以加载完成 + 固定静默窗口为准，不观察持续 DOM 更新（连续刷新的 SPA 可能被报为稳定）。
+- 真实指针输入、裁剪/缩放截图、页面 JavaScript 执行与 console/network 缓冲都依赖绑定在受控标签页上的调试会话：按需 attach，空闲 60 秒或标签页移出本会话归属即 detach，绝不附加用户未交给本会话的标签页。用户点掉 Chrome 的调试信息栏后，这些工具回退到纯 DOM 行为并在结果里说明。
+- 降级截图走 `captureVisibleTab`，只能截当前活动标签页的可见区域，且忽略 `scale`；调试器路径才支持对受控标签页裁剪与缩放。
+- `browser_console` 与 `browser_network` 从首次在某个标签页调用时开始采集。没有调试会话时在页面主世界 hook `console`、`fetch` 与 `XMLHttpRequest`，会漏掉 hook 之前的请求、文档/资源请求与 Service Worker 流量；结果里会说明数据来自哪条路径。

@@ -58,16 +58,26 @@ function panelPort() {
 }
 
 function mockChrome(options: {
+  /** Set false to model a build without the offscreen API (Firefox). */
+  offscreenEnabled?: boolean
   localGet?: () => Promise<Record<string, unknown>>
   localSet?: (items: Record<string, unknown>) => Promise<void>
   tabGet?: (tabId: number) => Promise<chrome.tabs.Tab>
   tabQuery?: (queryInfo: chrome.tabs.QueryInfo) => Promise<chrome.tabs.Tab[]>
   tabRemove?: (tabId: number) => Promise<void>
   tabSendMessage?: (tabId: number, message: unknown) => Promise<unknown>
+  captureVisibleTab?: () => Promise<string>
+  runtimeSendMessage?: (message: unknown) => Promise<unknown>
   executeScript?: () => Promise<unknown>
 } = {}) {
   const onConnect = chromeEvent<[chrome.runtime.Port]>()
   const onAlarm = chromeEvent<[chrome.alarms.Alarm]>()
+  let offscreenOpen = false
+  const offscreen = {
+    hasDocument: vi.fn(async () => offscreenOpen),
+    createDocument: vi.fn(async () => { offscreenOpen = true }),
+    closeDocument: vi.fn(async () => { offscreenOpen = false }),
+  }
   const alarms = {
     create: vi.fn(),
     clear: vi.fn(async () => true),
@@ -85,6 +95,7 @@ function mockChrome(options: {
       getURL: (path: string) => `chrome-extension://test/${path}`,
       onConnect,
       onMessage: chromeEvent<[unknown, chrome.runtime.MessageSender, (response: unknown) => void]>(),
+      sendMessage: vi.fn(options.runtimeSendMessage ?? (async () => ({ ok: true, filename: 'recording.gif' }))),
     },
     sidePanel: {
       open: vi.fn(async () => {}),
@@ -106,6 +117,7 @@ function mockChrome(options: {
       query: vi.fn(options.tabQuery ?? (async () => [{ id: 1, windowId: 1, title: 'Tab', url: 'https://example.com/' }] as chrome.tabs.Tab[])),
       remove: vi.fn(options.tabRemove ?? (async () => {})),
       sendMessage: vi.fn(options.tabSendMessage ?? (async () => {})),
+      captureVisibleTab: vi.fn(options.captureVisibleTab ?? (async () => 'data:image/png;base64,QUJD')),
       onActivated: chromeEvent<[{ tabId: number; windowId: number }]>(),
       onUpdated: chromeEvent<[number, chrome.tabs.TabChangeInfo, chrome.tabs.Tab]>(),
       onReplaced: chromeEvent<[number, number]>(),
@@ -129,8 +141,9 @@ function mockChrome(options: {
       onFocusChanged: chromeEvent<[number]>(),
       onRemoved: chromeEvent<[number]>(),
     },
+    ...(options.offscreenEnabled === false ? {} : { offscreen }),
   } as unknown as typeof chrome)
-  return { alarms, onConnect, tabs: chrome.tabs }
+  return { alarms, offscreen, onConnect, runtime: chrome.runtime, tabs: chrome.tabs }
 }
 
 afterEach(() => {
@@ -256,7 +269,7 @@ describe('background bridge lifecycle', () => {
     let finishSettingsWrite!: () => void
     const settingsWrite = new Promise<void>((resolve) => { finishSettingsWrite = resolve })
     const chromeMock = mockChrome({
-      localGet: async () => ({ dshSettings: { bridgeUrl: 'wss://bridge.example/ext/bridge' } }),
+      localGet: async () => ({ dshSettings: { bridgeUrl: 'wss://bridge.example/ext/bridge', tabIsolation: false } }),
       localSet: async () => { await settingsWrite },
     })
     vi.stubGlobal('WebSocket', FakeWebSocket)
@@ -306,7 +319,7 @@ describe('background bridge lifecycle', () => {
   it('reports a settings persistence failure to the requesting panel', async () => {
     let settingsWrites = 0
     const chromeMock = mockChrome({
-      localGet: async () => ({ dshSettings: { bridgeUrl: 'wss://bridge.example/ext/bridge' } }),
+      localGet: async () => ({ dshSettings: { bridgeUrl: 'wss://bridge.example/ext/bridge', tabIsolation: false } }),
       localSet: async () => {
         settingsWrites += 1
         if (settingsWrites === 1) throw new Error('Storage is unavailable')
@@ -373,6 +386,9 @@ describe('background bridge lifecycle', () => {
       localGet: async () => ({
         dshSettings: {
           bridgeUrl: 'wss://bridge.example/ext/bridge',
+              // These cases exercise approval/revocation, not tab isolation; the
+              // isolation default is covered by tests/tab-isolation.spec.ts.
+              tabIsolation: false,
           unrestrictedBrowserAccess: true,
           sharePageContent: 'off',
         },
@@ -422,6 +438,9 @@ describe('background bridge lifecycle', () => {
       localGet: async () => ({
         dshSettings: {
           bridgeUrl: 'wss://bridge.example/ext/bridge',
+              // These cases exercise approval/revocation, not tab isolation; the
+              // isolation default is covered by tests/tab-isolation.spec.ts.
+              tabIsolation: false,
           unrestrictedBrowserAccess: true,
         },
       }),
@@ -488,6 +507,9 @@ describe('background bridge lifecycle', () => {
       localGet: async () => ({
         dshSettings: {
           bridgeUrl: 'wss://bridge.example/ext/bridge',
+              // These cases exercise approval/revocation, not tab isolation; the
+              // isolation default is covered by tests/tab-isolation.spec.ts.
+              tabIsolation: false,
           unrestrictedBrowserAccess: true,
         },
       }),
@@ -554,6 +576,9 @@ describe('background bridge lifecycle', () => {
       localGet: async () => ({
         dshSettings: {
           bridgeUrl: 'wss://bridge.example/ext/bridge',
+              // These cases exercise approval/revocation, not tab isolation; the
+              // isolation default is covered by tests/tab-isolation.spec.ts.
+              tabIsolation: false,
           unrestrictedBrowserAccess: true,
         },
       }),
@@ -632,6 +657,9 @@ describe('background bridge lifecycle', () => {
       localGet: async () => ({
         dshSettings: {
           bridgeUrl: 'wss://bridge.example/ext/bridge',
+              // These cases exercise approval/revocation, not tab isolation; the
+              // isolation default is covered by tests/tab-isolation.spec.ts.
+              tabIsolation: false,
           unrestrictedBrowserAccess: true,
         },
       }),
@@ -702,6 +730,9 @@ describe('background bridge lifecycle', () => {
     const chromeMock = mockChrome({
       localGet: async () => ({ dshSettings: {
         bridgeUrl: 'wss://bridge.example/ext/bridge',
+              // These cases exercise approval/revocation, not tab isolation; the
+              // isolation default is covered by tests/tab-isolation.spec.ts.
+              tabIsolation: false,
         unrestrictedBrowserAccess: true,
       } }),
       tabQuery: async () => [tab],
@@ -756,6 +787,9 @@ describe('background bridge lifecycle', () => {
       localGet: async () => ({
         dshSettings: {
           bridgeUrl: 'wss://bridge.example/ext/bridge',
+              // These cases exercise approval/revocation, not tab isolation; the
+              // isolation default is covered by tests/tab-isolation.spec.ts.
+              tabIsolation: false,
           unrestrictedBrowserAccess: true,
         },
       }),
@@ -819,6 +853,9 @@ describe('background bridge lifecycle', () => {
       localGet: async () => ({
         dshSettings: {
           bridgeUrl: 'wss://bridge.example/ext/bridge',
+              // These cases exercise approval/revocation, not tab isolation; the
+              // isolation default is covered by tests/tab-isolation.spec.ts.
+              tabIsolation: false,
           unrestrictedBrowserAccess: false,
           sharePageContent: 'auto',
         },
@@ -894,6 +931,9 @@ describe('background bridge lifecycle', () => {
       localGet: async () => ({
         dshSettings: {
           bridgeUrl: 'wss://bridge.example/ext/bridge',
+              // These cases exercise approval/revocation, not tab isolation; the
+              // isolation default is covered by tests/tab-isolation.spec.ts.
+              tabIsolation: false,
           unrestrictedBrowserAccess: true,
           sharePageContent: 'off',
         },
@@ -939,6 +979,325 @@ describe('background bridge lifecycle', () => {
     expect(socket.sent).not.toContainEqual(expect.objectContaining({
       t: 'rpc',
       method: 'bridge.injectBrowserSnapshot',
+    }))
+  })
+})
+
+describe('bridge watchdog and keepalive', () => {
+  const CAPS_FRAME = {
+    t: 'hello.ok',
+    caps: { textOnly: true, snapshotMaxChars: 32_000, maxInteractiveItems: 60 },
+  }
+
+  it('closes a socket that misses the 30 s handshake deadline', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.stubGlobal('WebSocket', FakeWebSocket)
+      const { BridgeClient, CONNECT_TIMEOUT_MS } = await import('../src/background/bridge.ts')
+      const states: string[] = []
+      const client = new BridgeClient(
+        { onStateChange: (state) => states.push(state), onFrame: () => {}, onHelloOk: () => {} },
+        async () => true,
+        () => true,
+      )
+      client.start('ws://127.0.0.1:3080/ext/bridge', 'token')
+      // The probe and the socket creation are microtasks, not timers.
+      for (let i = 0; i < 5; i += 1) await Promise.resolve()
+      expect(FakeWebSocket.instances).toHaveLength(1)
+      const socket = FakeWebSocket.instances[0]!
+
+      // The socket never opens: the deadline, not the socket, decides its fate.
+      await vi.advanceTimersByTimeAsync(CONNECT_TIMEOUT_MS)
+      expect(socket.readyState).toBe(FakeWebSocket.CLOSED)
+      expect(states).toContain('reconnecting')
+      client.stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('rebuilds a connected socket after 90 s without inbound traffic', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.stubGlobal('WebSocket', FakeWebSocket)
+      const { BridgeClient, IDLE_TIMEOUT_MS, WATCHDOG_INTERVAL_MS } = await import('../src/background/bridge.ts')
+      const states: string[] = []
+      const client = new BridgeClient(
+        { onStateChange: (state) => states.push(state), onFrame: () => {}, onHelloOk: () => {} },
+        async () => true,
+        () => true,
+      )
+      client.start('ws://127.0.0.1:3080/ext/bridge', 'token')
+      for (let i = 0; i < 5; i += 1) await Promise.resolve()
+      const socket = FakeWebSocket.instances[0]!
+      socket.open()
+      for (let i = 0; i < 5; i += 1) await Promise.resolve()
+      socket.receive(CAPS_FRAME)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(client.state).toBe('connected')
+
+      // A ping inside the window refreshes the deadline.
+      await vi.advanceTimersByTimeAsync(60_000)
+      socket.receive({ t: 'ping' })
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(socket.readyState).toBe(FakeWebSocket.OPEN)
+
+      // Silence past the deadline closes the socket and schedules a reconnect.
+      await vi.advanceTimersByTimeAsync(IDLE_TIMEOUT_MS + WATCHDOG_INTERVAL_MS)
+      expect(socket.readyState).toBe(FakeWebSocket.CLOSED)
+      expect(states).toContain('reconnecting')
+      client.stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('records the offscreen keepalive timestamp', async () => {
+    mockChrome()
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 503 })))
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    const background = await import('../src/background/index.ts')
+    const onMessage = chrome.runtime.onMessage as unknown as {
+      emit: (...args: unknown[]) => void
+    }
+    onMessage.emit({ type: 'SW_KEEPALIVE' }, { id: 'test-extension' }, () => {})
+    expect(background.swKeepAliveAt()).toBeGreaterThan(0)
+  })
+})
+
+describe('offscreen lease lifecycle', () => {
+  const CAPS_FRAME = {
+    t: 'hello.ok',
+    caps: { textOnly: true, snapshotMaxChars: 32_000, maxInteractiveItems: 60 },
+  }
+
+  it('closes the heartbeat document once the panel lease ends', async () => {
+    const chromeMock = mockChrome()
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 503 })))
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    await import('../src/background/index.ts')
+
+    const panel = panelPort()
+    chromeMock.onConnect.emit(panel.port)
+    await vi.waitFor(() => { expect(chromeMock.offscreen.createDocument).toHaveBeenCalledOnce() })
+
+    panel.onDisconnect.emit()
+    await vi.waitFor(() => { expect(chromeMock.offscreen.closeDocument).toHaveBeenCalledOnce() })
+    // Repeated lease events must not close an already-closed document.
+    chromeMock.alarms.onAlarm.emit({ name: 'bridge-keepalive', scheduledTime: Date.now() })
+    await new Promise((resolve) => { setTimeout(resolve, 0) })
+    expect(chromeMock.offscreen.closeDocument).toHaveBeenCalledOnce()
+  })
+
+  it('never creates the document when keepAliveEnabled is false', async () => {
+    const chromeMock = mockChrome({
+      localGet: async () => ({ dshSettings: { keepAliveEnabled: false } }),
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 503 })))
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    await import('../src/background/index.ts')
+
+    const panel = panelPort()
+    chromeMock.onConnect.emit(panel.port)
+    await vi.waitFor(() => { expect(chromeMock.alarms.create).toHaveBeenCalledWith('bridge-keepalive', { periodInMinutes: 0.5 }) })
+    await new Promise((resolve) => { setTimeout(resolve, 0) })
+    expect(chromeMock.offscreen.createDocument).not.toHaveBeenCalled()
+  })
+
+  it('settles an in-flight tool call when the bridge reports send_failed', async () => {
+    // The content script never answers, so the snapshot call stays in flight
+    // until the bridge's send_failed notice settles it.
+    const chromeMock = mockChrome({ tabSendMessage: () => new Promise(() => {}) })
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      wsUrl: 'ws://127.0.0.1:3080/ext/bridge',
+    }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    await import('../src/background/index.ts')
+
+    const panel = panelPort()
+    chromeMock.onConnect.emit(panel.port)
+    await vi.waitFor(() => { expect(FakeWebSocket.instances).toHaveLength(1) })
+    const socket = FakeWebSocket.instances[0]!
+    socket.open()
+    await Promise.resolve()
+    socket.receive(CAPS_FRAME)
+    await vi.waitFor(() => { expect(socket.sent).toContainEqual(expect.objectContaining({ t: 'hello' })) })
+
+    // An unanswered snapshot keeps the call pending when the bridge reports
+    // that an answer cannot be sent.
+    socket.receive({
+      t: 'tool.call',
+      id: 'call-1',
+      name: 'browser_open_tab',
+      args: { url: 'https://example.com/' },
+      expiresAt: Date.now() + 60_000,
+    })
+    await new Promise((resolve) => { setTimeout(resolve, 0) })
+
+    socket.receive({
+      t: 'error',
+      code: 'send_failed',
+      id: 'call-1',
+      message: 'frame of 20 bytes exceeds the cap',
+    })
+    await vi.waitFor(() => {
+      expect(socket.sent).toContainEqual({
+        t: 'tool.result',
+        id: 'call-1',
+        ok: false,
+        error: { code: 'send_failed', message: 'frame of 20 bytes exceeds the cap' },
+      })
+    })
+  })
+
+  it('refreshes the idle deadline from inbound frames only', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.stubGlobal('WebSocket', FakeWebSocket)
+      const { BridgeClient, IDLE_TIMEOUT_MS, WATCHDOG_INTERVAL_MS } = await import('../src/background/bridge.ts')
+      const client = new BridgeClient(
+        { onStateChange: () => {}, onFrame: () => {}, onHelloOk: () => {} },
+        async () => true,
+        () => true,
+      )
+      client.start('ws://127.0.0.1:3080/ext/bridge', 'token')
+      for (let i = 0; i < 5; i += 1) await Promise.resolve()
+      const socket = FakeWebSocket.instances[0]!
+      socket.open()
+      for (let i = 0; i < 5; i += 1) await Promise.resolve()
+      socket.receive(CAPS_FRAME)
+      for (let i = 0; i < 5; i += 1) await Promise.resolve()
+
+      // Outbound writes do not prove liveness; the socket dies on silence.
+      await vi.advanceTimersByTimeAsync(IDLE_TIMEOUT_MS - 10_000)
+      expect(client.send({ t: 'pong' })).toBe(true)
+      await vi.advanceTimersByTimeAsync(20_000 + WATCHDOG_INTERVAL_MS)
+      expect(socket.readyState).toBe(FakeWebSocket.CLOSED)
+      client.stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('offscreen lease does not follow a connected socket', () => {
+  it('releases the document when the last panel closes on a live connection', async () => {
+    const chromeMock = mockChrome()
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      wsUrl: 'ws://127.0.0.1:3080/ext/bridge',
+    }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    const background = await import('../src/background/index.ts')
+
+    const panel = panelPort()
+    chromeMock.onConnect.emit(panel.port)
+    await vi.waitFor(() => { expect(FakeWebSocket.instances).toHaveLength(1) })
+    const socket = FakeWebSocket.instances[0]!
+    socket.open()
+    await Promise.resolve()
+    socket.receive({
+      t: 'hello.ok',
+      caps: { textOnly: true, snapshotMaxChars: 32_000, maxInteractiveItems: 60 },
+    })
+    await vi.waitFor(() => { expect(background.keepAliveWanted()).toBe(true) })
+    await vi.waitFor(() => { expect(chromeMock.offscreen.createDocument).toHaveBeenCalledOnce() })
+
+    // Closing the panel keeps the socket (suspendReconnect), but the lease end
+    // must still release the heartbeat document.
+    panel.onDisconnect.emit()
+    expect(socket.readyState).toBe(FakeWebSocket.OPEN)
+    expect(background.keepAliveWanted()).toBe(false)
+    chromeMock.alarms.onAlarm.emit({ name: 'bridge-keepalive', scheduledTime: Date.now() })
+    await vi.waitFor(() => { expect(chromeMock.offscreen.closeDocument).toHaveBeenCalledOnce() })
+  })
+})
+
+describe('targeted send_failed settlement', () => {
+  it('settles only the refused call and leaves the other one running', async () => {
+    const chromeMock = mockChrome()
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      wsUrl: 'ws://127.0.0.1:3080/ext/bridge',
+    }), { status: 200 })))
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    await import('../src/background/index.ts')
+
+    const panel = panelPort()
+    chromeMock.onConnect.emit(panel.port)
+    await vi.waitFor(() => { expect(FakeWebSocket.instances).toHaveLength(1) })
+    const socket = FakeWebSocket.instances[0]!
+    socket.open()
+    await Promise.resolve()
+    socket.receive({
+      t: 'hello.ok',
+      caps: { textOnly: true, snapshotMaxChars: 32_000, maxInteractiveItems: 60 },
+    })
+    await vi.waitFor(() => { expect(socket.sent).toContainEqual(expect.objectContaining({ t: 'hello' })) })
+
+    // Both calls wait for approval, so both are in flight.
+    for (const id of ['call-a', 'call-b']) {
+      socket.receive({
+        t: 'tool.call',
+        id,
+        name: 'browser_open_tab',
+        args: { url: 'https://example.com/' },
+        expiresAt: Date.now() + 60_000,
+      })
+    }
+    await new Promise((resolve) => { setTimeout(resolve, 0) })
+
+    socket.receive({ t: 'error', code: 'send_failed', id: 'call-a', message: 'frame too large' })
+    await vi.waitFor(() => {
+      expect(socket.sent).toContainEqual(expect.objectContaining({
+        t: 'tool.result',
+        id: 'call-a',
+        ok: false,
+      }))
+    })
+    // The unrelated call keeps running: it is settled later, by cancellation.
+    expect(socket.sent.some((frame) => (frame as { id?: string }).id === 'call-b')).toBe(false)
+    socket.receive({ t: 'tool.cancel', id: 'call-b' })
+    await vi.waitFor(() => {
+      expect(socket.sent).toContainEqual(expect.objectContaining({ t: 'tool.result', id: 'call-b', ok: false }))
+    })
+    expect((socket.sent.find((frame) => (frame as { id?: string }).id === 'call-a') as { error?: { code?: string } }).error?.code)
+      .toBe('send_failed')
+  })
+})
+
+describe('recording survives a disabled keepalive', () => {
+  it('creates the encoder document and exports while keepAliveEnabled is false', async () => {
+    const chromeMock = mockChrome({
+      localGet: async () => ({ dshSettings: { keepAliveEnabled: false } }),
+      captureVisibleTab: async () => 'data:image/png;base64,QUJD',
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 503 })))
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    const background = await import('../src/background/index.ts')
+
+    const panel = panelPort()
+    chromeMock.onConnect.emit(panel.port)
+    panel.onMessage.emit({ type: 'panel.window', windowId: 1 })
+    panel.onMessage.emit({ type: 'recording.start' })
+
+    // The encoder lives in the offscreen document, so a recording needs it
+    // even though the worker-warming lease is disabled.
+    await vi.waitFor(() => { expect(background.keepAliveWanted()).toBe(true) })
+    await vi.waitFor(() => { expect(chromeMock.offscreen.createDocument).toHaveBeenCalledOnce() })
+
+    await vi.waitFor(() => { expect(chromeMock.tabs.captureVisibleTab).toHaveBeenCalled() })
+    panel.onMessage.emit({ type: 'recording.export' })
+    await vi.waitFor(() => {
+      expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+        type: expect.stringContaining('GIF'),
+        frames: expect.arrayContaining([expect.objectContaining({ base64: 'QUJD' })]),
+      }))
+    })
+    // Nothing reported a missing receiving end.
+    expect(panel.postMessage).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'recording',
+      error: expect.stringContaining('receiving end'),
     }))
   })
 })

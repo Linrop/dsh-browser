@@ -2,7 +2,7 @@ import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
-import { BridgeServer, BridgeToolError, isLoopbackAddress, messageToText, payloadCode, payloadMessage } from '../src/server.ts'
+import { BridgeServer, BridgeToolError, SendGate, isLoopbackAddress, messageToText, payloadCode, payloadMessage } from '../src/server.ts'
 import { BRIDGE_INJECT_BROWSER_SNAPSHOT_METHOD, BRIDGE_SESSION_PURGE_METHOD, type BridgeFrame } from '../src/protocol.ts'
 import { SessionPurgeError } from '../src/session-purge.ts'
 import type { BrowserHostApi, HostEventFrame } from '../src/host-api.ts'
@@ -659,7 +659,7 @@ describe('BridgeServer', () => {
     await expect.poll(() => h.bridge.hasConnection()).toBe(false)
   })
 
-  it('closes sockets on unparseable frames and ignores client-only frames when ready', async () => {
+  it('answers unparseable frames once and ignores client-only frames when ready', async () => {
     const h = await startBridge()
     harnesses.push(h)
     const { ws, frames, done } = await connect(h.url)
@@ -670,10 +670,20 @@ describe('BridgeServer', () => {
     send(ws, { t: 'hello', token: TOKEN, caps: CAPS })
     await new Promise((resolve) => { setTimeout(resolve, 50) })
     expect(ws.readyState).toBe(WebSocket.OPEN)
-    // Garbage is a protocol violation and closes the socket.
+    // An unparseable frame is a peer-versioning event: one bad-request notice,
+    // and the socket stays usable for the frames the peer does understand.
     ws.send('not-json')
+    ws.send('also-not-json')
+    await waitFor(() => frames.filter((f) => f.t === 'error').length === 1)
+    expect(frames.find((f) => f.t === 'error')).toMatchObject({ code: 'bad-request' })
+    expect(ws.readyState).toBe(WebSocket.OPEN)
+
+    send(ws, { t: 'rpc', id: 'after-garbage', method: 'session.list', payload: {} })
+    await waitFor(() => frames.some((f) => f.t === 'rpc.result' && f.id === 'after-garbage'))
+    expect(ws.readyState).toBe(WebSocket.OPEN)
+
+    ws.close()
     await done
-    expect(ws.readyState).toBe(WebSocket.CLOSED)
   })
 
   it('relays business failures inside the server-response and isolates thrown adapter errors', async () => {
@@ -780,5 +790,177 @@ describe('BridgeServer', () => {
     const countBefore = frames.filter((f) => f.t === 'event').length
     await new Promise((resolve) => { setTimeout(resolve, 80) })
     expect(frames.filter((f) => f.t === 'event').length).toBe(countBefore)
+  })
+})
+
+describe('SendGate', () => {
+  /** Fake socket recording writes and their completion callbacks. */
+  class FakeSocket {
+    readyState = WebSocket.OPEN
+    written: string[] = []
+    callbacks: Array<(error?: Error | null) => void> = []
+
+    send(data: string, callback?: (error?: Error | null) => void): void {
+      this.written.push(data)
+      if (callback !== undefined) this.callbacks.push(callback)
+    }
+
+    complete(error?: Error | null): void {
+      const callback = this.callbacks.shift()
+      callback?.(error)
+    }
+  }
+
+  it('writes at most the in-flight budget and queues the rest', async () => {
+    const socket = new FakeSocket()
+    const gate = new SendGate(socket, { maxInflight: 2 })
+    for (let i = 0; i < 4; i += 1) expect(gate.send({ t: 'ping' })).toBe(true)
+    expect(socket.written).toHaveLength(2)
+    expect(gate.stats()).toMatchObject({ sent: 2, inflight: 2, queued: 2 })
+
+    socket.complete(null)
+    expect(socket.written).toHaveLength(3)
+    // Completing a write frees its slot, so each completion may pull one more
+    // queued frame in; four completions drain all four frames.
+    for (let i = 0; i < 3; i += 1) socket.complete(null)
+    expect(socket.written).toHaveLength(4)
+    expect(gate.stats()).toMatchObject({ sent: 4, inflight: 0, queued: 0 })
+    await expect(gate.whenIdle()).resolves.toBeUndefined()
+  })
+
+  it('treats a null completion callback as success, never as a failure', async () => {
+    const socket = new FakeSocket()
+    const gate = new SendGate(socket)
+    expect(gate.send({ t: 'ping' })).toBe(true)
+    // ws reports success as callback(null): this must not throw and must not
+    // count or report a failure.
+    expect(() => socket.complete(null)).not.toThrow()
+    expect(gate.stats()).toMatchObject({ failures: 0, droppedOversize: 0, droppedOverflow: 0 })
+    expect(socket.written).toHaveLength(1)
+  })
+
+  it('reports a failed write as send_failed and counts it', async () => {
+    const socket = new FakeSocket()
+    const gate = new SendGate(socket)
+    gate.send({ t: 'ping' })
+    socket.complete(new Error('boom'))
+    expect(gate.stats().failures).toBe(1)
+    const notice = JSON.parse(socket.written.at(-1) ?? '{}') as { t?: string; code?: string }
+    expect(notice).toMatchObject({ t: 'error', code: 'send_failed' })
+  })
+
+  it('refuses a frame above the byte cap and reports send_failed', () => {
+    const socket = new FakeSocket()
+    const gate = new SendGate(socket, { maxFrameBytes: 64 })
+    expect(gate.send({ t: 'error', code: 'x', message: 'y'.repeat(200) })).toBe(false)
+    expect(gate.stats()).toMatchObject({ droppedOversize: 1, sent: 0 })
+    const notice = JSON.parse(socket.written.at(-1) ?? '{}') as { t?: string; code?: string }
+    expect(notice).toMatchObject({ t: 'error', code: 'send_failed' })
+  })
+
+  it('refuses a frame when the write queue is full', () => {
+    const socket = new FakeSocket()
+    const gate = new SendGate(socket, { maxInflight: 1, maxQueued: 1 })
+    expect(gate.send({ t: 'ping' })).toBe(true)
+    expect(gate.send({ t: 'ping' })).toBe(true)
+    expect(gate.send({ t: 'ping' })).toBe(false)
+    expect(gate.stats()).toMatchObject({ droppedOverflow: 1, queued: 1 })
+  })
+})
+
+describe('outbound gate and inbound frame cap', () => {
+  it('refuses a tool.call above the frame cap instead of writing it raw', async () => {
+    const h = await startBridge({ sendLimits: { maxFrameBytes: 512 } })
+    harnesses.push(h)
+    const { ws, frames, done } = await connect(h.url)
+    send(ws, { t: 'hello', token: TOKEN, caps: CAPS })
+    await waitFor(() => frames.some((frame) => frame.t === 'hello.ok'))
+
+    const pending = h.bridge.requestTool(
+      'browser_type',
+      { index: 0, text: 'x'.repeat(4_000) },
+      new AbortController().signal,
+      1_000,
+    )
+    const settled = pending.catch((error: unknown) => error)
+    const error = await settled
+    expect(error).toMatchObject({ code: 'send_failed' })
+    expect(frames.some((frame) => frame.t === 'tool.call')).toBe(false)
+    // The notice names the refused call, so the extension settles exactly it.
+    await waitFor(() => frames.some((frame) => frame.t === 'error' && frame.code === 'send_failed'))
+    const notice = frames.find((frame) => frame.t === 'error' && frame.code === 'send_failed')
+    expect(notice).toMatchObject({ t: 'error', code: 'send_failed' })
+    expect(typeof (notice as { id?: unknown }).id).toBe('string')
+
+    ws.close()
+    await done
+  })
+
+  it('queues tool.call frames behind the in-flight budget and still delivers every one', async () => {
+    const h = await startBridge({ sendLimits: { maxInflight: 1 } })
+    harnesses.push(h)
+    const { ws, frames, done } = await connect(h.url)
+    send(ws, { t: 'hello', token: TOKEN, caps: CAPS })
+    await waitFor(() => frames.some((frame) => frame.t === 'hello.ok'))
+
+    const signal = new AbortController().signal
+    const calls = [0, 1, 2].map(() => h.bridge.requestTool('browser_snapshot', {}, signal, 800))
+    void calls.forEach((call) => { void call.catch(() => {}) })
+    await waitFor(() => frames.filter((frame) => frame.t === 'tool.call').length === 3)
+    expect(frames.filter((frame) => frame.t === 'tool.call')).toHaveLength(3)
+
+    ws.close()
+    await done
+  })
+
+  it('does not dispatch an inbound frame above the byte cap and keeps the socket', async () => {
+    const h = await startBridge()
+    harnesses.push(h)
+    const { ws, frames, done } = await connect(h.url)
+    send(ws, { t: 'hello', token: TOKEN, caps: CAPS })
+    await waitFor(() => frames.some((frame) => frame.t === 'hello.ok'))
+
+    const huge = { t: 'rpc', id: 'huge', method: 'session.list', payload: { blob: 'x'.repeat(16 * 1024 * 1024) } }
+    ws.send(JSON.stringify(huge))
+    await waitFor(() => frames.some((frame) => frame.t === 'error'))
+    expect(frames.find((frame) => frame.t === 'error')).toMatchObject({ code: 'bad-request' })
+    expect(frames.some((frame) => frame.t === 'rpc.result' && frame.id === 'huge')).toBe(false)
+    expect(h.callMock).not.toHaveBeenCalled()
+
+    // Still usable afterwards.
+    send(ws, { t: 'rpc', id: 'after', method: 'session.list', payload: {} })
+    await waitFor(() => frames.some((frame) => frame.t === 'rpc.result' && frame.id === 'after'))
+
+    ws.close()
+    await done
+  })
+})
+
+describe('write failure settles pending tool calls', () => {
+  it('rejects a pending call immediately instead of waiting for the timeout', async () => {
+    // A gate whose socket fails every write: the extension can never receive
+    // the tool.call, so the pending promise must settle from the write failure.
+    const failingGate = (ws: WebSocket, onWriteFailed: (message: string) => void): SendGate =>
+      new SendGate(
+        { readyState: WebSocket.OPEN, send: (_data, callback) => { callback?.(new Error('socket gone')) } },
+        {},
+        onWriteFailed,
+      )
+    const h = await startBridge({ sendGateFactory: failingGate })
+    harnesses.push(h)
+    const { ws, done } = await connect(h.url)
+    send(ws, { t: 'hello', token: TOKEN, caps: CAPS })
+    await new Promise((resolve) => { setTimeout(resolve, 20) })
+
+    const started = Date.now()
+    const error = await h.bridge
+      .requestTool('browser_snapshot', {}, new AbortController().signal, 90_000)
+      .catch((cause: unknown) => cause)
+    expect(error).toMatchObject({ code: 'send_failed' })
+    // Nowhere near the 90 s per-call budget.
+    expect(Date.now() - started).toBeLessThan(1_000)
+
+    ws.close()
+    await done
   })
 })

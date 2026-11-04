@@ -27,11 +27,14 @@ import {
   BRIDGE_INJECT_BROWSER_SNAPSHOT_METHOD,
   BRIDGE_SESSION_PURGE_METHOD,
   HELLO_TIMEOUT_MS,
+  MAX_FRAME_BYTES,
+  MAX_INFLIGHT_SENDS,
   PING_INTERVAL_MS,
   parseBridgeFrame,
   type BridgeFrame,
   type BridgeCaps,
   type ClientFrame,
+  type ServerFrame,
   type ToolErrorCode,
 } from './protocol.ts'
 import { SessionPurgeError } from './session-purge.ts'
@@ -106,6 +109,13 @@ export interface BridgeServerDeps {
   helloTimeoutMs?: number
   /** Server ping cadence; defaults to PING_INTERVAL_MS. */
   pingIntervalMs?: number
+  /** Test seam: the outbound budget of one connection; production uses the protocol constants. */
+  sendLimits?: SendGateLimits
+  /**
+   * Test seam: build a connection's send gate. Production uses the default
+   * gate; tests use it to exercise write-failure handling deterministically.
+   */
+  sendGateFactory?: (ws: WebSocket, onWriteFailed: (message: string) => void) => SendGate
 }
 
 /** One in-flight tool call awaiting the extension's `tool.result`. */
@@ -123,13 +133,183 @@ interface ReadyConnection {
   abort: AbortController
   pump: Promise<void>
   ping: NodeJS.Timeout
+  /** Bounded outbound writer shared by every frame sent on this connection. */
+  sender: SendGate
 }
 
-function sendFrame(ws: WebSocket, frame: BridgeFrame): void {
-  /* v8 ignore next -- teardown race: the socket can die between a pump's
-  readiness check and this write; the guard refuses writes on dead sockets */
+/** Unbounded direct write used only for pre-auth refusals (no gate exists yet). */
+function sendFrameDirect(ws: WebSocket, frame: ServerFrame): void {
+  /* v8 ignore next -- teardown race: the socket can die between a check and this write */
   if (ws.readyState !== WebSocket.OPEN) return
   ws.send(JSON.stringify(frame))
+}
+
+/** Socket surface the send gate needs; `ws` sockets satisfy it directly. */
+export interface SendSocket {
+  readonly readyState: number
+  /** `ws` calls the callback with `null` on success and an `Error` on failure. */
+  send(data: string, callback?: (error?: Error | null) => void): void
+}
+
+/** Outbound budget of one connection. Unset fields fall back to the protocol constants. */
+export interface SendGateLimits {
+  /** Pending socket writes before further frames queue. */
+  maxInflight?: number
+  /** Largest single JSON frame in UTF-8 bytes. */
+  maxFrameBytes?: number
+  /** Queued frames awaiting a write slot; one more than this is refused. */
+  maxQueued?: number
+}
+
+/** Counters exposed for diagnostics, logging, and tests. */
+export interface SendStats {
+  sent: number
+  inflight: number
+  queued: number
+  droppedOversize: number
+  droppedOverflow: number
+  failures: number
+}
+
+/** The tool-call id a refused frame names, if it is a `tool.call`. */
+function refusedToolCallId(frame: ServerFrame): string | undefined {
+  return frame.t === 'tool.call' ? frame.id : undefined
+}
+
+/** Queue depth allowed behind the in-flight writes. */
+const MAX_QUEUED_SENDS = 64
+
+/**
+ * Bounded outbound writer for one authenticated connection.
+ *
+ * Writes run at most {@link MAX_INFLIGHT_SENDS} at a time; further frames wait
+ * in a bounded FIFO, an oversized frame is refused before it reaches the
+ * socket, and every refusal or write failure reports `send_failed` back to the
+ * extension so the peer learns why an answer never arrived.
+ */
+export class SendGate {
+  private inflight = 0
+  private readonly queue: string[] = []
+  private idleWaiters: Array<() => void> = []
+  private readonly counters = { sent: 0, droppedOversize: 0, droppedOverflow: 0, failures: 0 }
+
+  constructor(
+    private readonly socket: SendSocket,
+    private readonly limits: SendGateLimits = {},
+    /**
+     * Called once per failed socket write. The connection layer settles every
+     * pending tool call here: the extension may never learn about a write that
+     * failed, so waiting for its answer would hang until the per-call timeout.
+     */
+    private readonly onWriteFailed?: (message: string) => void,
+  ) {}
+
+  /**
+   * Serialize and enqueue one frame.
+   * @param frame - frame to write.
+   * @returns false when the frame was refused (socket closed, too large, or queue full).
+   */
+  send(frame: ServerFrame): boolean {
+    if (this.socket.readyState !== WebSocket.OPEN) return false
+    const text = JSON.stringify(frame)
+    const bytes = Buffer.byteLength(text, 'utf8')
+    const maxFrameBytes = this.limits.maxFrameBytes ?? MAX_FRAME_BYTES
+    if (bytes > maxFrameBytes) {
+      this.counters.droppedOversize += 1
+      this.notifySendFailed(
+        `frame of ${bytes} bytes exceeds the ${maxFrameBytes} byte cap`,
+        refusedToolCallId(frame),
+      )
+      return false
+    }
+    if (this.inflight >= (this.limits.maxInflight ?? MAX_INFLIGHT_SENDS)) {
+      if (this.queue.length >= (this.limits.maxQueued ?? MAX_QUEUED_SENDS)) {
+        this.counters.droppedOverflow += 1
+        this.notifySendFailed('too many pending bridge writes; frame dropped', refusedToolCallId(frame))
+        return false
+      }
+      this.queue.push(text)
+      return true
+    }
+    this.transmit(text)
+    return true
+  }
+
+  /** Snapshot of the counters plus current backlog. */
+  stats(): SendStats {
+    return { ...this.counters, inflight: this.inflight, queued: this.queue.length }
+  }
+
+  /** Resolve once every accepted frame has been written or failed. */
+  whenIdle(): Promise<void> {
+    if (this.inflight === 0 && this.queue.length === 0) return Promise.resolve()
+    return new Promise<void>((resolve) => { this.idleWaiters.push(resolve) })
+  }
+
+  /** Drop queued frames (connection teardown) and release idle waiters. */
+  dispose(): void {
+    this.queue.length = 0
+    for (const resolve of this.idleWaiters.splice(0)) resolve()
+  }
+
+  private transmit(text: string): void {
+    this.inflight += 1
+    this.counters.sent += 1
+    try {
+      this.socket.send(text, (error?: Error | null) => {
+        this.inflight -= 1
+        // ws reports success as `callback(null)`; only a non-null argument is
+        // a failure, and its message is read defensively.
+        if (error != null) {
+          this.counters.failures += 1
+          const message = `socket write failed: ${error instanceof Error ? error.message : String(error)}`
+          this.notifySendFailed(message)
+          this.onWriteFailed?.(message)
+        }
+        this.pump()
+      })
+    } catch (error: unknown) {
+      this.inflight -= 1
+      this.counters.failures += 1
+      const message = `socket write failed: ${error instanceof Error ? error.message : String(error)}`
+      this.notifySendFailed(message)
+      this.onWriteFailed?.(message)
+      this.pump()
+    }
+  }
+
+  private pump(): void {
+    const maxInflight = this.limits.maxInflight ?? MAX_INFLIGHT_SENDS
+    while (this.inflight < maxInflight && this.queue.length > 0) {
+      const next = this.queue.shift()
+      if (next === undefined) break
+      this.transmit(next)
+    }
+    if (this.inflight === 0 && this.queue.length === 0) {
+      for (const resolve of this.idleWaiters.splice(0)) resolve()
+    }
+  }
+
+  /**
+   * Report a refused write without counting it against the concurrency budget.
+   * @param message - why the frame was refused.
+   * @param toolCallId - the refused `tool.call` id, so the extension settles
+   *   exactly that call instead of aborting every in-flight tool.
+   */
+  private notifySendFailed(message: string, toolCallId?: string): void {
+    if (this.socket.readyState !== WebSocket.OPEN) return
+    const frame = {
+      t: 'error',
+      code: 'send_failed',
+      message,
+      ...(toolCallId === undefined ? {} : { id: toolCallId }),
+    } satisfies ServerFrame
+    try {
+      this.socket.send(JSON.stringify(frame))
+    } catch {
+      /* the socket died while reporting the refusal; the connection teardown owns cleanup */
+    }
+  }
 }
 
 /**
@@ -212,7 +392,7 @@ export class BridgeServer {
         // The extension may be paused on a user approval after the caller has
         // stopped waiting. Withdraw that approval before settling locally so
         // a late click cannot execute an expired action.
-        sendFrame(conn.ws, { t: 'tool.cancel', id })
+        conn.sender.send({ t: 'tool.cancel', id })
         settle(error)
       }
       const onAbort = (): void => {
@@ -223,21 +403,20 @@ export class BridgeServer {
       }, timeoutMs)
       signal.addEventListener('abort', onAbort, { once: true })
       this.pendingTools.set(id, { resolve, reject, timer })
-      conn.ws.send(JSON.stringify({
+      // The largest outbound frame goes through the same gate as every other
+      // frame: an oversized or over-budget tool.call is reported as
+      // send_failed instead of being written unthrottled.
+      const accepted = conn.sender.send({
         t: 'tool.call',
         id,
         name,
         args,
         expiresAt,
         ...(sessionId === undefined ? {} : { sessionId }),
-      } satisfies BridgeFrame), (error) => {
-        /* v8 ignore next -- teardown race: when the write fails, the socket's
-        close handler settles the same call with the same code; the callback
-        path is a defensive second settle, covered via the close path */
-        if (error != null) {
-          settle(new BridgeToolError('bridge-closed', `bridge socket failed before delivery: ${error.message}`))
-        }
       })
+      if (!accepted) {
+        settle(new BridgeToolError('send_failed', `browser action "${name}" could not be delivered to the extension`))
+      }
     })
   }
 
@@ -277,12 +456,34 @@ export class BridgeServer {
     let helloTimer: NodeJS.Timeout | undefined = setTimeout(() => {
       ws.close(4001, 'hello timeout')
     }, this.deps.helloTimeoutMs ?? HELLO_TIMEOUT_MS)
+    /** One `bad-request` notice per connection; later malformed frames are ignored. */
+    let badFrameNoticeSent = false
 
     const onMessage = (data: Buffer | ArrayBuffer | Buffer[]): void => {
       const text = messageToText(data)
+      // Symmetry with the outbound gate: an oversized inbound frame is refused
+      // before parsing, without dropping the connection.
+      const bytes = Buffer.byteLength(text, 'utf8')
+      if (bytes > MAX_FRAME_BYTES) {
+        if (!badFrameNoticeSent) {
+          badFrameNoticeSent = true
+          sendFrameDirect(ws, {
+            t: 'error',
+            code: 'bad-request',
+            message: `frame of ${bytes} bytes exceeds the ${MAX_FRAME_BYTES} byte cap`,
+          })
+        }
+        return
+      }
       const frame = parseBridgeFrame(text)
       if (frame === undefined) {
-        ws.close(1008, 'unparseable frame')
+        // Unknown or malformed frames are a peer-versioning event, not a
+        // transport fault: answer once, keep the socket usable, and ignore
+        // further malformed frames so a broken peer cannot flood the channel.
+        if (!badFrameNoticeSent) {
+          badFrameNoticeSent = true
+          sendFrameDirect(ws, { t: 'error', code: 'bad-request', message: 'frame is not a valid bridge frame' })
+        }
         return
       }
       if (helloTimer !== undefined) {
@@ -328,19 +529,24 @@ export class BridgeServer {
   private promote(ws: WebSocket, remoteAddress: string | undefined): void {
     this.replaceConnection()
     const abort = new AbortController()
-    const ping = setInterval(() => { sendFrame(ws, { t: 'ping' }) }, this.deps.pingIntervalMs ?? PING_INTERVAL_MS)
+    const onWriteFailed = (message: string): void => {
+      this.failPendingTools('send_failed', `bridge could not deliver a tool call: ${message}`)
+    }
+    const sender = this.deps.sendGateFactory?.(ws, onWriteFailed)
+      ?? new SendGate(ws, this.deps.sendLimits, onWriteFailed)
+    const ping = setInterval(() => { sender.send({ t: 'ping' }) }, this.deps.pingIntervalMs ?? PING_INTERVAL_MS)
     const pump = (async () => {
       try {
         for await (const frame of this.deps.api.events(abort.signal)) {
           if (ws.readyState !== WebSocket.OPEN) break
-          sendFrame(ws, {
+          sender.send({
             t: 'event',
             frame,
           })
         }
       } catch (error: unknown) {
         if (!abort.signal.aborted && ws.readyState === WebSocket.OPEN) {
-          sendFrame(ws, { t: 'error', code: 'stream-failed', message: String(error) })
+          sender.send({ t: 'error', code: 'stream-failed', message: String(error) })
           // An authenticated socket without its Remote streams is unusable but
           // otherwise appears healthy to the extension. Closing the generation
           // activates its bounded reconnect loop and rebuilds every follower.
@@ -348,8 +554,8 @@ export class BridgeServer {
         }
       }
     })()
-    this.current = { ws, remoteAddress, abort, pump, ping }
-    sendFrame(ws, { t: 'hello.ok', caps: this.deps.caps })
+    this.current = { ws, remoteAddress, abort, pump, ping, sender }
+    sender.send({ t: 'hello.ok', caps: this.deps.caps })
     ws.once('close', () => {
       clearInterval(ping)
       abort.abort()
@@ -413,13 +619,13 @@ export class BridgeServer {
     if (conn === null) return
     const forbidden = PRIVILEGED_METHODS.has(frame.method) && !isLoopbackAddress(conn.remoteAddress)
     if (forbidden) {
-      sendFrame(conn.ws, { t: 'rpc.result', id: frame.id, ok: false, error: { code: 'forbidden', message: 'method is loopback-only' } })
+      conn.sender.send({ t: 'rpc.result', id: frame.id, ok: false, error: { code: 'forbidden', message: 'method is loopback-only' } })
       return
     }
     if (frame.method === BRIDGE_INJECT_BROWSER_SNAPSHOT_METHOD) {
       const payload = browserSnapshotPayload(frame.payload)
       if (payload === undefined) {
-        sendFrame(conn.ws, {
+        conn.sender.send({
           t: 'rpc.result',
           id: frame.id,
           ok: false,
@@ -429,9 +635,9 @@ export class BridgeServer {
       }
       try {
         await this.deps.injectBrowserSnapshot(payload.sessionId, payload.snapshot)
-        sendFrame(conn.ws, { t: 'rpc.result', id: frame.id, ok: true, result: { accepted: true } })
+        conn.sender.send({ t: 'rpc.result', id: frame.id, ok: true, result: { accepted: true } })
       } catch (error: unknown) {
-        sendFrame(conn.ws, {
+        conn.sender.send({
           t: 'rpc.result',
           id: frame.id,
           ok: false,
@@ -443,7 +649,7 @@ export class BridgeServer {
     if (frame.method === BRIDGE_SESSION_PURGE_METHOD) {
       const sessionId = purgeSessionPayload(frame.payload)
       if (sessionId === undefined) {
-        sendFrame(conn.ws, {
+        conn.sender.send({
           t: 'rpc.result',
           id: frame.id,
           ok: false,
@@ -453,11 +659,11 @@ export class BridgeServer {
       }
       try {
         await this.deps.purgeSession(sessionId)
-        sendFrame(conn.ws, { t: 'rpc.result', id: frame.id, ok: true, result: { purged: true } })
+        conn.sender.send({ t: 'rpc.result', id: frame.id, ok: true, result: { purged: true } })
       } catch (error: unknown) {
         const code = error instanceof SessionPurgeError ? error.code : 'internal'
         const message = error instanceof Error ? error.message : String(error)
-        sendFrame(conn.ws, { t: 'rpc.result', id: frame.id, ok: false, error: { code, message } })
+        conn.sender.send({ t: 'rpc.result', id: frame.id, ok: false, error: { code, message } })
       }
       return
     }
@@ -468,14 +674,14 @@ export class BridgeServer {
         payload: frame.payload,
         signal: conn.abort.signal,
       })
-      sendFrame(conn.ws, {
+      conn.sender.send({
         t: 'rpc.result',
         id: frame.id,
         ok: true,
         result: { type: 'server-response', rpcId: frame.id, result },
       })
     } catch (error: unknown) {
-      sendFrame(conn.ws, { t: 'rpc.result', id: frame.id, ok: false, error: { code: 'internal', message: String(error) } })
+      conn.sender.send({ t: 'rpc.result', id: frame.id, ok: false, error: { code: 'internal', message: String(error) } })
     }
   }
 
@@ -486,9 +692,22 @@ export class BridgeServer {
     if (conn === null) return
     try {
       const result = await this.deps.api.respond(frame.rpcId, frame.result, conn.abort.signal)
-      sendFrame(conn.ws, { t: 'respond.result', id: frame.id, ok: true, result })
+      conn.sender.send({ t: 'respond.result', id: frame.id, ok: true, result })
     } catch (error: unknown) {
-      sendFrame(conn.ws, { t: 'respond.result', id: frame.id, ok: false, error: { code: 'internal', message: String(error) } })
+      conn.sender.send({ t: 'respond.result', id: frame.id, ok: false, error: { code: 'internal', message: String(error) } })
+    }
+  }
+
+  /**
+   * Settle every pending tool call with one transport failure.
+   * @param code - wire error code recorded on each call.
+   * @param message - human-readable explanation for the model.
+   */
+  private failPendingTools(code: ToolErrorCode, message: string): void {
+    for (const [id, pending] of [...this.pendingTools]) {
+      clearTimeout(pending.timer)
+      this.pendingTools.delete(id)
+      pending.reject(new BridgeToolError(code, message))
     }
   }
 
@@ -508,6 +727,7 @@ export class BridgeServer {
     this.current = null
     clearInterval(conn.ping)
     conn.abort.abort()
+    conn.sender.dispose()
     if (conn.ws.readyState === WebSocket.OPEN || conn.ws.readyState === WebSocket.CONNECTING) {
       conn.ws.close(4000, 'replaced')
     }

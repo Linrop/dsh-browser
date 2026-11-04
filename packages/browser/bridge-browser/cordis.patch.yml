@@ -27,3 +27,7 @@
         toolTimeoutMs: 90000
         snapshotMaxChars: 32000
         maxInteractiveItems: 60
+        artifactMaxBytes: !!js Number(process.env.DSH_BROWSER_ARTIFACT_MAX_BYTES) || undefined
+        artifactMaxFiles: !!js Number(process.env.DSH_BROWSER_ARTIFACT_MAX_FILES) || undefined
+        artifactTtlMs: !!js Number(process.env.DSH_BROWSER_ARTIFACT_TTL_MS) || undefined
+        artifactSweepIntervalMs: !!js Number(process.env.DSH_BROWSER_ARTIFACT_SWEEP_INTERVAL_MS) || undefined

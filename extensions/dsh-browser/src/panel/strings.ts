@@ -78,6 +78,15 @@ export interface PanelCopy {
     approvalNotificationsHelp: string
     autoResumeSession: string
     autoResumeSessionHelp: string
+    indicatorMode: string
+    indicatorModeHelp: string
+    indicatorBadge: string
+    indicatorBadgeOverlay: string
+    indicatorOff: string
+    tabIsolation: string
+    tabIsolationHelp: string
+    keepAlive: string
+    keepAliveHelp: string
     trustedOrigins: string
     trustedOriginsHelp: string
     trustedOriginInput: string
@@ -121,6 +130,8 @@ export interface PanelCopy {
     relaySaveFailed: (reason: string) => string
     relayEmpty: string
     relayInvalidName: string
+    diagnostics: string
+    diagnosticsHelp: string
   }
   update: {
     eyebrow: string
@@ -148,14 +159,6 @@ export interface PanelCopy {
     copyCheckoutCommand: string
     copied: string
     copyError: string
-  }
-  textSize: {
-    open: string
-    title: string
-    smaller: string
-    larger: string
-    reset: string
-    value: (percent: string) => string
   }
   app: {
     openSettings: string
@@ -210,6 +213,14 @@ export interface PanelCopy {
     selectionTruncated: string
     removeSelection: string
     scrollToBottom: string
+    record: string
+    recordStop: string
+    recordingActive: string
+    recordingExporting: string
+    recordingFrames: (frames: number, dropped: number) => string
+    recordingExported: (filename: string) => string
+    recordingCleared: string
+    recordingFailed: (reason: string) => string
   }
 }
 
@@ -311,6 +322,15 @@ const EN: PanelCopy = {
     approvalNotificationsHelp: 'Notify you when an approval arrives while the side panel is closed',
     autoResumeSession: "Resume this page's conversation",
     autoResumeSessionHelp: 'Reopen the conversation associated with this tab and page path; other pages start a new conversation',
+    indicatorMode: 'Visible work indicator',
+    indicatorModeHelp: 'Show running browser work on the toolbar badge, and optionally as a dot inside the assisted page',
+    indicatorBadge: 'Badge only',
+    indicatorBadgeOverlay: 'Badge and in-page dot (default)',
+    indicatorOff: 'Off',
+    tabIsolation: 'Restrict tools to this session\'s tabs',
+    tabIsolationHelp: 'Only the tab this conversation bound to, tabs it opened, and tabs you told it to follow can be operated; anything else is refused',
+    keepAlive: 'Keep the assistant connection warm',
+    keepAliveHelp: 'Hold a small background document while the side panel is open so browser tools answer immediately; turn it off to reduce background activity',
     trustedOrigins: 'Always-allowed domains',
     trustedOriginsHelp: 'The approval dialog can trust a domain for the current side-panel session only. Domains added here permanently skip action confirmation when every known origin is trusted. Wildcards include the base domain and subdomains, and stay scoped to their scheme and port; `*.example.com` defaults to HTTPS.',
     trustedOriginInput: 'Domain to always trust (e.g. https://example.com or https://*.example.com)',
@@ -354,6 +374,8 @@ const EN: PanelCopy = {
     relaySaveFailed: (reason) => `Saving failed: ${reason}`,
     relayEmpty: 'No relay profiles yet.',
     relayInvalidName: 'Enter a profile name.',
+    diagnostics: 'Local event counters',
+    diagnosticsHelp: 'Counts from this background session only. Nothing leaves the browser.',
   },
   update: {
     eyebrow: 'Release channel',
@@ -381,14 +403,6 @@ const EN: PanelCopy = {
     copyCheckoutCommand: 'Copy checkout command',
     copied: 'Command copied',
     copyError: 'Could not copy the command. Run the installer from the original installation source instead.',
-  },
-  textSize: {
-    open: 'Text size',
-    title: 'Text size',
-    smaller: 'Smaller text',
-    larger: 'Larger text',
-    reset: 'Reset',
-    value: (percent) => `Text size ${percent}`,
   },
   app: {
     openSettings: 'Open settings',
@@ -443,6 +457,16 @@ const EN: PanelCopy = {
     selectionTruncated: '(truncated)',
     removeSelection: 'Remove the selected text',
     scrollToBottom: 'Scroll to latest',
+    record: 'Record this tab as a GIF',
+    recordStop: 'Stop and download the recording',
+    recordingActive: 'Recording',
+    recordingExporting: 'Encoding the GIF…',
+    recordingFrames: (frames, dropped) => dropped === 0
+      ? `${frames} frame${frames === 1 ? '' : 's'} captured`
+      : `${frames} frames captured · ${dropped} dropped to stay inside the limits`,
+    recordingExported: (filename) => `Recording exported as ${filename}.`,
+    recordingCleared: 'Recording cleared.',
+    recordingFailed: (reason) => `Recording failed: ${reason}`,
   },
 }
 
@@ -544,6 +568,15 @@ const ZH: PanelCopy = {
     approvalNotificationsHelp: '侧栏关闭时收到审批请求，通过系统通知提醒你',
     autoResumeSession: '续接当前页面会话',
     autoResumeSessionHelp: '重新打开当前标签页此页面的会话；其他页面会新建会话',
+    indicatorMode: '工作状态提示',
+    indicatorModeHelp: '在工具栏徽标上显示浏览器操作进行中，可选择同时在被操作的页面内显示光点',
+    indicatorBadge: '仅徽标',
+    indicatorBadgeOverlay: '徽标与页内光点（默认）',
+    indicatorOff: '关闭',
+    tabIsolation: '限定本会话可操作的标签页',
+    tabIsolationHelp: '只有本会话绑定的标签页、它自己打开的标签页，以及你让它跟随的标签页可以被操作，其余一律拒绝',
+    keepAlive: '保持助手连接常驻',
+    keepAliveHelp: '侧栏打开期间维持一个后台文档，让浏览器工具即时响应；关闭可减少后台活动',
     trustedOrigins: '永久免确认域名',
     trustedOriginsHelp: '审批框可只信任本次侧栏会话。这里添加的域名仅在所有已知来源均受信任时免除操作确认。通配符包含主域及其子域，并严格区分协议和端口；`*.example.com` 默认使用 HTTPS。',
     trustedOriginInput: '要永久信任的域名（如 https://example.com 或 https://*.example.com）',
@@ -587,6 +620,8 @@ const ZH: PanelCopy = {
     relaySaveFailed: (reason) => `保存失败：${reason}`,
     relayEmpty: '还没有中转档案。',
     relayInvalidName: '请填写档案名称。',
+    diagnostics: '本地事件计数',
+    diagnosticsHelp: '仅统计本次后台会话内的事件，不会发送到任何地方。',
   },
   update: {
     eyebrow: '发布通道',
@@ -614,14 +649,6 @@ const ZH: PanelCopy = {
     copyCheckoutCommand: '复制 checkout 命令',
     copied: '命令已复制',
     copyError: '无法复制命令，请回到原安装来源重新运行安装脚本。',
-  },
-  textSize: {
-    open: '字号',
-    title: '字号',
-    smaller: '缩小字号',
-    larger: '放大字号',
-    reset: '恢复默认',
-    value: (percent) => `字号 ${percent}`,
   },
   app: {
     openSettings: '打开设置',
@@ -676,6 +703,16 @@ const ZH: PanelCopy = {
     selectionTruncated: '（已截断）',
     removeSelection: '移除选中内容',
     scrollToBottom: '回到最新消息',
+    record: '录制当前标签页并导出 GIF',
+    recordStop: '停止录制并下载',
+    recordingActive: '录制中',
+    recordingExporting: '正在编码 GIF…',
+    recordingFrames: (frames, dropped) => dropped === 0
+      ? `已录制 ${frames} 帧`
+      : `已录制 ${frames} 帧 · 因超出上限丢弃 ${dropped} 帧`,
+    recordingExported: (filename) => `录制已导出为 ${filename}。`,
+    recordingCleared: '录制已清除。',
+    recordingFailed: (reason) => `录制失败：${reason}`,
   },
 }
 

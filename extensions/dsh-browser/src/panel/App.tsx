@@ -1,6 +1,6 @@
 /**
- * Side panel application: chat with the local dsh agent, plus a settings
- * view. Renders conversation from session history and live session events;
+ * Side panel application: chat with the local dsh agent. Renders
+ * conversation from session history and live session events;
  * browser actions are driven by the model through the bridge tools (the panel
  * only shows tool activity cards).
  *
@@ -8,28 +8,18 @@
  */
 
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { BRIDGE_SESSION_PURGE_METHOD, DEFAULT_SNAPSHOT_MAX_CHARS } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
-import type { BridgeCaps } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
+import { BRIDGE_SESSION_PURGE_METHOD } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
 import type { ServerFrame } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
 import type { BridgeState } from '../background/bridge.ts'
 import type { AffinityTab, TabAffinityDecision, TabAffinityState } from '../background/tab-affinity.ts'
-import { connectPanel, PanelRpcError, type PanelApi, type PanelSettings } from './api.ts'
+import type { RecordingStatus } from '../content/recorder.ts'
+import { connectPanel, type PanelApi, type PanelSettings } from './api.ts'
 import { renderMarkdown } from './markdown.ts'
 import whaleUrl from '../../assets/icons/deepseek-256.png'
 import type { ApprovalDecision, ApprovalRequest } from '../security/approval.ts'
 import { getUiLocale } from '../i18n.ts'
 import { PANEL_COPY, type PanelCopy } from './strings.ts'
-import {
-  applyUiScale,
-  DEFAULT_UI_SCALE,
-  formatUiScale,
-  loadUiScale,
-  saveUiScale,
-  stepUiScale,
-  uiScaleAtLimit,
-} from './ui-scale.ts'
 import { QuestionCard } from './QuestionCard.tsx'
-import { UpdateCard } from './UpdateCard.tsx'
 import { MessageImages } from './MessageImages.tsx'
 import type { QuestionAnswer } from './questions.ts'
 import {
@@ -38,7 +28,6 @@ import {
   removePendingQuestion,
   upsertPendingQuestion,
 } from './pending-questions.ts'
-import { normalizeTrustedOrigin } from '../security/trusted-origins.ts'
 import type { PageSelection } from '../selection.ts'
 import {
   selectionPromptText,
@@ -90,26 +79,6 @@ import {
   type SessionEventView,
 } from './events.ts'
 
-function normalizeWebOrigin(value: string): string | null {
-  return normalizeTrustedOrigin(value) ?? null
-}
-
-/** One editable API-relay profile in the settings view. */
-interface RelayProfileDraft {
-  /** Stable llm-pi-ai provider-route key; empty until first save mints it. */
-  key: string
-  name: string
-  protocol: 'anthropic-messages' | 'openai-completions' | 'openai-codex-responses'
-  baseUrl: string
-  /** Typed token; empty means keep whatever is already stored. */
-  token: string
-  tokenConfigured: boolean
-  modelsText: string
-  setDefault: boolean
-}
-
-/** Route keys managed by the relay editor; core-owned routes are never touched. */
-const RELAY_ROUTE_PREFIX = 'relay-'
 
 /** One selectable entry from `session.models` for the composer chip list. */
 interface SessionModelOption {
@@ -124,130 +93,6 @@ interface SessionModelDirectory {
   current: { provider: string; model: string; reasoningEffort?: string } | null
   options: SessionModelOption[]
   routable: boolean | null
-}
-
-/**
- * Display names are free-form (CJK included); the route key needs the
- * ASCII shape the wire and credential refs expect, so CJK-heavy names
- * collapse to a stable name hash instead of being rejected.
- */
-function relayRouteKey(name: string): string {
-  const slug = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
-  if (slug !== '') return `${RELAY_ROUTE_PREFIX}${slug}`
-  let hash = 5381
-  for (let index = 0; index < name.length; index += 1) {
-    hash = ((hash << 5) + hash + name.charCodeAt(index)) | 0
-  }
-  return `${RELAY_ROUTE_PREFIX}n${(hash >>> 0).toString(36)}`
-}
-
-function relayTokenRef(routeKey: string): string {
-  const suffix = routeKey.slice(RELAY_ROUTE_PREFIX.length).replace(/[^a-zA-Z0-9]/g, '_').toUpperCase()
-  return `DSH_RELAY_${suffix}_TOKEN`
-}
-
-function parseRelayModels(text: string): Array<{ id: string; contextWindow?: number }> {
-  return text.split('\n').map((line) => line.trim()).filter((line) => line !== '').map((line) => {
-    const [id, contextWindow] = line.split(',').map((part) => part.trim())
-    const parsed = contextWindow === undefined || contextWindow === '' ? undefined : Number(contextWindow)
-    return {
-      id,
-      ...(parsed !== undefined && Number.isFinite(parsed) && parsed > 0 ? { contextWindow: parsed } : {}),
-    }
-  }).filter((model) => model.id !== '')
-}
-
-/** Gateways report failures with the endpoint named; surface everything we got. */
-function relayErrorText(cause: unknown): string {
-  if (cause instanceof PanelRpcError) {
-    const detailKeys = Object.keys(cause.details ?? {})
-    const details = detailKeys.length > 0 ? ` ${JSON.stringify(cause.details).slice(0, 220)}` : ''
-    return `${cause.message}${details}`
-  }
-  return cause instanceof Error ? cause.message : String(cause)
-}
-
-type DiscoveredModel = { id: string; contextWindow?: number }
-
-/**
- * Anthropic-protocol routes have no native listing; the gateway still fails
- * them with a "no model listing" message whose wording varies, so match the
- * known phrasings instead of one brittle code.
- */
-function isManualOnlyDiscovery(cause: unknown): boolean {
-  if (!(cause instanceof PanelRpcError)) return false
-  return cause.code.includes('unsupported')
-    || /no model listing|models by hand/i.test(cause.message)
-}
-
-function isAuthFailure(cause: unknown): boolean {
-  return cause instanceof PanelRpcError
-    && (cause.code.includes('credential') || /\b401\b|\b403\b|invalid[ _-]?key/i.test(cause.message))
-}
-
-async function discoverOnce(
-  api: PanelApi,
-  profile: RelayProfileDraft,
-  attempt: { api: string; baseURL: string },
-): Promise<DiscoveredModel[]> {
-  const result = await api.rpc<{ models?: DiscoveredModel[] }>('llm.discoverModels', {
-    settingsNs: 'llm-pi-ai',
-    provider: profile.key !== '' ? profile.key : relayRouteKey(profile.name),
-    api: attempt.api,
-    baseURL: attempt.baseURL,
-    ...(profile.token.trim() === '' ? {} : { apiKey: profile.token.trim() }),
-  })
-  return result.models ?? []
-}
-
-/**
- * Build the ordered discovery attempts for one draft. Anthropic-protocol
- * profiles have no native listing, so fall back to the relay's own
- * OpenAI-compatible listing endpoint (`<base>/v1/models`) — New API / One API
- * style stations serve it with the same token, and the returned ids are the
- * ones the Anthropic route accepts.
- */
-async function discoverWithFallback(
-  api: PanelApi,
-  profile: RelayProfileDraft,
-): Promise<{ models: DiscoveredModel[]; viaOpenaiListing: boolean }> {
-  const base = profile.baseUrl.trim().replace(/\/+$/, '')
-  const attempts: Array<{ api: string; baseURL: string; viaOpenaiListing: boolean }> = []
-  if (profile.protocol === 'anthropic-messages') {
-    attempts.push({ api: 'openai-completions', baseURL: `${base}/v1`, viaOpenaiListing: true })
-    attempts.push({ api: 'openai-completions', baseURL: base, viaOpenaiListing: true })
-  } else {
-    attempts.push({ api: profile.protocol, baseURL: base, viaOpenaiListing: false })
-    if (!base.includes('/v1')) {
-      attempts.push({ api: profile.protocol, baseURL: `${base}/v1`, viaOpenaiListing: false })
-    }
-  }
-
-  let lastCause: unknown
-  for (const attempt of attempts) {
-    try {
-      const models = await discoverOnce(api, profile, attempt)
-      if (models.length > 0) {
-        return { models, viaOpenaiListing: attempt.viaOpenaiListing }
-      }
-      lastCause = new PanelRpcError('model-discovery-failed', 'the endpoint listed no models', {
-        baseURL: attempt.baseURL,
-      })
-    } catch (cause) {
-      lastCause = cause
-      if (isAuthFailure(cause)) break
-    }
-  }
-  throw lastCause ?? new PanelRpcError('model-discovery-failed', 'model discovery failed', {})
-}
-
-function SettingsIcon(): React.JSX.Element {
-  return (
-    <svg viewBox="0 0 20 20" aria-hidden="true">
-      <path d="M10 7.35A2.65 2.65 0 1 0 10 12.65 2.65 2.65 0 0 0 10 7.35Z" />
-      <path d="M16.15 11.2a6.4 6.4 0 0 0 0-2.4l1.18-.91-1.5-2.6-1.4.57a6.3 6.3 0 0 0-2.08-1.2L12.15 3h-3l-.2 1.66a6.3 6.3 0 0 0-2.08 1.2l-1.4-.57-1.5 2.6 1.18.91a6.4 6.4 0 0 0 0 2.4l-1.18.91 1.5 2.6 1.4-.57a6.3 6.3 0 0 0 2.08 1.2l.2 1.66h3l.2-1.66a6.3 6.3 0 0 0 2.08-1.2l1.4.57 1.5-2.6-1.18-.91Z" />
-    </svg>
-  )
 }
 
 function PlusIcon(): React.JSX.Element {
@@ -306,27 +151,12 @@ function ToolIcon(): React.JSX.Element {
   )
 }
 
-function BackIcon(): React.JSX.Element {
-  return (
-    <svg viewBox="0 0 20 20" aria-hidden="true">
-      <path d="m12.5 4.5-5.5 5.5 5.5 5.5" />
-    </svg>
-  )
-}
 
-function TextSizeIcon(): React.JSX.Element {
+function RecordIcon({ active }: { active: boolean }): React.JSX.Element {
   return (
     <svg viewBox="0 0 20 20" aria-hidden="true">
-      <path d="M2.5 14.5 6.25 5h1.5l3.75 9.5M4.1 11.4h5.8" />
-      <path d="M12.4 14.5 15 7.6h1.1l2.6 6.9M13.5 12.4h4.1" />
-    </svg>
-  )
-}
-
-function MinusIcon(): React.JSX.Element {
-  return (
-    <svg viewBox="0 0 20 20" aria-hidden="true">
-      <path d="M5 10h10" />
+      <circle cx="10" cy="10" r="4.2" fill={active ? 'currentColor' : 'none'} />
+      <circle cx="10" cy="10" r="8.2" />
     </svg>
   )
 }
@@ -340,39 +170,22 @@ function ShieldIcon(): React.JSX.Element {
   )
 }
 
-/** Stepper for the panel-wide text scale; see `ui-scale.ts` for the model. */
-function TextSizePanel({
-  scale,
-  copy,
-  onStep,
-  onReset,
-}: {
-  scale: number
-  copy: PanelCopy
-  onStep: (direction: 1 | -1) => void
-  onReset: () => void
-}): React.JSX.Element {
-  return (
-    <section className="text-size-panel" aria-label={copy.textSize.title}>
-      <strong>{copy.textSize.title}</strong>
-      <div className="text-size-stepper">
-        <button type="button" disabled={uiScaleAtLimit(scale, -1)}
-          onClick={() => onStep(-1)}
-          aria-label={copy.textSize.smaller} title={copy.textSize.smaller}>
-          <MinusIcon />
-        </button>
-        <span className="text-size-value" role="status"
-          aria-label={copy.textSize.value(formatUiScale(scale))}>{formatUiScale(scale)}</span>
-        <button type="button" disabled={uiScaleAtLimit(scale, 1)}
-          onClick={() => onStep(1)}
-          aria-label={copy.textSize.larger} title={copy.textSize.larger}>
-          <PlusIcon />
-        </button>
-      </div>
-      <button type="button" className="text-size-reset" disabled={scale === DEFAULT_UI_SCALE}
-        onClick={onReset}>{copy.textSize.reset}</button>
-    </section>
-  )
+/**
+ * Pasted clipboard files from the composer; non-file items (plain text) are
+ * ignored. Some screenshot sources only expose the file through `items`, so
+ * both channels are read and de-duplicated by name/size/type.
+ */
+function clipboardFiles(data: DataTransfer | null): File[] {
+  if (data === null) return []
+  const fromFiles = Array.from(data.files ?? []).filter((item): item is File => item instanceof File)
+  if (fromFiles.length > 0) return fromFiles
+  const fromItems: File[] = []
+  for (const item of Array.from(data.items ?? [])) {
+    if (item.kind !== 'file') continue
+    const file = item.getAsFile()
+    if (file !== null) fromItems.push(file)
+  }
+  return fromItems
 }
 
 function tabLabel(tab: AffinityTab | null, unknownTab: string): string {
@@ -626,7 +439,6 @@ export function App(): React.JSX.Element {
   const copy = PANEL_COPY[locale]
   const [api] = useState<PanelApi>(() => connectPanel())
   const [state, setState] = useState<BridgeState>('stopped')
-  const [caps, setCaps] = useState<BridgeCaps | null>(null)
   const [settings, setSettings] = useState<PanelSettings | null>(null)
   const [rows, setRows] = useState<Row[]>([])
   const [streamRow, setStreamRow] = useState<Row | null>(null)
@@ -639,23 +451,13 @@ export function App(): React.JSX.Element {
   const [busy, setBusy] = useState(false)
   const [working, setWorking] = useState(false)
   const [stopping, setStopping] = useState(false)
-  const [showSettings, setShowSettings] = useState(false)
-  const [uiScale, setUiScale] = useState(DEFAULT_UI_SCALE)
-  const uiScaleRef = useRef(DEFAULT_UI_SCALE)
-  const uiScaleChosenRef = useRef(false)
-  const [showTextSize, setShowTextSize] = useState(false)
   const [approvalQueue, setApprovalQueue] = useState<ApprovalRequest[]>([])
   const [tabAffinity, setTabAffinity] = useState<TabAffinityState | null>(null)
-  const [trustedOriginInput, setTrustedOriginInput] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [showSessionPicker, setShowSessionPicker] = useState(false)
   const [loadingSessions, setLoadingSessions] = useState(false)
   const [sessionChanging, setSessionChanging] = useState(false)
   const [sessionList, setSessionList] = useState<SessionPickerEntry[]>([])
-  const [relayProfiles, setRelayProfiles] = useState<RelayProfileDraft[]>([])
-  const [relayLoaded, setRelayLoaded] = useState(false)
-  const [relayNotice, setRelayNotice] = useState<string | null>(null)
-  const [relayBusy, setRelayBusy] = useState(false)
   const [sessionModels, setSessionModels] = useState<SessionModelDirectory | null>(null)
   const [modelSelecting, setModelSelecting] = useState(false)
   const [showModelPicker, setShowModelPicker] = useState(false)
@@ -694,6 +496,8 @@ export function App(): React.JSX.Element {
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const atBottomRef = useRef(true)
   const [atBottom, setAtBottom] = useState(true)
+  const [recording, setRecording] = useState<RecordingStatus | null>(null)
+  const [recordingError, setRecordingError] = useState<string | null>(null)
 
   const nextSeq = (): number => { seqRef.current += 1; return seqRef.current }
 
@@ -762,31 +566,7 @@ export function App(): React.JSX.Element {
     setQuestionSubmissions(updated)
   }
 
-  // Text size: the stylesheet reads --ui-scale, so seed the document from
-  // storage before the first paint the user notices, then keep the two in step.
-  // A choice made while the read is still in flight has already been persisted,
-  // so the late seed must not overwrite it and revert what the user sees.
-  useEffect(() => {
-    void loadUiScale().then((stored) => {
-      if (uiScaleChosenRef.current) return
-      uiScaleRef.current = stored
-      setUiScale(stored)
-      applyUiScale(stored)
-    })
-  }, [])
-
-  // The stepper emits a direction, not a value: resolving the next step against
-  // the ref keeps a fast double-click from computing both steps off the same
-  // stale render and silently collapsing them into one.
-  function changeUiScale(next: number): void {
-    uiScaleChosenRef.current = true
-    uiScaleRef.current = next
-    setUiScale(next)
-    applyUiScale(next)
-    saveUiScale(next)
-  }
-
-  // Settings: seed from storage, then let the panel own the form.
+  // Settings: seed from storage; the panel only reads them (no editor).
   useEffect(() => {
     void chrome.storage.local.get('dshSettings').then((stored) => {
       const raw = stored.dshSettings as Partial<PanelSettings> | undefined
@@ -798,6 +578,9 @@ export function App(): React.JSX.Element {
         trustedActionOrigins: raw?.trustedActionOrigins ?? [],
         approvalNotifications: raw?.approvalNotifications ?? true,
         autoResumeSession: raw?.autoResumeSession ?? true,
+        indicatorMode: raw?.indicatorMode ?? 'badge-overlay',
+        tabIsolation: raw?.tabIsolation ?? true,
+        keepAliveEnabled: raw?.keepAliveEnabled ?? true,
       })
     })
   }, [])
@@ -808,9 +591,9 @@ export function App(): React.JSX.Element {
   const [sessionEpoch, setSessionEpoch] = useState(0)
   const lastStateRef = useRef<BridgeState | null>(null)
   useEffect(() => {
-    const offStatus = api.onStatus((next, nextCaps) => {
+    const offStatus = api.onStatus((next) => {
       setState(next)
-      setCaps(nextCaps)
+
       const previous = lastStateRef.current
       lastStateRef.current = next
       if (previous !== null && next !== previous && next === 'stopped') {
@@ -860,12 +643,16 @@ export function App(): React.JSX.Element {
     const offResumeHint = api.onSessionResumeHint((sessionId) => {
       setResumeHint({ ready: true, sessionId })
     })
+    const offRecording = api.onRecording((status, failure) => {
+      setRecording(status)
+      setRecordingError(failure ?? null)
+    })
     void api.requestStatus().catch((cause: unknown) => {
       setError(cause instanceof Error ? cause.message : String(cause))
     })
     return () => {
       offStatus(); offEvent(); offApproval(); offApprovalResolved()
-      offTabAffinity(); offSelection(); offResumeHint()
+      offTabAffinity(); offSelection(); offResumeHint(); offRecording()
     }
   }, [api])
 
@@ -897,14 +684,13 @@ export function App(): React.JSX.Element {
   // Sibling chrome (session picker, question card, errors, attachments) can
   // resize the scrollport without a scroll event; keep bottom state honest.
   useEffect(() => {
-    if (showSettings) return
     const element = scrollRef.current
     if (element === null || typeof ResizeObserver === 'undefined') return
     syncScrollBottom()
     const observer = new ResizeObserver(() => { syncScrollBottom() })
     observer.observe(element)
     return () => observer.disconnect()
-  }, [showSettings, question, error, showSessionPicker, draftImages.length, selection])
+  }, [question, error, showSessionPicker, draftImages.length, selection])
 
   useEffect(() => {
     if (!showModelPicker) return
@@ -1620,249 +1406,6 @@ export function App(): React.JSX.Element {
     }
   }
 
-  async function saveSettings(): Promise<void> {
-    if (settings === null) return
-    try {
-      const relaySaved = await saveRelayProfiles()
-      if (!relaySaved) return
-      await api.updateSettings(settings)
-      setShowSettings(false)
-      await refreshSessionModels(sessionRef.current)
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause))
-    }
-  }
-
-  /** Load relay profiles from the llm-pi-ai settings namespace once per settings visit. */
-  useEffect(() => {
-    if (!showSettings || relayLoaded) return
-    let cancelled = false
-    void (async () => {
-      try {
-        const described = await api.rpc<{
-          namespaces?: Array<{ ns: string; value?: Record<string, unknown> }>
-        }>('settings.describe', {})
-        const ns = described.namespaces?.find((candidate) => candidate.ns === 'llm-pi-ai')
-        const providers = (ns?.value?.providers ?? {}) as Record<string, {
-          displayName?: string
-          api?: string
-          baseURL?: string
-          apiKeyEnv?: string
-          models?: Array<{ id: string; contextWindow?: number }>
-        }>
-        const defaults = (described.namespaces?.find((candidate) => candidate.ns === 'agent-default-model')
-          ?.value ?? {}) as { provider?: unknown }
-        const refs = Object.entries(providers)
-          .filter(([key]) => key.startsWith(RELAY_ROUTE_PREFIX))
-          .map(([, route]) => typeof route.apiKeyEnv === 'string' ? route.apiKeyEnv : '')
-          .filter((ref) => ref !== '')
-        let configuredRefs = new Set<string>()
-        if (refs.length > 0) {
-          try {
-            const creds = await api.rpc<{ credentials?: Record<string, { configured?: boolean }> }>(
-              'credentials.describe',
-              { refs },
-            )
-            configuredRefs = new Set(
-              Object.entries(creds.credentials ?? {})
-                .filter(([, view]) => view.configured === true)
-                .map(([ref]) => ref),
-            )
-          } catch {
-            // Credential visibility is cosmetic here; treat every token as unconfigured.
-          }
-        }
-        const drafts = Object.entries(providers)
-          .filter(([key]) => key.startsWith(RELAY_ROUTE_PREFIX))
-          .map(([key, route]) => ({
-            key,
-            name: typeof route.displayName === 'string' && route.displayName !== '' ? route.displayName : key,
-            protocol: (route.api === 'anthropic-messages' || route.api === 'openai-codex-responses'
-              ? route.api
-              : 'openai-completions') as RelayProfileDraft['protocol'],
-            baseUrl: typeof route.baseURL === 'string' ? route.baseURL : '',
-            token: '',
-            tokenConfigured: route.apiKeyEnv !== undefined && configuredRefs.has(route.apiKeyEnv),
-            modelsText: (route.models ?? []).map((model) => [
-              model.id,
-              model.contextWindow === undefined ? '' : String(model.contextWindow),
-            ].filter((part) => part !== '').join(', ')).join('\n'),
-            setDefault: defaults.provider === key,
-          }))
-        if (!cancelled) setRelayProfiles(drafts)
-      } catch {
-        // The namespace may not exist yet; an empty list still allows creating profiles.
-      }
-      if (!cancelled) setRelayLoaded(true)
-    })()
-    return () => { cancelled = true }
-  }, [api, showSettings, relayLoaded])
-
-  function updateRelayProfile(index: number, patch: Partial<RelayProfileDraft>): void {
-    setRelayProfiles((current) => current.map((profile, at) => at === index ? { ...profile, ...patch } : profile))
-  }
-
-  function addRelayProfile(): void {
-    setRelayNotice(null)
-    setRelayProfiles((current) => [...current, {
-      key: '',
-      name: '',
-      protocol: 'openai-completions',
-      baseUrl: '',
-      token: '',
-      tokenConfigured: false,
-      modelsText: '',
-      setDefault: false,
-    }])
-  }
-
-  async function removeRelayProfile(index: number): Promise<void> {
-    const profile = relayProfiles[index]
-    setRelayProfiles((current) => current.filter((_, at) => at !== index))
-    setRelayNotice(null)
-    if (profile === undefined || profile.key === '') return
-    try {
-      await api.rpc('settings.mutate', {
-        ns: 'llm-pi-ai',
-        ops: [{ op: 'unset', path: ['providers', profile.key] }],
-      })
-      try {
-        await api.rpc('credentials.unset', { ref: relayTokenRef(profile.key) })
-      } catch {
-        // The route is gone either way; a stale credential reference harms nothing.
-      }
-    } catch (cause) {
-      setRelayNotice(copy.settings.relaySaveFailed(cause instanceof Error ? cause.message : String(cause)))
-    }
-  }
-
-  async function testRelayConnection(index: number): Promise<void> {
-    const profile = relayProfiles[index]
-    if (profile === undefined || relayBusy) return
-    setRelayBusy(true)
-    setRelayNotice(copy.settings.relayTesting)
-    try {
-      const { models, viaOpenaiListing } = await discoverWithFallback(api, profile)
-      const ids = models.map((model) => model.id)
-      if (ids.length === 0) {
-        setRelayNotice(copy.settings.relayTestManualOnly)
-        return
-      }
-      setRelayNotice(copy.settings.relayTestOk(ids.length, ids.slice(0, 4).join(', ')
-        + (ids.length > 4 ? ' …' : ''))
-        + (viaOpenaiListing ? copy.settings.relayOpenaiListingNote : ''))
-    } catch (cause) {
-      setRelayNotice(isManualOnlyDiscovery(cause)
-        ? copy.settings.relayTestManualOnly
-        : copy.settings.relayTestFailed(relayErrorText(cause)))
-    } finally {
-      setRelayBusy(false)
-    }
-  }
-
-  /** Discover models from the drafted endpoint and fill the textarea in place. */
-  async function fetchRelayModels(index: number): Promise<void> {
-    const profile = relayProfiles[index]
-    if (profile === undefined || relayBusy) return
-    if (profile.baseUrl.trim() === '') {
-      setRelayNotice(copy.settings.relayNeedBaseUrl)
-      return
-    }
-    setRelayBusy(true)
-    setRelayNotice(copy.settings.relayFetching)
-    try {
-      const { models, viaOpenaiListing } = await discoverWithFallback(api, profile)
-      if (models.length === 0) {
-        setRelayNotice(copy.settings.relayTestManualOnly)
-        return
-      }
-      updateRelayProfile(index, {
-        modelsText: models.map((model) => [
-          model.id,
-          model.contextWindow === undefined ? '' : String(model.contextWindow),
-        ].filter((part) => part !== '').join(', ')).join('\n'),
-      })
-      setRelayNotice(copy.settings.relayFetchOk(models.length)
-        + (viaOpenaiListing ? copy.settings.relayOpenaiListingNote : ''))
-    } catch (cause) {
-      setRelayNotice(isManualOnlyDiscovery(cause)
-        ? copy.settings.relayTestManualOnly
-        : copy.settings.relayTestFailed(relayErrorText(cause)))
-    } finally {
-      setRelayBusy(false)
-    }
-  }
-
-  /**
-   * Persist every relay draft: token to the credential store, route to the
-   * llm-pi-ai namespace, optional default to agent-default-model.
-   * @returns false when validation failed and the outer save must abort.
-   */
-  async function saveRelayProfiles(): Promise<boolean> {
-    for (const profile of relayProfiles) {
-      if (profile.name.trim() === '') {
-        setRelayNotice(copy.settings.relayInvalidName)
-        return false
-      }
-    }
-    try {
-      const usedKeys = new Set<string>()
-      let defaultApplied = false
-      for (const profile of relayProfiles) {
-        let key = profile.key !== '' ? profile.key : relayRouteKey(profile.name)
-        while (usedKeys.has(key)) key += '-x'
-        usedKeys.add(key)
-        const ref = relayTokenRef(key)
-        if (profile.token.trim() !== '') {
-          await api.rpc('credentials.set', { ref, value: profile.token.trim() })
-        }
-        const models = parseRelayModels(profile.modelsText)
-        const firstModel = models[0]
-        const routeValue: Record<string, unknown> = {
-          displayName: profile.name.trim(),
-          apiKeyEnv: ref,
-          baseURL: profile.baseUrl.trim(),
-          models,
-          api: profile.protocol,
-        }
-        await api.rpc('settings.mutate', {
-          ns: 'llm-pi-ai',
-          ops: [{ op: 'set', path: ['providers', key], value: routeValue }],
-        })
-        if (profile.setDefault && !defaultApplied && models.length > 0) {
-          await api.rpc('settings.mutate', {
-            ns: 'agent-default-model',
-            ops: [
-              { op: 'set', path: ['provider'], value: key },
-              { op: 'set', path: ['model'], value: firstModel?.id ?? '' },
-              { op: 'unset', path: ['reasoningEffort'] },
-            ],
-          })
-          defaultApplied = true
-          // Model selection is remembered per session; the active one would
-          // otherwise stay on its old provider until a new chat is started.
-          const activeSessionId = sessionRef.current
-          if (activeSessionId !== null && firstModel?.id !== undefined) {
-            try {
-              await api.rpc('session.selectModel', {
-                sessionId: activeSessionId,
-                provider: key,
-                model: firstModel.id,
-              })
-            } catch {
-              // Best effort: the default still applies to every new session.
-            }
-          }
-        }
-      }
-      if (relayProfiles.length > 0) setRelayNotice(copy.settings.relaySavedOk)
-      return true
-    } catch (cause) {
-      setRelayNotice(copy.settings.relaySaveFailed(cause instanceof Error ? cause.message : String(cause)))
-      return false
-    }
-  }
-
   async function decideApproval(decision: ApprovalDecision): Promise<void> {
     const request = approvalQueue[0]
     if (request === undefined) return
@@ -1870,6 +1413,7 @@ export function App(): React.JSX.Element {
       await api.respondToApproval(request.id, decision)
       if (decision === 'always-allow-reads') {
         setSettings((current) => current === null ? current : { ...current, sharePageContent: 'auto' })
+        void api.updateSettings({ sharePageContent: 'auto' })
       }
       updateApprovalQueue((current) => current.filter((entry) => entry.id !== request.id))
     } catch (cause) {
@@ -1886,22 +1430,16 @@ export function App(): React.JSX.Element {
     }
   }
 
-  function addTrustedOrigin(): void {
-    const origin = normalizeWebOrigin(trustedOriginInput)
-    if (origin === null) return
-    setSettings((current) => current === null
-      ? current
-      : { ...current, trustedActionOrigins: [...new Set([...current.trustedActionOrigins, origin])].sort() })
-    setTrustedOriginInput('')
+  async function toggleRecording(): Promise<void> {
+    try {
+      if (recording?.active === true) await api.exportRecording()
+      else await api.startRecording()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause))
+    }
   }
 
-  function removeTrustedOrigin(origin: string): void {
-    setSettings((current) => current === null
-      ? current
-      : { ...current, trustedActionOrigins: current.trustedActionOrigins.filter((candidate) => candidate !== origin) })
-  }
-
-  // 状态栏只显示连接状态；快照上限是技术细节，在设置页说明（见 hint）。
+  // 状态栏只显示连接状态；快照上限是技术细节。
   const statusText = copy.status[state]
   const sessionMenuTitle = sessionTitle ?? copy.app.newSession
   const currentModelOption = sessionModels?.options.find((option) => (
@@ -1928,239 +1466,26 @@ export function App(): React.JSX.Element {
     }
     return groups
   })()
+  const recordingStatusText = ((): string | null => {
+    if (recording === null) return null
+    if (recordingError !== null) return copy.app.recordingFailed(recordingError)
+    if (recording.exporting === true) return copy.app.recordingExporting
+    if (recording.active) return `${copy.app.recordingActive} · ${copy.app.recordingFrames(recording.frames, recording.dropped)}`
+    if (recording.filename !== undefined) {
+      return `${copy.app.recordingExported(recording.filename)} ${copy.app.recordingCleared}`
+    }
+    if (recording.clearedAt !== undefined) return copy.app.recordingCleared
+    return null
+  })()
   const approvalDialog = !approvalReadyForSession(queuedApproval, sessionRef.current, sessionChanging)
     ? null
     : <ApprovalDialog request={queuedApproval!} onDecision={decideApproval} copy={copy} />
 
-  if (showSettings) {
-    return (
-      <><div className="settings">
-        <div className="settings-heading">
-          <button className="icon-button" onClick={() => setShowSettings(false)} aria-label={copy.settings.back}><BackIcon /></button>
-          <div>
-            <span className="eyebrow">{copy.settings.eyebrow}</span>
-            <h1>{copy.settings.title}</h1>
-          </div>
-        </div>
-        <UpdateCard copy={copy.update} />
-        <div className="settings-panel">
-          <label>
-            <span>{copy.settings.bridgeAddress}</span>
-            <small>{copy.settings.bridgeHelp}</small>
-            <input
-              value={settings?.bridgeUrl ?? ''}
-              onChange={(e) => setSettings((prev) => prev === null ? prev : { ...prev, bridgeUrl: e.target.value })}
-              placeholder={copy.settings.bridgePlaceholder}
-            />
-          </label>
-          <label>
-            <span>Token</span>
-            <small>{copy.settings.tokenHelp}</small>
-            <input
-              type="password"
-              value={settings?.token ?? ''}
-              onChange={(e) => setSettings((prev) => prev === null ? prev : { ...prev, token: e.target.value })}
-              placeholder={copy.settings.tokenPlaceholder}
-            />
-          </label>
-          <label>
-            <span>{copy.settings.pageSharing}</span>
-            <small>{copy.settings.pageSharingHelp}</small>
-            <select
-              value={settings?.sharePageContent ?? 'auto'}
-              disabled={settings?.unrestrictedBrowserAccess ?? false}
-              onChange={(e) => setSettings((prev) => prev === null ? prev : { ...prev, sharePageContent: e.target.value as PanelSettings['sharePageContent'] })}
-            >
-              <option value="auto">{copy.settings.sharingAuto}</option>
-              <option value="ask">{copy.settings.sharingAsk}</option>
-              <option value="off">{copy.settings.sharingOff}</option>
-            </select>
-          </label>
-        </div>
-        <div className="settings-panel preference-toggles">
-          <label className="setting-toggle">
-            <span className="setting-toggle-copy">
-              <strong>{copy.settings.unrestrictedBrowserAccess}</strong>
-              <small>{copy.settings.unrestrictedBrowserAccessHelp}</small>
-            </span>
-            <input
-              className="setting-toggle-input"
-              type="checkbox"
-              checked={settings?.unrestrictedBrowserAccess ?? false}
-              onChange={(event) => setSettings((current) => current === null
-                ? current
-                : { ...current, unrestrictedBrowserAccess: event.target.checked })}
-            />
-            <span className="setting-toggle-control" aria-hidden="true"><span /></span>
-          </label>
-          <label className="setting-toggle">
-            <span className="setting-toggle-copy">
-              <strong>{copy.settings.approvalNotifications}</strong>
-              <small>{copy.settings.approvalNotificationsHelp}</small>
-            </span>
-            <input
-              className="setting-toggle-input"
-              type="checkbox"
-              checked={settings?.approvalNotifications ?? true}
-              onChange={(event) => setSettings((current) => current === null
-                ? current
-                : { ...current, approvalNotifications: event.target.checked })}
-            />
-            <span className="setting-toggle-control" aria-hidden="true"><span /></span>
-          </label>
-          <label className="setting-toggle">
-            <span className="setting-toggle-copy">
-              <strong>{copy.settings.autoResumeSession}</strong>
-              <small>{copy.settings.autoResumeSessionHelp}</small>
-            </span>
-            <input
-              className="setting-toggle-input"
-              type="checkbox"
-              checked={settings?.autoResumeSession ?? true}
-              onChange={(event) => setSettings((current) => current === null
-                ? current
-                : { ...current, autoResumeSession: event.target.checked })}
-            />
-            <span className="setting-toggle-control" aria-hidden="true"><span /></span>
-          </label>
-        </div>
-        <section className="relay-config" aria-labelledby="relay-title">
-          <div className="relay-heading">
-            <span id="relay-title">
-              <strong>{copy.settings.relaySection}</strong>
-              <small>{copy.settings.relayHelp}</small>
-            </span>
-            <button className="secondary" onClick={addRelayProfile}>{copy.settings.relayAdd}</button>
-          </div>
-          {relayProfiles.length === 0 && <p>{copy.settings.relayEmpty}</p>}
-          {relayProfiles.map((profile, index) => (
-            <div className="relay-profile" key={profile.key === '' ? `new-${index}` : profile.key}>
-              <label>
-                <span>{copy.settings.relayName}</span>
-                <input
-                  value={profile.name}
-                  onChange={(event) => updateRelayProfile(index, { name: event.target.value })}
-                  placeholder={copy.settings.relayNamePlaceholder}
-                />
-              </label>
-              <label>
-                <span>{copy.settings.relayProtocol}</span>
-                <select
-                  value={profile.protocol}
-                  onChange={(event) => updateRelayProfile(index, {
-                    protocol: event.target.value as RelayProfileDraft['protocol'],
-                  })}
-                >
-                  <option value="openai-completions">{copy.settings.relayProtocolOpenai}</option>
-                  <option value="openai-codex-responses">{copy.settings.relayProtocolCodex}</option>
-                  <option value="anthropic-messages">{copy.settings.relayProtocolClaude}</option>
-                </select>
-              </label>
-              <label>
-                <span>{copy.settings.relayBaseUrl}</span>
-                <input
-                  value={profile.baseUrl}
-                  onChange={(event) => updateRelayProfile(index, { baseUrl: event.target.value })}
-                  placeholder="https://api.example.com/v1"
-                />
-              </label>
-              <label>
-                <span>{copy.settings.relayToken}</span>
-                <input
-                  type="password"
-                  value={profile.token}
-                  onChange={(event) => updateRelayProfile(index, { token: event.target.value })}
-                  placeholder={copy.settings.relayTokenPlaceholder(profile.tokenConfigured)}
-                />
-              </label>
-              <div className="relay-models">
-                <div className="relay-label-row">
-                  <span>{copy.settings.relayModels}</span>
-                  <button className="relay-fetch" disabled={profile.baseUrl.trim() === '' || relayBusy}
-                    onClick={() => { void fetchRelayModels(index) }}>
-                    {copy.settings.relayFetchModels}
-                  </button>
-                </div>
-                <small>{copy.settings.relayModelsHelp}</small>
-                <textarea
-                  rows={3}
-                  aria-label={copy.settings.relayModels}
-                  value={profile.modelsText}
-                  onChange={(event) => updateRelayProfile(index, { modelsText: event.target.value })}
-                  placeholder={copy.settings.relayModelsPlaceholder}
-                />
-              </div>
-              <label className="setting-toggle">
-                <span className="setting-toggle-copy">
-                  <strong>{copy.settings.relaySetDefault}</strong>
-                  <small>{copy.settings.relaySetDefaultHelp}</small>
-                </span>
-                <input
-                  className="setting-toggle-input"
-                  type="checkbox"
-                  checked={profile.setDefault}
-                  onChange={(event) => setRelayProfiles((current) => current.map((candidate, at) => at === index
-                    ? { ...candidate, setDefault: event.target.checked }
-                    : candidate))}
-                />
-                <span className="setting-toggle-control" aria-hidden="true"><span /></span>
-              </label>
-              <div className="relay-profile-actions">
-                <button
-                  disabled={profile.name.trim() === '' || profile.baseUrl.trim() === ''}
-                  onClick={() => { void testRelayConnection(index) }}
-                >
-                  {copy.settings.relayTest}
-                </button>
-                <button className="secondary" onClick={() => { void removeRelayProfile(index) }}>
-                  {copy.settings.relayRemove}
-                </button>
-              </div>
-            </div>
-          ))}
-          {relayNotice !== null && <p className="hint">{relayNotice}</p>}
-        </section>
-        <section className="trusted-origins" aria-labelledby="trusted-origins-title">
-          <div>
-            <span id="trusted-origins-title">{copy.settings.trustedOrigins}</span>
-            <small>{copy.settings.trustedOriginsHelp}</small>
-          </div>
-          <div className="trusted-origin-add">
-            <input
-              aria-label={copy.settings.trustedOriginInput}
-              value={trustedOriginInput}
-              onChange={(event) => setTrustedOriginInput(event.target.value)}
-              onKeyDown={(event) => { if (event.key === 'Enter') addTrustedOrigin() }}
-              placeholder="https://example.com / https://*.example.com"
-            />
-            <button disabled={normalizeWebOrigin(trustedOriginInput) === null} onClick={addTrustedOrigin}>{copy.settings.add}</button>
-          </div>
-          {trustedOriginInput.trim() !== '' && normalizeWebOrigin(trustedOriginInput) === null && (
-            <p className="origin-error">{copy.settings.invalidOrigin}</p>
-          )}
-          {settings?.trustedActionOrigins.length === 0 && <p>{copy.settings.noTrustedOrigins}</p>}
-          {settings?.trustedActionOrigins.map((origin) => (
-            <div className="trusted-origin" key={origin}>
-              <code>{origin}</code>
-              <button onClick={() => removeTrustedOrigin(origin)} aria-label={copy.settings.removeOrigin(origin)}>{copy.settings.remove}</button>
-            </div>
-          ))}
-        </section>
-        <div className="settings-actions">
-          <button className="primary" onClick={saveSettings}>{copy.settings.save}</button>
-          <button className="secondary" onClick={() => setShowSettings(false)}>{copy.settings.cancel}</button>
-        </div>
-        <p className="hint">{copy.settings.snapshotHint(caps?.snapshotMaxChars ?? DEFAULT_SNAPSHOT_MAX_CHARS)}</p>
-      </div>{approvalDialog}</>
-    )
-  }
-
   return (
     <><div className="app">
       <header className="topbar">
-        <span className="connection" role="status">
+        <span className="connection" role="status" title={statusText} aria-label={statusText}>
           <span className={`dot ${state}`} />
-          <span className="connection-label">{statusText}</span>
         </span>
         <button className="session-menu-trigger" disabled={state !== 'connected' || sessionSwitchBlocked}
           aria-expanded={showSessionPicker} aria-label={copy.app.openSessions}
@@ -2174,23 +1499,23 @@ export function App(): React.JSX.Element {
             aria-label={copy.app.newSession} title={copy.app.newSession}>
             <PlusIcon />
           </button>
-          <button className="icon-button text-size-trigger" onClick={() => setShowTextSize((open) => !open)}
-            aria-expanded={showTextSize} aria-label={copy.textSize.open} title={copy.textSize.open}>
-            <TextSizeIcon />
+          <button className={`icon-button record-trigger${recording?.active === true ? ' recording' : ''}`}
+            disabled={state !== 'connected' || recording?.exporting === true}
+            aria-pressed={recording?.active === true}
+            onClick={() => { void toggleRecording() }}
+            aria-label={recording?.active === true ? copy.app.recordStop : copy.app.record}
+            title={recording?.active === true ? copy.app.recordStop : copy.app.record}>
+            <RecordIcon active={recording?.active === true} />
           </button>
-          <button className="icon-button settings-trigger" onClick={() => {
-            setShowModelPicker(false)
-            setShowSettings(true)
-          }}
-            aria-label={copy.app.openSettings} title={copy.app.settings}><SettingsIcon /></button>
         </div>
       </header>
-      {showTextSize && (
-        <TextSizePanel scale={uiScale} copy={copy}
-          onStep={(direction) => changeUiScale(stepUiScale(uiScaleRef.current, direction))}
-          onReset={() => changeUiScale(DEFAULT_UI_SCALE)} />
-      )}
       <TabAffinityBanner state={tabAffinity} copy={copy} onDecision={decideTabAffinity} />
+      {recordingStatusText !== null && (
+        <div className={`recording-strip${recording?.active === true ? ' active' : ''}`} role="status">
+          <span className="recording-dot" aria-hidden="true" />
+          <span>{recordingStatusText}</span>
+        </div>
+      )}
       {showSessionPicker && (
         <section className="session-picker" aria-label={copy.app.sessions}>
           <div className="session-picker-head">
@@ -2337,6 +1662,13 @@ export function App(): React.JSX.Element {
                 void send()
               }
             }}
+            onPaste={(e) => {
+              const files = clipboardFiles(e.nativeEvent.clipboardData)
+              // 纯文本粘贴保持 textarea 原生行为；文件走与文件选择相同的 ingest。
+              if (files.length === 0) return
+              e.preventDefault()
+              void addImageFiles(files)
+            }}
             placeholder={state === 'connected' ? copy.app.connectedPlaceholder : copy.app.disconnectedPlaceholder}
             disabled={!sessionReady || busy}
             rows={2}
@@ -2365,7 +1697,6 @@ export function App(): React.JSX.Element {
                 title={imageLimits === null ? copy.app.imageUnavailable : copy.app.addImages}
                 onClick={() => fileInputRef.current?.click()}
               ><AttachmentIcon /></button>
-              <span>{copy.app.composerHelp}</span>
             </span>
             {working ? (
               <button

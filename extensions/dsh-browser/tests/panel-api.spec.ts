@@ -395,4 +395,63 @@ describe('panel protocol', () => {
 
     await expect(pending).rejects.toThrow('Storage is unavailable')
   })
+
+  it('streams recording state, export failures, and local event counters', async () => {
+    let receive: ((message: unknown) => void) | undefined
+    const postMessage = vi.fn()
+    const port = {
+      postMessage,
+      onMessage: { addListener: vi.fn((listener: (message: unknown) => void) => { receive = listener }) },
+      onDisconnect: { addListener: vi.fn() },
+    }
+    vi.stubGlobal('chrome', { runtime: { connect: vi.fn(() => port) } })
+    const api = connectPanel()
+    const recordingListener = vi.fn()
+    const diagnosticsListener = vi.fn()
+    api.onRecording(recordingListener)
+    api.onDiagnostics(diagnosticsListener)
+
+    receive?.({
+      type: 'recording',
+      status: { active: true, frames: 3, bytes: 3072, dropped: 1, expired: 0 },
+    })
+    receive?.({
+      type: 'recording',
+      status: { active: false, frames: 3, bytes: 3072, dropped: 1, expired: 0 },
+      error: 'The GIF could not be written',
+    })
+    const counts = {
+      'recording.started': 1,
+      'recording.exported': 0,
+      'recording.cleared': 0,
+      'bridge.connected': 2,
+      'bridge.connect_timeout': 0,
+      'bridge.stale_reconnect': 1,
+      'artifact.swept': 0,
+    } as const
+    receive?.({ type: 'diagnostics', counts })
+
+    expect(recordingListener).toHaveBeenNthCalledWith(1, {
+      active: true,
+      frames: 3,
+      bytes: 3072,
+      dropped: 1,
+      expired: 0,
+    }, undefined)
+    expect(recordingListener).toHaveBeenNthCalledWith(2, {
+      active: false,
+      frames: 3,
+      bytes: 3072,
+      dropped: 1,
+      expired: 0,
+    }, 'The GIF could not be written')
+    expect(diagnosticsListener).toHaveBeenCalledWith(counts)
+
+    await api.startRecording()
+    expect(postMessage).toHaveBeenLastCalledWith({ type: 'recording.start' })
+    await api.exportRecording()
+    expect(postMessage).toHaveBeenLastCalledWith({ type: 'recording.export' })
+    await api.clearRecording()
+    expect(postMessage).toHaveBeenLastCalledWith({ type: 'recording.clear' })
+  })
 })

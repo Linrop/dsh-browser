@@ -5,3 +5,7 @@ node_modules/
 !benchmark/lib/**
 **/dist/
 **/dist-firefox/
+
+# local-only research notes and installer marker
+.research/
+.managed-by-install-sh
