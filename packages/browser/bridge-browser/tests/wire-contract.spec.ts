@@ -38,6 +38,9 @@ interface WireFixtures {
   uploadRequest: UploadFixture
   uploadResult: { text: string }
   screenshotResult: ScreenshotFixture
+  closeRequest: { tabId: number }
+  closeSessionRequest: Record<string, never>
+  listTabsResult: { tabs: { tabId: number; origin: string; owned: boolean }[] }
 }
 
 const OPTIONS: BrowserToolsOptions = {
@@ -182,6 +185,37 @@ describe('wire fixtures', () => {
     } finally {
       await rm(root, { recursive: true, force: true })
     }
+  })
+
+  it('sends browser_close with the fixture request args and an empty request verbatim', async () => {
+    const fixtures = await loadFixtures()
+    const { ctx, bridge, requestTool, registered } = makeHarness()
+    registerBrowserTools(ctx, bridge, OPTIONS)
+    const tool = registered.find((r) => r.name === 'browser_close')!
+    const exec = { signal: new AbortController().signal }
+
+    await executable(tool.definition)(fixtures.closeRequest, exec)
+    expect(requestTool).toHaveBeenLastCalledWith('browser_close', fixtures.closeRequest, exec.signal, 1_000)
+
+    await executable(tool.definition)(fixtures.closeSessionRequest, exec)
+    expect(requestTool).toHaveBeenLastCalledWith('browser_close', {}, exec.signal, 1_000)
+  })
+
+  it('returns the fixture tab listing unchanged, including owned and origin', async () => {
+    const fixtures = await loadFixtures()
+    const { ctx, bridge, requestTool, registered } = makeHarness()
+    requestTool.mockResolvedValueOnce({ text: JSON.stringify(fixtures.listTabsResult) })
+    registerBrowserTools(ctx, bridge, OPTIONS)
+    const tool = registered.find((r) => r.name === 'browser_list_tabs')!
+    const exec = { signal: new AbortController().signal }
+
+    const result = await executable(tool.definition)({}, exec)
+
+    // The extension owns the listing fields; the host must not rewrite them.
+    expect(result.text).toBe(JSON.stringify(fixtures.listTabsResult))
+    expect(requestTool).toHaveBeenLastCalledWith('browser_list_tabs', {}, exec.signal, 1_000)
+    expect(fixtures.listTabsResult.tabs.map((tab) => tab.origin)).toEqual(['created', 'adopted'])
+    expect(fixtures.listTabsResult.tabs.every((tab) => typeof tab.owned === 'boolean')).toBe(true)
   })
 
   it('parses the fixture screenshot result, including image and frame, into the artifact directory', async () => {

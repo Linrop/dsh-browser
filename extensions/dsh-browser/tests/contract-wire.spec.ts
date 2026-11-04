@@ -22,10 +22,25 @@ interface UploadFileWire {
   base64: string
 }
 
+interface TabRowFixture {
+  tabId: number
+  windowId: number
+  index: number
+  active: boolean
+  controlled: boolean
+  owned: boolean
+  origin: 'created' | 'adopted'
+  title: string
+  url: string
+}
+
 interface WireFixtures {
   uploadRequest: { index: number; files: UploadFileWire[] }
   consoleRequest: { only_errors: boolean; clear: boolean; pattern: string; limit: number }
   networkRequest: { url_pattern: string; clear: boolean; limit: number }
+  closeRequest: { tabId: number }
+  closeSessionRequest: Record<string, never>
+  listTabsResult: { tabs: TabRowFixture[] }
 }
 
 // jsdom replaces global URL, which node:fs will not accept as a file URL, so
@@ -220,5 +235,152 @@ describe('networkRequest wire form', () => {
 
     const after = await dispatch(call('browser_network', fixtures.networkRequest))
     expect(textOf(after)).toContain('No network requests found')
+  })
+})
+
+describe('listTabsResult wire form', () => {
+  it('reports every tab field, including origin, exactly as the fixture records it', async () => {
+    const rows = fixtures.listTabsResult.tabs
+    const tabs = rows.map((row) => ({
+      id: row.tabId,
+      windowId: row.windowId,
+      index: row.index,
+      active: row.active,
+      highlighted: false,
+      pinned: false,
+      incognito: false,
+      selected: row.active,
+      discarded: false,
+      autoDiscardable: true,
+      groupId: -1,
+      title: row.title,
+      url: row.url,
+    })) as chrome.tabs.Tab[]
+    const runtimeListeners = new Set<(message: unknown, sender: chrome.runtime.MessageSender) => void>()
+    const remove = vi.fn(async () => undefined)
+    const create = vi.fn(async () => ({ ...tabs[0]!, url: 'about:blank' }))
+    const update = vi.fn(async (id: number, changes: chrome.tabs.UpdateProperties) => {
+      const current = tabs.find((tab) => tab.id === id)!
+      return { ...current, ...changes }
+    })
+    vi.stubGlobal('chrome', {
+      tabs: {
+        query: vi.fn(async () => tabs),
+        get: vi.fn(async (id: number) => tabs.find((tab) => tab.id === id)!),
+        create,
+        update,
+        remove,
+        sendMessage: vi.fn(async () => ({ ok: true, result: { text: 'new page' } })),
+      },
+      webNavigation: {
+        getAllFrames: vi.fn(async () => [{
+          frameId: 0,
+          parentFrameId: -1,
+          documentId: 'doc-created',
+          url: tabs[0]!.url ?? '',
+        }]),
+      },
+      runtime: {
+        id: 'test-extension',
+        onMessage: {
+          addListener: (listener: (message: unknown, sender: chrome.runtime.MessageSender) => void) => {
+            runtimeListeners.add(listener)
+          },
+          removeListener: (listener: (message: unknown, sender: chrome.runtime.MessageSender) => void) => {
+            runtimeListeners.delete(listener)
+          },
+        },
+      },
+    })
+    // The created origin is only real if the tab came through browser_open_tab.
+    const { dispatchOpenTab } = await import('../src/background/tools.ts')
+    const opened = dispatchOpenTab(
+      { id: 'open-wire', name: 'browser_open_tab', args: { url: tabs[0]!.url! } },
+      1,
+      'auto',
+      { maxItems: 60, maxChars: 12_000 },
+      async () => 'approved',
+      undefined,
+      () => true,
+      () => true,
+    )
+    await vi.waitFor(() => { expect(runtimeListeners.size).toBe(1) })
+    for (const listener of runtimeListeners) {
+      listener(
+        { type: 'DSH_CONTENT_READY' },
+        {
+          tab: { id: tabs[0]!.id },
+          frameId: 0,
+          documentId: 'doc-created',
+          url: tabs[0]!.url,
+        } as chrome.runtime.MessageSender,
+      )
+    }
+    await expect(opened).resolves.toMatchObject({ ok: true })
+
+    const context: TabManagementContext = {
+      unrestrictedAccess: true,
+      controlledTabId: rows.find((row) => row.controlled)?.tabId,
+      ownsTab: (tabId) => rows.find((row) => row.tabId === tabId)?.owned === true,
+    }
+
+    const answer = await dispatchToolCall(
+      call('browser_list_tabs', {}),
+      'auto', undefined, undefined, undefined, undefined, undefined, context,
+    )
+    expect(answer.ok).toBe(true)
+    const text = textOf(answer)
+    const body = /<UNTRUSTED_PAGE_CONTENT nonce="[^"]+">\n([\s\S]*)\n<\/UNTRUSTED_PAGE_CONTENT/.exec(text)![1]!
+    // Exact field set: a renamed or dropped row key fails here.
+    expect(JSON.parse(body)).toEqual(fixtures.listTabsResult)
+    expect(remove).not.toHaveBeenCalled()
+  })
+})
+
+describe('closeRequest wire form', () => {
+  it('closes the tab named by tabId and reports the closed id', async () => {
+    const { tabId } = fixtures.closeRequest
+    const remove = vi.fn(async () => undefined)
+    vi.stubGlobal('chrome', {
+      tabs: {
+        query: vi.fn(async () => []),
+        get: vi.fn(async (id: number) => ({
+          id,
+          windowId: 1,
+          index: 0,
+          active: false,
+          title: 'Docs',
+          url: 'https://docs.example/guide',
+        })),
+        remove,
+      },
+      runtime: { id: 'test-extension' },
+    })
+    const context: TabManagementContext = { unrestrictedAccess: true, ownsTab: () => true }
+
+    const answer = await dispatchToolCall(
+      call('browser_close', { ...fixtures.closeRequest }),
+      'auto', undefined, undefined, undefined, undefined, undefined, context,
+    )
+
+    expect(answer.ok).toBe(true)
+    expect(textOf(answer)).toContain('Closed tab ' + tabId)
+    expect(remove).toHaveBeenCalledWith(tabId)
+  })
+
+  it('closes nothing and succeeds when the session opened no tab', async () => {
+    vi.stubGlobal('chrome', {
+      tabs: { query: vi.fn(async () => []), get: vi.fn(async () => { throw new Error('no tab') }), remove: vi.fn() },
+      runtime: { id: 'test-extension' },
+    })
+    const context: TabManagementContext = { unrestrictedAccess: true, ownsTab: () => false }
+
+    const answer = await dispatchToolCall(
+      call('browser_close', { ...fixtures.closeSessionRequest }),
+      'auto', undefined, undefined, undefined, undefined, undefined, context,
+    )
+
+    expect(answer.ok).toBe(true)
+    expect(textOf(answer)).toBe('Closed no tabs: this session has not opened any tab (closed: []).')
   })
 })

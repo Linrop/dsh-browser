@@ -58,6 +58,11 @@ import {
   type ScreenshotOptions,
 } from './cdp.ts'
 import {
+  ScreenshotPlanError,
+  clipFromRegion,
+  validateScreenshotClip,
+} from './screenshot-plan.ts'
+import {
   realInputVerdict,
   type RealInputState,
   type RealInputUnavailableReason,
@@ -169,7 +174,37 @@ export const TAB_MANAGEMENT_TOOL_NAMES = new Set([
   'browser_list_tabs',
   'browser_follow_tab',
   'browser_close_tab',
+  'browser_close',
 ])
+
+/**
+ * Tabs this browser connection opened through `browser_open_tab`.
+ *
+ * Affinity ownership answers what the connection may operate; this set records
+ * how a tab got here. It is what `browser_close` without `tabId` may close and
+ * what `browser_list_tabs` reports as `origin: "created"`. The set is
+ * connection-scoped like ownership and is pruned against live tabs whenever it
+ * is read.
+ */
+const createdTabIds = new Set<number>()
+
+/** Number of closed reports kept small: ids are listed in close order. */
+function recordCreatedTab(tabId: number): void {
+  if (Number.isInteger(tabId) && tabId >= 0) createdTabIds.add(tabId)
+}
+
+/** Live created tabs, dropping ids whose tab has already gone away. */
+async function liveCreatedTabs(): Promise<number[]> {
+  const live: number[] = []
+  for (const tabId of [...createdTabIds].sort((left, right) => left - right)) {
+    if (await findTab(tabId) === undefined) {
+      createdTabIds.delete(tabId)
+      continue
+    }
+    live.push(tabId)
+  }
+  return live
+}
 const NAVIGATION_SNAPSHOT_GUIDANCE = 'Navigation completed and the current page snapshot is included below. Use it directly instead of taking an immediate duplicate snapshot.'
 const RECEIVER_MISSING_NAVIGATION_GRACE_MS = 1_500
 const pendingInjections = new Map<number, Promise<void>>()
@@ -893,6 +928,15 @@ function tabManagementApproval(call: ToolCall, tab?: chrome.tabs.Tab): ApprovalP
       canTrust: false,
     }
   }
+  if (call.name === 'browser_close' && tab === undefined) {
+    return {
+      kind: 'action',
+      action: call.name,
+      summary: locale === 'zh' ? '关闭本会话打开的标签页' : 'Close the tabs this session opened',
+      origins: [],
+      canTrust: false,
+    }
+  }
   const url = tab === undefined ? '' : tabUrl(tab)
   const origin = originFromUrl(url)
   const display = approvalDisplayUrl(url)
@@ -951,6 +995,9 @@ async function dispatchTabManagementTool(
         active: tab.active,
         controlled: tab.id === context.controlledTabId,
         owned: context.ownsTab === undefined || context.ownsTab(tab.id),
+        // How the tab entered this connection: opened through browser_open_tab
+        // (created) versus pre-existing, bound, or followed (adopted).
+        origin: createdTabIds.has(tab.id) ? 'created' : 'adopted',
         title: tab.title ?? '',
         url: tabUrl(tab),
       }))
@@ -958,6 +1005,10 @@ async function dispatchTabManagementTool(
       ok: true,
       result: { text: wrapUntrustedContent(JSON.stringify({ tabs: records }, null, 2), budget.maxChars) },
     }
+  }
+
+  if (call.name === 'browser_close') {
+    return dispatchCloseTool(call, authorize, signal, context)
   }
 
   const tabId = requestedTabId(call.args)
@@ -992,24 +1043,122 @@ async function dispatchTabManagementTool(
       result: { text: `Tab ${tabId} is now the controlled tab. Call browser_snapshot before operating its page.` },
     }
   }
-  if (call.name === 'browser_close_tab') {
-    try {
-      context.commitAction?.()
-      await chrome.tabs.remove(tabId)
-    } catch (error: unknown) {
-      const detail = error instanceof Error ? error.message : String(error)
-      return unavailable(`Tab ${tabId} could not be closed: ${detail}`)
+  if (call.name === 'browser_close_tab') return closeTabById(tabId, context)
+  return unavailable(`Unsupported tab-management tool: ${call.name}`)
+}
+
+/**
+ * Close one tab and drop it from the created-tab ledger.
+ *
+ * Both tab-closing tools share this implementation so the reported text and the
+ * ownership bookkeeping cannot drift between them.
+ * @param tabId - tab to close.
+ * @param context - affinity context carrying the controlled tab and commit hook.
+ * @returns the close status, or the refusal when the browser declined.
+ */
+async function closeTabById(tabId: number, context: TabManagementContext): Promise<ToolAnswer> {
+  try {
+    context.commitAction?.()
+    await chrome.tabs.remove(tabId)
+  } catch (error: unknown) {
+    const detail = error instanceof Error ? error.message : String(error)
+    return unavailable(`Tab ${tabId} could not be closed: ${detail}`)
+  }
+  createdTabIds.delete(tabId)
+  return {
+    ok: true,
+    result: {
+      text: tabId === context.controlledTabId
+        ? `Closed controlled tab ${tabId}. Call browser_list_tabs and browser_follow_tab before the next page operation.`
+        : `Closed tab ${tabId}.`,
+    },
+  }
+}
+
+/**
+ * `browser_close`: ownership-aware cleanup of the tabs this session opened.
+ *
+ * Without `tabId` it closes only tabs this connection created, and a session
+ * with none closes nothing and succeeds — cleanup must be safe to call
+ * unconditionally. A named tab is refused with the reason when this session
+ * neither opened nor followed it, instead of being silently skipped.
+ * @param call - the tool call (`tabId` optional).
+ * @param authorize - approval request channel.
+ * @param signal - bridge lifetime.
+ * @param context - affinity context carrying ownership and the controlled tab.
+ * @returns the closed ids as status text.
+ */
+async function dispatchCloseTool(
+  call: ToolCall,
+  authorize: ((prompt: ApprovalPrompt) => Promise<ApprovalAuthorization>) | undefined,
+  signal: AbortSignal | undefined,
+  context: TabManagementContext,
+): Promise<ToolAnswer> {
+  const requested = call.args.tabId
+  if (requested === undefined) {
+    const owned = await liveCreatedTabs()
+    const targets = context.ownsTab === undefined
+      ? owned
+      : owned.filter((tabId) => context.ownsTab?.(tabId) === true)
+    // Cleanup of nothing needs no approval: the call is safe and its answer is
+    // the empty report, not a prompt the user must dismiss.
+    if (targets.length === 0) {
+      return {
+        ok: true,
+        result: { text: 'Closed no tabs: this session has not opened any tab (closed: []).' },
+      }
+    }
+    const approval = tabManagementApproval(call)
+    const rejected = await authorizeTabManagement(approval, context.unrestrictedAccess, authorize, call, signal)
+    if (rejected !== undefined) return rejected
+    if (isCancelled(call, signal)) return cancelled()
+    const closed: number[] = []
+    const failures: string[] = []
+    for (const tabId of targets) {
+      const answer = await closeTabById(tabId, context)
+      if (answer.ok) closed.push(tabId)
+      else failures.push(answer.error?.message ?? `Tab ${tabId} could not be closed.`)
+    }
+    if (failures.length > 0) {
+      return {
+        ok: false,
+        error: {
+          code: 'action-failed',
+          message: `Closed ${closed.length} tab(s): [${closed.join(', ')}]. ${failures.join(' ')}`,
+        },
+      }
     }
     return {
       ok: true,
-      result: {
-        text: tabId === context.controlledTabId
-          ? `Closed controlled tab ${tabId}. Call browser_list_tabs and browser_follow_tab before the next page operation.`
-          : `Closed tab ${tabId}.`,
+      result: { text: `Closed ${closed.length} tab(s) opened by this session: [${closed.join(', ')}].` },
+    }
+  }
+
+  const tabId = requestedTabId(call.args)
+  if (tabId === undefined) {
+    return { ok: false, error: { code: 'action-failed', message: 'tabId must be a non-negative safe integer returned by browser_list_tabs.' } }
+  }
+  const before = await findTab(tabId)
+  if (before === undefined) return unavailable(`Tab ${tabId} is no longer open. Call browser_list_tabs again.`)
+  if (context.ownsTab !== undefined && !context.ownsTab(tabId)) {
+    return {
+      ok: false,
+      error: {
+        code: 'tab_outside',
+        message: `Tab ${tabId} was not opened or followed by this session, so it is not this session's to close. Call browser_list_tabs to find a tab this session owns.`,
       },
     }
   }
-  return unavailable(`Unsupported tab-management tool: ${call.name}`)
+  const approval = tabManagementApproval(call, before)
+  const rejected = await authorizeTabManagement(approval, context.unrestrictedAccess, authorize, call, signal)
+  if (rejected !== undefined) return rejected
+  const current = await findTab(tabId)
+  if (current === undefined) return unavailable(`Tab ${tabId} closed while approval was pending. Call browser_list_tabs again.`)
+  if (tabUrl(current) !== tabUrl(before)) {
+    return unavailable(`Tab ${tabId} navigated while approval was pending. Call browser_list_tabs again before retrying.`)
+  }
+  if (isCancelled(call, signal)) return cancelled()
+  return closeTabById(tabId, context)
 }
 
 // ---- Real pointer input through CDP, with the synthesized-event fallback ----
@@ -1734,7 +1883,8 @@ function badArgs(message: string): ToolAnswer {
 function toolFailure(error: unknown): ToolAnswer {
   if (error instanceof DebuggerUnavailableError
     || error instanceof JsResultNotSerializableError
-    || error instanceof ScreenshotTooLargeError) {
+    || error instanceof ScreenshotTooLargeError
+    || error instanceof ScreenshotPlanError) {
     return { ok: false, error: { code: error.code, message: error.message } }
   }
   return {
@@ -1764,9 +1914,9 @@ function isScreenshotFormat(value: unknown): value is 'jpeg' | 'png' {
 function parseScreenshotOptions(args: Record<string, unknown>): { options: ScreenshotOptions } | { error: string } {
   const format = args.format === undefined ? 'jpeg' : args.format
   if (!isScreenshotFormat(format)) return { error: 'format must be "jpeg" or "png".' }
-  const scale = args.scale === undefined ? 1 : args.scale
-  if (typeof scale !== 'number' || !Number.isFinite(scale) || scale < 0.1 || scale > 1) {
-    return { error: 'scale must be a number between 0.1 and 1.' }
+  const scale = args.scale
+  if (scale !== undefined && (typeof scale !== 'number' || !Number.isInteger(scale) || scale < 1 || scale > 3)) {
+    return { error: 'scale must be 1, 2, or 3.' }
   }
   const quality = args.quality === undefined ? 80 : args.quality
   if (typeof quality !== 'number' || !Number.isFinite(quality) || quality < 1 || quality > 100) {
@@ -1778,16 +1928,22 @@ function parseScreenshotOptions(args: Record<string, unknown>): { options: Scree
     if (!Array.isArray(raw) || raw.length !== 4 || raw.some((part) => typeof part !== 'number' || !Number.isFinite(part))) {
       return { error: 'region must be four finite numbers [x0, y0, x1, y1].' }
     }
-    const [x0, y0, x1, y1] = raw as [number, number, number, number]
-    if (x1 <= x0 || y1 <= y0) return { error: 'region must satisfy x1 > x0 and y1 > y0.' }
-    region = [x0, y0, x1, y1]
+    // The plan checks the viewport-dependent bounds; the clip's own geometry
+    // fails here so an empty rectangle never starts a capture.
+    try {
+      validateScreenshotClip(clipFromRegion(raw as [number, number, number, number]))
+    } catch (error: unknown) {
+      if (error instanceof ScreenshotPlanError) return { error: error.message }
+      throw error
+    }
+    region = raw as [number, number, number, number]
   }
   return {
     options: {
-      scale,
       format,
       quality: Math.floor(quality),
       ...(region === undefined ? {} : { region }),
+      ...(scale === undefined ? {} : { scale }),
     },
   }
 }
@@ -2119,8 +2275,19 @@ function validateElementTarget(call: ToolCall, tabId: number, frames: TabFrame[]
   const frameId = requestedFrame(call.args)
   const frame = frames.find((candidate) => candidate.frameId === frameId)
   const snapshotted = snapshotDocumentsByTab.get(tabId)?.get(frameId)
-  if (frame === undefined || snapshotted === undefined || snapshotted !== frameDocumentKey(frame)) {
+  if (frame === undefined || snapshotted === undefined) {
     return unavailable('The element reference does not belong to the current document. Call browser_snapshot again for current frame and index values.')
+  }
+  if (snapshotted !== frameDocumentKey(frame)) {
+    // A frame record without a document id falls back to its URL as identity,
+    // so an SPA history change looks like a document replacement. Defer to the
+    // content script, which re-resolves the ref through its recorded selector
+    // when it still holds the document, and reports the ref as gone when a real
+    // navigation replaced the registry. A frame with a document id is a proven
+    // replacement, so that still fails closed here.
+    if (frame.documentId !== undefined) {
+      return unavailable('The element reference does not belong to the current document. Call browser_snapshot again for current frame and index values.')
+    }
   }
   return undefined
 }
@@ -2248,6 +2415,7 @@ export async function dispatchOpenTab(
     }
   }
 
+  recordCreatedTab(tabId)
   // Affinity is committed: further cancellation must not claim the tab was never opened.
   resetTabSnapshot(tabId)
   if (!targetStillAllowed(tabId)) return targetChanged()

@@ -40,5 +40,35 @@
     "url_pattern": "api",
     "clear": false,
     "limit": 100
+  },
+  "closeRequest": {
+    "tabId": 18
+  },
+  "closeSessionRequest": {},
+  "listTabsResult": {
+    "tabs": [
+      {
+        "tabId": 11,
+        "windowId": 1,
+        "index": 0,
+        "active": true,
+        "controlled": true,
+        "owned": true,
+        "origin": "created",
+        "title": "Inbox",
+        "url": "https://mail.example/inbox"
+      },
+      {
+        "tabId": 12,
+        "windowId": 1,
+        "index": 1,
+        "active": false,
+        "controlled": false,
+        "owned": true,
+        "origin": "adopted",
+        "title": "Docs",
+        "url": "https://docs.example/guide"
+      }
+    ]
   }
 }

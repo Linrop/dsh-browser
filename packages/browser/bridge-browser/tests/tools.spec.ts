@@ -31,13 +31,13 @@ describe('registerBrowserTools', () => {
     const registeredNames = registered.map((r) => r.name)
     expect(registeredNames).toEqual([...BROWSER_TOOL_NAMES])
     expect([...registeredNames].sort()).toEqual([...BROWSER_TOOL_NAMES].sort())
-    expect(registeredNames).toHaveLength(26)
+    expect(registeredNames).toHaveLength(27)
     expect(disposers.size).toBe(registeredNames.length)
     for (const dispose of disposers.values()) dispose()
   })
 
-  it('keeps BROWSER_TOOL_NAMES a duplicate-free list of 26 wire actions', () => {
-    expect(BROWSER_TOOL_NAMES).toHaveLength(26)
+  it('keeps BROWSER_TOOL_NAMES a duplicate-free list of 27 wire actions', () => {
+    expect(BROWSER_TOOL_NAMES).toHaveLength(27)
     expect(new Set(BROWSER_TOOL_NAMES).size).toBe(BROWSER_TOOL_NAMES.length)
     for (const name of BROWSER_TOOL_NAMES) expect(name).toMatch(/^browser_[a-z_]+$/)
   })
@@ -148,6 +148,10 @@ describe('registerBrowserTools', () => {
     expect(requestTool).toHaveBeenLastCalledWith('browser_follow_tab', { tabId: 17 }, exec.signal, 1_000)
     await run('browser_close_tab', { tabId: 18 })
     expect(requestTool).toHaveBeenLastCalledWith('browser_close_tab', { tabId: 18 }, exec.signal, 1_000)
+    await run('browser_close', {})
+    expect(requestTool).toHaveBeenLastCalledWith('browser_close', {}, exec.signal, 1_000)
+    await run('browser_close', { tabId: 18 })
+    expect(requestTool).toHaveBeenLastCalledWith('browser_close', { tabId: 18 }, exec.signal, 1_000)
 
     for (const name of ['browser_back', 'browser_forward', 'browser_reload'] as const) {
       await run(name, {})
@@ -223,6 +227,38 @@ describe('registerBrowserTools', () => {
     expect(requestTool.mock.calls.at(-1)!.slice(0, 2)).toEqual(['browser_click', { index: 1 }])
   })
 
+  it('closes tabs through the ownership-aware tool, including inside browser_batch', async () => {
+    const { ctx, bridge, requestTool, registered } = makeHarness()
+    registerBrowserTools(ctx, bridge, OPTIONS)
+    const byName = new Map(registered.map((r) => [r.name, r.definition]))
+    const exec = { signal: new AbortController().signal }
+    const close = executable(byName.get('browser_close')!)
+
+    await close({}, exec)
+    expect(requestTool).toHaveBeenLastCalledWith('browser_close', {}, exec.signal, 1_000)
+
+    await close({ tabId: 18 }, exec)
+    expect(requestTool).toHaveBeenLastCalledWith('browser_close', { tabId: 18 }, exec.signal, 1_000)
+
+    await expect(close({ tabId: -1 }, exec)).rejects.toThrow(/tabId must be a non-negative safe integer/)
+
+    // Every other tab-management tool is refused inside a batch; browser_close
+    // is allowed because it is ownership-checked cleanup, and it must reach the
+    // same handler as the standalone form.
+    await executable(byName.get('browser_batch')!)({ actions: [{ name: 'browser_close', args: {} }] }, exec)
+    expect(requestTool.mock.calls.at(-1)!.slice(0, 2)).toEqual(['browser_close', {}])
+  })
+
+  it('documents ownership and origin on the tab listing', () => {
+    const { ctx, bridge, registered } = makeHarness()
+    registerBrowserTools(ctx, bridge, OPTIONS)
+    const description = String(registered.find((r) => r.name === 'browser_list_tabs')!.definition.description)
+    expect(description).toContain('owned')
+    expect(description).toContain('origin')
+    expect(description).toContain('created')
+    expect(description).toContain('adopted')
+  })
+
   it('normalizes every DSH parameter map to JSON Schema before registration', () => {
     const { ctx, bridge, registered } = makeHarness()
     registerBrowserTools(ctx, bridge, OPTIONS)
@@ -261,8 +297,8 @@ describe('registerBrowserTools', () => {
     const { ctx, bridge, registered } = makeHarness()
     registerBrowserTools(ctx, bridge, OPTIONS)
     const descriptionChars = registered.reduce((sum, { definition }) => sum + String(definition.description).length, 0)
-    // 26 tools: roughly 130 characters each keeps one-line contracts, not essays.
-    expect(descriptionChars).toBeLessThan(4_000)
+    // 27 tools: roughly 160 characters each keeps one-line contracts, not essays.
+    expect(descriptionChars).toBeLessThan(4_400)
   })
 
   it('exposes optional frame routing on frame-local tools only', () => {
@@ -273,7 +309,7 @@ describe('registerBrowserTools', () => {
       const params = byName.get(name)!.parameters as { properties: { frame?: { type?: unknown } } }
       expect(params.properties.frame?.type).toBe('number')
     }
-    for (const name of ['browser_snapshot', 'browser_navigate', 'browser_open_tab', 'browser_list_tabs', 'browser_follow_tab', 'browser_close_tab', 'browser_back', 'browser_forward', 'browser_reload']) {
+    for (const name of ['browser_snapshot', 'browser_navigate', 'browser_open_tab', 'browser_list_tabs', 'browser_follow_tab', 'browser_close_tab', 'browser_close', 'browser_back', 'browser_forward', 'browser_reload']) {
       const params = byName.get(name)!.parameters as { properties: { frame?: unknown } }
       expect(params.properties.frame).toBeUndefined()
     }
@@ -881,7 +917,7 @@ describe('browser_batch', () => {
       .rejects.toThrow(/is not a browser tool/)
   })
 
-  it('refuses batch and every tab-management tool inside browser_batch', async () => {
+  it('refuses batch and the tab-management tools that open, list, or follow inside browser_batch', async () => {
     const { ctx, bridge, registered } = makeHarness()
     registerBrowserTools(ctx, bridge, OPTIONS)
     const tool = registered.find((r) => r.name === 'browser_batch')!

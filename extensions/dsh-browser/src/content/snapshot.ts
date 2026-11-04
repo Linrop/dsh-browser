@@ -10,6 +10,7 @@
  * @module
  */
 
+import { stableSelector } from './element-selector.ts'
 import { accessibleName, collectInteractive, isInViewport, isVisible, mainText, pageText, truncate } from './extract.ts'
 import { ElementIds } from './ids.ts'
 import { isSensitiveField, maskValue } from './privacy.ts'
@@ -208,6 +209,9 @@ export function buildSnapshot(ids: ElementIds, options: SnapshotOptions, last: S
   for (const { element: el, inViewport } of ordered.slice(0, options.budget.maxItems)) {
     const index = ids.indexOf(el)
     if (index === undefined) continue
+    // Record the selector beside the number so a later action can re-find this
+    // control after an app re-render replaces the node.
+    ids.recordSelector(index, stableSelector(el))
     const item: InventoryItem = {
       index,
       role: roleOf(el),
@@ -235,6 +239,7 @@ export function buildSnapshot(ids: ElementIds, options: SnapshotOptions, last: S
   for (const el of formElements.slice(0, options.budget.maxForms)) {
     const index = ids.indexOf(el)
     if (index === undefined) continue
+    ids.recordSelector(index, stableSelector(el))
     const masked = isSensitiveField(el)
     const checkable = el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio')
     const value = checkable

@@ -3037,3 +3037,52 @@ textarea:focus-visible {
   cursor: default;
   opacity: .55;
 }
+
+.live-view-trigger.active {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+  color: var(--blue-ink);
+}
+
+.live-view {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 12px 8px;
+  border-bottom: 1px solid var(--line);
+  background: var(--canvas);
+}
+
+.live-view-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--muted);
+  font-size: calc(10.5px * var(--ui-scale));
+}
+
+.live-view-head strong {
+  color: var(--ink);
+  font-weight: 640;
+}
+
+.live-view-frame {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  object-fit: contain;
+}
+
+.live-view-notice {
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: calc(10.5px * var(--ui-scale));
+}

@@ -11,7 +11,7 @@
  * @module
  */
 
-import { ActionError, elementOrThrow, numberArg } from './action-support.ts'
+import { ActionError, elementOrThrow, numberArg, takeRelocationNotes } from './action-support.ts'
 import { selectAction, uploadFileAction } from './element-actions.ts'
 import { pageText, truncate } from './extract.ts'
 import { findAction } from './find.ts'
@@ -153,8 +153,32 @@ export interface ActionContext {
   includePageDelta?: boolean
 }
 
-/** Run one named action with its args. */
+/**
+ * Run one named action with its args.
+ *
+ * A re-rendered control is re-located by its recorded selector inside the
+ * action, and the status line must say so: the model otherwise cannot tell
+ * that the number it read addresses a replacement node.
+ */
 export async function runAction(action: string, args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
+  let result: ActionResult
+  try {
+    result = await dispatchAction(action, args, ctx)
+  } catch (error: unknown) {
+    // A failed action still consumed a re-location; the notice must not leak
+    // into the next action's status line.
+    takeRelocationNotes(ctx.ids)
+    throw error
+  }
+  const notes = takeRelocationNotes(ctx.ids)
+  // The pointer-rect answer is JSON consumed by the background; appending prose
+  // would corrupt it, and the dispatched input reports its own status.
+  if (notes.length === 0 || action === 'browser_pointer_rect') return result
+  const note = notes.join(' ')
+  return { ...result, text: result.text === '' ? note : `${result.text} ${note}` }
+}
+
+async function dispatchAction(action: string, args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
   switch (action) {
     case 'browser_snapshot':
       return snapshotAction(args, ctx)

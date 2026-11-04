@@ -20,6 +20,8 @@ import whaleUrl from '../../assets/icons/deepseek-256.png'
 import type { ApprovalDecision, ApprovalRequest } from '../security/approval.ts'
 import { getUiLocale } from '../i18n.ts'
 import { PANEL_COPY, type PanelCopy } from './strings.ts'
+import type { LiveViewFrame, LiveViewState } from '../background/live-view.ts'
+import { isNewerLiveFrame, LiveViewPanel, LiveViewToggle } from './LiveView.tsx'
 import { QuestionCard } from './QuestionCard.tsx'
 import { MessageImages } from './MessageImages.tsx'
 import type { QuestionAnswer } from './questions.ts'
@@ -499,6 +501,12 @@ export function App(): React.JSX.Element {
   const [atBottom, setAtBottom] = useState(true)
   const [recording, setRecording] = useState<RecordingStatus | null>(null)
   const [recordingError, setRecordingError] = useState<string | null>(null)
+  const [liveEnabled, setLiveEnabled] = useState(false)
+  const [liveState, setLiveState] = useState<LiveViewState>({ status: 'off' })
+  const [liveFrame, setLiveFrame] = useState<LiveViewFrame | null>(null)
+  /** Highest frame sequence seen per tab; older frames are dropped. */
+  const liveSeqRef = useRef(new Map<number, number>())
+  const liveTabRef = useRef<number | undefined>(undefined)
 
   const nextSeq = (): number => { seqRef.current += 1; return seqRef.current }
 
@@ -617,6 +625,11 @@ export function App(): React.JSX.Element {
         setModelSelecting(false)
         setShowModelPicker(false)
         setSessionTitle(null)
+        setLiveEnabled(false)
+        setLiveState({ status: 'off' })
+        setLiveFrame(null)
+        liveSeqRef.current.clear()
+        void api.setLiveView(false).catch(() => {})
         setWorking(false)
         setStopping(false)
         setSessionChanging(false)
@@ -647,12 +660,26 @@ export function App(): React.JSX.Element {
       setRecording(status)
       setRecordingError(failure ?? null)
     })
+    const offLiveView = api.onLiveView((next) => {
+      // A tab switch or a stopped stream invalidates the picture on screen.
+      if (next.tabId !== liveTabRef.current || next.status !== 'streaming') setLiveFrame(null)
+      liveTabRef.current = next.tabId
+      setLiveState(next)
+    })
+    const offLiveFrame = api.onLiveFrame((incoming) => {
+      const previous = liveSeqRef.current.get(incoming.tabId)
+      if (!isNewerLiveFrame(previous, incoming.seq)) return
+      liveSeqRef.current.set(incoming.tabId, incoming.seq)
+      liveTabRef.current = incoming.tabId
+      setLiveFrame(incoming)
+    })
     void api.requestStatus().catch((cause: unknown) => {
       setError(cause instanceof Error ? cause.message : String(cause))
     })
     return () => {
       offStatus(); offEvent(); offApproval(); offApprovalResolved()
       offTabAffinity(); offSelection(); offResumeHint(); offRecording()
+      offLiveView(); offLiveFrame()
     }
   }, [api])
 
@@ -1439,6 +1466,14 @@ export function App(): React.JSX.Element {
     }
   }
 
+  function toggleLiveView(enabled: boolean): void {
+    setLiveEnabled(enabled)
+    if (!enabled) setLiveFrame(null)
+    void api.setLiveView(enabled).catch((cause: unknown) => {
+      setError(cause instanceof Error ? cause.message : String(cause))
+    })
+  }
+
   // 状态栏只显示连接状态；快照上限是技术细节。
   const statusText = copy.status[state]
   const sessionMenuTitle = sessionTitle ?? copy.app.newSession
@@ -1499,6 +1534,7 @@ export function App(): React.JSX.Element {
             aria-label={copy.app.newSession} title={copy.app.newSession}>
             <PlusIcon />
           </button>
+          <LiveViewToggle copy={copy} enabled={liveEnabled} onToggle={toggleLiveView} />
           <button className={`icon-button record-trigger${recording?.active === true ? ' recording' : ''}`}
             disabled={state !== 'connected' || recording?.exporting === true}
             aria-pressed={recording?.active === true}
@@ -1510,6 +1546,7 @@ export function App(): React.JSX.Element {
         </div>
       </header>
       <TabAffinityBanner state={tabAffinity} copy={copy} onDecision={decideTabAffinity} />
+      <LiveViewPanel copy={copy} enabled={liveEnabled} state={liveState} frame={liveFrame} />
       {recordingStatusText !== null && (
         <div className={`recording-strip${recording?.active === true ? ' active' : ''}`} role="status">
           <span className="recording-dot" aria-hidden="true" />

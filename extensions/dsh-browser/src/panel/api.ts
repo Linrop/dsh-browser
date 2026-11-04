@@ -12,6 +12,7 @@ import type { LocalEventCounts } from '../background/events.ts'
 import type { RecordingStatus } from '../content/recorder.ts'
 import type { Settings } from '../background/index.ts'
 import type { TabAffinityDecision, TabAffinityState } from '../background/tab-affinity.ts'
+import type { LiveViewFrame, LiveViewState } from '../background/live-view.ts'
 import type { ApprovalDecision, ApprovalRequest } from '../security/approval.ts'
 import { parsePageSelection, type PageSelection } from '../selection.ts'
 import { getUiLocale } from '../i18n.ts'
@@ -103,7 +104,21 @@ interface DiagnosticsMessage {
   counts: LocalEventCounts
 }
 
-type BackgroundMessage = RpcResultMessage | RespondResultMessage | SettingsResultMessage | StatusMessage | EventMessage | ApprovalRequestMessage | ApprovalResolvedMessage | TabAffinityMessage | TabAffinityRebindResultMessage | SelectionMessage | SessionResumeHintMessage | RecordingMessage | DiagnosticsMessage
+interface LiveViewStateMessage {
+  type: 'live-view-state'
+  state: LiveViewState
+}
+
+interface LiveFrameMessage {
+  type: 'live-frame'
+  tabId: number
+  seq: number
+  width: number
+  height: number
+  data: string
+}
+
+type BackgroundMessage = RpcResultMessage | RespondResultMessage | SettingsResultMessage | StatusMessage | EventMessage | ApprovalRequestMessage | ApprovalResolvedMessage | TabAffinityMessage | TabAffinityRebindResultMessage | SelectionMessage | SessionResumeHintMessage | RecordingMessage | DiagnosticsMessage | LiveViewStateMessage | LiveFrameMessage
 
 /** Structured gateway failure retained for product-level error handling. */
 export class PanelRpcError extends Error {
@@ -150,6 +165,12 @@ export interface PanelApi {
   onRecording(callback: (status: RecordingStatus, error?: string) => void): () => void
   /** Worker-local event counters for the diagnostics view. */
   onDiagnostics(callback: (counts: LocalEventCounts) => void): () => void
+  /** Live-view availability and status changes. */
+  onLiveView(callback: (state: LiveViewState) => void): () => void
+  /** Screencast frames, one per compositor change while the panel watches. */
+  onLiveFrame(callback: (frame: LiveViewFrame) => void): () => void
+  /** Turn this panel's live view on or off. */
+  setLiveView(enabled: boolean): Promise<void>
   startRecording(): Promise<void>
   exportRecording(): Promise<void>
   clearRecording(): Promise<void>
@@ -180,6 +201,8 @@ export function connectPanel(): PanelApi {
   const sessionResumeHintListeners = new Set<(sessionId: string | null) => void>()
   const recordingListeners = new Set<(status: RecordingStatus, error?: string) => void>()
   const diagnosticsListeners = new Set<(counts: LocalEventCounts) => void>()
+  const liveViewListeners = new Set<(state: LiveViewState) => void>()
+  const liveFrameListeners = new Set<(frame: LiveViewFrame) => void>()
 
   let port: chrome.runtime.Port | null = null
   let reconnectPromise: Promise<chrome.runtime.Port> | null = null
@@ -263,6 +286,22 @@ export function connectPanel(): PanelApi {
       case 'diagnostics':
         for (const listener of diagnosticsListeners) listener(msg.counts)
         break
+      case 'live-view-state':
+        for (const listener of liveViewListeners) listener(msg.state)
+        break
+      case 'live-frame': {
+        if (typeof msg.data !== 'string' || msg.data === '') return
+        if (typeof msg.tabId !== 'number' || typeof msg.seq !== 'number') return
+        if (typeof msg.width !== 'number' || typeof msg.height !== 'number') return
+        for (const listener of liveFrameListeners) listener({
+          tabId: msg.tabId,
+          seq: msg.seq,
+          width: msg.width,
+          height: msg.height,
+          data: msg.data,
+        })
+        break
+      }
     }
   }
 
@@ -500,6 +539,17 @@ export function connectPanel(): PanelApi {
     onDiagnostics(callback) {
       diagnosticsListeners.add(callback)
       return () => { diagnosticsListeners.delete(callback) }
+    },
+    onLiveView(callback) {
+      liveViewListeners.add(callback)
+      return () => { liveViewListeners.delete(callback) }
+    },
+    onLiveFrame(callback) {
+      liveFrameListeners.add(callback)
+      return () => { liveFrameListeners.delete(callback) }
+    },
+    setLiveView(enabled) {
+      return send({ type: 'live-view', enabled })
     },
     startRecording() {
       return send({ type: 'recording.start' })

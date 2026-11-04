@@ -354,13 +354,13 @@ describe('console buffer', () => {
     expect(readNetworkRequests(id).total).toBe(0)
   })
 
-  it('clears on a domain change but keeps the same domain across reloads', () => {
+  it('clears on a document replacement and keeps a same-document hash change', () => {
     const id = tabId()
-    seedTelemetryDomain(id, 'https://example.com/page')
+    noteTabNavigation(id, 'https://example.com/page', 'document-1')
     handleDebuggerEvent(id, 'Runtime.consoleAPICalled', { type: 'log', args: [{ value: 'first' }], timestamp: 1 })
-    noteTabNavigation(id, 'https://example.com/reload')
+    noteTabNavigation(id, 'https://example.com/page#section', 'document-1')
     expect(readConsoleMessages(id).total).toBe(1)
-    noteTabNavigation(id, 'https://other.example.org/page')
+    noteTabNavigation(id, 'https://example.com/page', 'document-2')
     expect(readConsoleMessages(id).total).toBe(0)
     forgetTab(id)
   })
@@ -674,10 +674,10 @@ describe('screenshot capture', () => {
       captured.push(params)
       return 'QUJD'
     })
-    const result = await captureScreenshot(tabId(), { ...DEFAULT_OPTIONS, region: [100, 50, 300, 150], scale: 0.5 })
-    expect(captured[0]?.clip).toEqual({ x: 110, y: 70, width: 200, height: 100, scale: 0.5 })
-    expect(result.frame.screenshotWidth).toBe(200)
-    expect(result.frame.screenshotHeight).toBe(100)
+    const result = await captureScreenshot(tabId(), { ...DEFAULT_OPTIONS, region: [100, 50, 300, 150], scale: 2 })
+    expect(captured[0]?.clip).toEqual({ x: 110, y: 70, width: 200, height: 100, scale: 2 })
+    expect(result.frame.screenshotWidth).toBe(800)
+    expect(result.frame.screenshotHeight).toBe(400)
   })
 
   it('drops to lower JPEG quality when the payload exceeds the wire budget', async () => {
@@ -788,16 +788,16 @@ describe('visible-tab screenshot fallback', () => {
     const { captureVisibleTab, drawCalls, outputTypes } = stubVisibleTab({ decoded: { width: 800, height: 600 }, metrics, png: true })
     const result = await captureVisibleTabScreenshot(tabId(), 1, {
       region: [100, 50, 300, 150],
-      scale: 0.5,
+      scale: 2,
       format: 'png',
       quality: 80,
     })
     expect(captureVisibleTab).toHaveBeenCalledWith(1, { format: 'png' })
-    expect(drawCalls[0]?.slice(1)).toEqual([200, 100, 400, 200, 0, 0, 200, 100])
+    expect(drawCalls[0]?.slice(1)).toEqual([200, 100, 400, 200, 0, 0, 800, 400])
     expect(outputTypes).toEqual(['image/png'])
     // The rendered canvas payload replaces the captured bytes.
-    expect(result.image).toEqual({ base64: 'AQID', mimeType: 'image/png', width: 200, height: 100 })
-    expect(result.frame.screenshotWidth).toBe(200)
+    expect(result.image).toEqual({ base64: 'AQID', mimeType: 'image/png', width: 800, height: 400 })
+    expect(result.frame.screenshotWidth).toBe(800)
   })
 
   it('notes the assumed device pixel ratio when the page cannot be measured', async () => {
@@ -810,7 +810,7 @@ describe('visible-tab screenshot fallback', () => {
   it('notes the ignored scale when the browser cannot re-encode the capture', async () => {
     stubVisibleTab({ decoded: { width: 800, height: 600 }, metrics })
     vi.stubGlobal('OffscreenCanvas', undefined)
-    const result = await captureVisibleTabScreenshot(tabId(), 1, { ...DEFAULT_OPTIONS, scale: 0.5 })
+    const result = await captureVisibleTabScreenshot(tabId(), 1, { ...DEFAULT_OPTIONS, scale: 2 })
     expect(result.image).toMatchObject({ width: 800, height: 600 })
     expect(result.notes?.join(' ')).toMatch(/ignores scale/)
   })
@@ -827,7 +827,7 @@ describe('capture entry points', () => {
     await startConsoleCapture(id, 'https://example.com/page')
     expect(methods).toEqual(expect.arrayContaining(['Runtime.enable', 'Log.enable']))
     handleDebuggerEvent(id, 'Runtime.consoleAPICalled', { type: 'log', args: [{ value: 'kept' }], timestamp: 1 })
-    noteTabNavigation(id, 'https://example.com/again')
+    noteTabNavigation(id, 'https://example.com/page#again')
     expect(readConsoleMessages(id).total).toBe(1)
   })
 

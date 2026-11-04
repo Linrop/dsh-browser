@@ -69,7 +69,24 @@ import {
 import { bumpEvent, eventCounters } from './events.ts'
 import { InteractionResponseRouter } from './responses.ts'
 import { normalizeToolError } from './error-map.ts'
-import { forgetTab, noteTabNavigation, recordInstrumentEntry, releaseTab } from './cdp.ts'
+import {
+  ackScreencastFrame,
+  forgetTab,
+  isDebuggerAvailable,
+  noteTabNavigation,
+  recordInstrumentEntry,
+  releaseTab,
+  setDebuggerDetachSink,
+  setScreencastFrameSink,
+  startScreencast,
+  stopScreencast,
+} from './cdp.ts'
+import {
+  LIVE_VIEW_MAX_HEIGHT,
+  LIVE_VIEW_MAX_WIDTH,
+  LiveViewController,
+  type LiveViewFrame,
+} from './live-view.ts'
 import { isInstrumentEntry } from '../content/instrument.ts'
 import {
   actionCoveredByTrustedOrigins,
@@ -195,6 +212,8 @@ let caps: BridgeCaps | null = null
 let bridge: BridgeClient | null = null
 let rpc: ReturnType<typeof createRpc> | null = null
 const panelPorts = new Set<chrome.runtime.Port>()
+/** Panels that turned their live view on; the stream runs while this is non-empty. */
+const liveViewPorts = new Set<chrome.runtime.Port>()
 const BRIDGE_KEEPALIVE_ALARM = 'bridge-keepalive'
 /** Invalidates an asynchronous discovery attempt when its panel lease ends. */
 let bridgeStartRevision = 0
@@ -677,6 +696,49 @@ function broadcastTabAffinity(): void {
   for (const port of panelPorts) {
     try { port.postMessage(payload) } catch { /* port already closed */ }
   }
+  syncLiveView()
+}
+
+/** Send the current live-view state to every panel. */
+function broadcastLiveView(): void {
+  const payload = { type: 'live-view-state', state: liveView.state() }
+  for (const port of panelPorts) {
+    try { port.postMessage(payload) } catch { /* port already closed */ }
+  }
+}
+
+/** Send one screencast frame to the panels that turned the live view on. */
+function broadcastLiveFrame(frame: LiveViewFrame): void {
+  const payload = { type: 'live-frame', ...frame }
+  for (const port of liveViewPorts) {
+    try { port.postMessage(payload) } catch { /* port already closed */ }
+  }
+}
+
+const liveView = new LiveViewController({
+  isDebuggerAvailable,
+  isTabActive: async (tabId: number): Promise<boolean> => {
+    try {
+      const tab = await chrome.tabs.get(tabId)
+      return tab.active === true
+    } catch {
+      return false
+    }
+  },
+  startScreencast: (tabId, options) => startScreencast(tabId, options),
+  stopScreencast: (tabId) => stopScreencast(tabId),
+  ackFrame: (tabId, sessionId) => ackScreencastFrame(tabId, sessionId),
+  onState: broadcastLiveView,
+  onFrame: broadcastLiveFrame,
+  viewport: () => ({ width: LIVE_VIEW_MAX_WIDTH, height: LIVE_VIEW_MAX_HEIGHT }),
+})
+
+setScreencastFrameSink((tabId, params) => { liveView.handleFrame(tabId, params) })
+setDebuggerDetachSink((tabId) => { liveView.handleDetach(tabId) })
+
+/** Point the live view at the tab the affinity state currently controls. */
+function syncLiveView(): void {
+  void liveView.setTarget(tabAffinity.snapshot().controlled?.tabId)
 }
 
 // ---- Visible work: toolbar badge, tab group, in-page dot ----
@@ -1976,7 +2038,10 @@ chrome.runtime.onConnect.addListener((port) => {
     if (!panelPorts.has(port)) return
     if (bridge === null || bridge.state === 'stopped') return startBridge()
   })
-  try { port.postMessage({ type: 'status', state: bridge?.state ?? ('stopped' as BridgeState), caps }) } catch { /* port closed */ }
+  try {
+    port.postMessage({ type: 'status', state: bridge?.state ?? ('stopped' as BridgeState), caps })
+    port.postMessage({ type: 'live-view-state', state: liveView.state() })
+  } catch { /* port closed */ }
   void affinityReady.then(async () => {
     await syncActiveTab()
     try { port.postMessage({ type: 'tab-affinity', state: tabAffinity.snapshot() }) } catch { /* port closed */ }
@@ -2203,6 +2268,14 @@ chrome.runtime.onConnect.addListener((port) => {
         })
         break
       }
+      case 'live-view': {
+        const request = message as { enabled?: unknown }
+        if (typeof request.enabled !== 'boolean') break
+        if (request.enabled) liveViewPorts.add(port)
+        else liveViewPorts.delete(port)
+        void liveView.setWatching(liveViewPorts.size > 0)
+        break
+      }
       case 'recording.start': {
         const recordingWindowId = panelWindows.get(port)
         if (recordingWindowId === undefined) {
@@ -2231,6 +2304,7 @@ chrome.runtime.onConnect.addListener((port) => {
             port.postMessage({ type: 'selection', selection: selections.current(statusWindowId) })
           }
           for (const frame of transientEvents.replay()) port.postMessage({ type: 'event', frame })
+          port.postMessage({ type: 'live-view-state', state: liveView.state() })
           approvals.replay((request) => {
             port.postMessage({ type: 'approval.request', request })
             return true
@@ -2253,6 +2327,7 @@ chrome.runtime.onConnect.addListener((port) => {
     const panelSessionId = panelActiveSessions.get(port)
     panelActiveSessions.delete(port)
     panelPorts.delete(port)
+    if (liveViewPorts.delete(port)) void liveView.setWatching(liveViewPorts.size > 0)
     if (panelSessionId !== undefined) void checkpointSessionPage(panelSessionId)
     interactionResponses.removePort(port)
     if (panelWindowId !== undefined && !hasPanelInWindow(panelWindowId)) {
@@ -2293,6 +2368,9 @@ chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
     // Mark the switch before awaiting metadata so an already-running trusted
     // action cannot slip through the handoff boundary.
     observeActiveSummary({ tabId, windowId, title: '', url: '' })
+    // A screencast only produces frames for the visible tab, so a switch must
+    // either start the new controlled tab or report it as unavailable.
+    syncLiveView()
     return chrome.tabs.get(tabId).then((tab) => {
       if (focusedWindow.isCurrent(activationRevision)) observeActiveTab(tab)
     }).catch(() => {})
@@ -2357,8 +2435,10 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // fragment update does not, and must not drop a quote still on the screen.
 // Matching the exact frame keeps an iframe's navigation from invalidating a
 // quote taken from its parent page, and vice versa.
-chrome.webNavigation.onCommitted.addListener(({ tabId, frameId, url }) => {
-  if (frameId === 0) noteTabNavigation(tabId, url)
+chrome.webNavigation.onCommitted.addListener(({ tabId, frameId, url, documentId }) => {
+  // Same-document fragment and history updates keep the document id, so they
+  // keep the console/network buffer; a replaced document starts empty.
+  if (frameId === 0) noteTabNavigation(tabId, url, documentId)
   broadcastSelections(selections.clearTab(tabId, frameId))
 })
 

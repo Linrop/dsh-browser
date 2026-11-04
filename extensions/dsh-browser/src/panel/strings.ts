@@ -1,4 +1,5 @@
 import type { BridgeState } from '../background/bridge.ts'
+import type { LiveViewUnavailableCode } from '../background/live-view.ts'
 import type { UiLocale } from '../i18n.ts'
 
 export interface PanelCopy {
@@ -221,6 +222,15 @@ export interface PanelCopy {
     recordingExported: (filename: string) => string
     recordingCleared: string
     recordingFailed: (reason: string) => string
+    liveView: {
+      enable: string
+      disable: string
+      title: string
+      starting: string
+      unavailable: string
+      unavailableWithReason: (reason: string) => string
+      reasons: Record<LiveViewUnavailableCode, string>
+    }
   }
 }
 
@@ -467,6 +477,21 @@ const EN: PanelCopy = {
     recordingExported: (filename) => `Recording exported as ${filename}.`,
     recordingCleared: 'Recording cleared.',
     recordingFailed: (reason) => `Recording failed: ${reason}`,
+    liveView: {
+      enable: 'Show the live view',
+      disable: 'Hide the live view',
+      title: 'Live view',
+      starting: 'Starting the live view…',
+      unavailable: 'Live view unavailable',
+      unavailableWithReason: (reason) => `Live view unavailable (${reason}).`,
+      reasons: {
+        'no-controlled-tab': 'no controlled tab',
+        'no-debugger': 'this browser build has no debugger API',
+        'tab-not-active': 'the controlled tab is in the background',
+        'attach-failed': 'the debugger could not attach',
+        'debugger-detached': 'the browser detached the debugger',
+      },
+    },
   },
 }
 
@@ -713,6 +738,21 @@ const ZH: PanelCopy = {
     recordingExported: (filename) => `录制已导出为 ${filename}。`,
     recordingCleared: '录制已清除。',
     recordingFailed: (reason) => `录制失败：${reason}`,
+    liveView: {
+      enable: '显示实时画面',
+      disable: '隐藏实时画面',
+      title: '实时画面',
+      starting: '正在启动实时画面…',
+      unavailable: '实时画面不可用',
+      unavailableWithReason: (reason) => `实时画面不可用（${reason}）。`,
+      reasons: {
+        'no-controlled-tab': '没有受控标签页',
+        'no-debugger': '此浏览器不可用调试器',
+        'tab-not-active': '受控标签页在后台',
+        'attach-failed': '调试器无法附加',
+        'debugger-detached': '浏览器已断开调试器',
+      },
+    },
   },
 }
 

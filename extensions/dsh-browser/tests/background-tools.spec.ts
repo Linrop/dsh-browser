@@ -871,6 +871,30 @@ describe('dispatchToolCall', () => {
     expect(chromeMock.sendMessage).not.toHaveBeenCalled()
   })
 
+  it('defers a URL-keyed frame reference to the content script so it can re-resolve the ref', async () => {
+    const frames = [{ frameId: 0, parentFrameId: -1, url: 'https://app.example/list' }]
+    const chromeMock = mockChrome({
+      tab: { id: 34, url: 'https://app.example/list' },
+      frames,
+      respond: () => ({ ok: true, result: { text: 'ok' } }),
+    })
+    await dispatchToolCall({ id: 'snap-url', name: 'browser_snapshot', args: {} }, 'auto')
+    chromeMock.sendMessage.mockClear()
+    // Browser builds without document ids report a frame by URL, so a client-side
+    // route change is indistinguishable from a document replacement here.
+    frames[0] = { ...frames[0]!, url: 'https://app.example/list?page=2' }
+
+    const answer = await dispatchToolCall(
+      { id: 'url-rebind', name: 'browser_click', args: { index: 2 } },
+      'auto',
+      undefined,
+      async () => 'approved',
+    )
+
+    expect(answer.ok).toBe(true)
+    expect(chromeMock.sendMessage).toHaveBeenCalledTimes(1)
+  })
+
   it('rejects an action when its target origin changes during approval', async () => {
     const frames = [
       { frameId: 0, parentFrameId: -1, documentId: 'top-v1', url: 'https://app.example/' },
@@ -1230,5 +1254,157 @@ describe('dispatchOpenTab', () => {
     expect((answer.result as { text: string }).text).toContain('Call browser_snapshot again')
     expect(remove).not.toHaveBeenCalled()
     expect(sendMessage).not.toHaveBeenCalled()
+  })
+})
+
+describe('browser_close', () => {
+  /**
+   * Chrome stub that can create one tab through the real browser_open_tab path,
+   * so browser_close reads the same created-tab ledger production uses.
+   */
+  function createdTabChrome(createdId: number, existing: chrome.tabs.Tab[] = []) {
+    const runtimeListeners = new Set<(message: unknown, sender: chrome.runtime.MessageSender) => void>()
+    const tabs = new Map<number, chrome.tabs.Tab>()
+    for (const tab of existing) if (tab.id !== undefined) tabs.set(tab.id, tab)
+    const create = vi.fn(async () => {
+      const tab = managedTab(createdId, { url: 'about:blank', index: existing.length })
+      tabs.set(createdId, tab)
+      return { ...tab }
+    })
+    const update = vi.fn(async (tabId: number, changes: chrome.tabs.UpdateProperties) => {
+      const current = tabs.get(tabId) ?? managedTab(tabId)
+      const next = { ...current, ...changes }
+      tabs.set(tabId, next)
+      return { ...next }
+    })
+    const get = vi.fn(async (tabId: number) => {
+      const tab = tabs.get(tabId)
+      if (tab === undefined) throw new Error(`No tab with id: ${tabId}`)
+      return { ...tab }
+    })
+    const remove = vi.fn(async (tabId: number) => {
+      tabs.delete(tabId)
+    })
+    const query = vi.fn(async () => [...tabs.values()])
+    const sendMessage = vi.fn(async () => ({ ok: true, result: { text: 'new page' } }))
+    const createAllFrames = (): unknown[] => [{
+      frameId: 0,
+      parentFrameId: -1,
+      documentId: `doc-${createdId}`,
+      url: tabs.get(createdId)?.url ?? '',
+    }]
+    const getAllFrames = vi.fn(async () => createAllFrames())
+    vi.stubGlobal('chrome', {
+      tabs: { create, update, remove, get, query, sendMessage },
+      scripting: { executeScript: vi.fn(async () => [{ frameId: 0, result: undefined }]) },
+      webNavigation: { getAllFrames },
+      runtime: {
+        onMessage: {
+          addListener: (listener: (message: unknown, sender: chrome.runtime.MessageSender) => void) => {
+            runtimeListeners.add(listener)
+          },
+          removeListener: (listener: (message: unknown, sender: chrome.runtime.MessageSender) => void) => {
+            runtimeListeners.delete(listener)
+          },
+        },
+      },
+    })
+    return { create, get, getAllFrames, query, remove, runtimeListeners, tabs }
+  }
+
+  /** Open one tab through the same path browser_open_tab uses. */
+  async function openCreatedTab(chromeMock: ReturnType<typeof createdTabChrome>, createdId: number): Promise<void> {
+    const { dispatchOpenTab } = await import('../src/background/tools.ts')
+    const open = dispatchOpenTab(
+      { id: 'open-close', name: 'browser_open_tab', args: { url: 'https://docs.example/new' } },
+      1,
+      'auto',
+      { maxItems: 60, maxChars: 12_000 },
+      async () => 'approved',
+      undefined,
+      () => true,
+      () => true,
+    )
+    await vi.waitFor(() => { expect(chromeMock.runtimeListeners.size).toBe(1) })
+    for (const listener of chromeMock.runtimeListeners) {
+      listener(
+        { type: 'DSH_CONTENT_READY' },
+        {
+          tab: { id: createdId }, frameId: 0, documentId: `doc-${createdId}`, url: 'https://docs.example/new',
+        } as chrome.runtime.MessageSender,
+      )
+    }
+    await expect(open).resolves.toMatchObject({ ok: true })
+  }
+
+  it('lists created versus adopted tabs, then closes only the tabs this session opened', async () => {
+    const chromeMock = createdTabChrome(91, [managedTab(12, { windowId: 1, index: 0 })])
+    await openCreatedTab(chromeMock, 91)
+    const context = {
+      unrestrictedAccess: true,
+      ownsTab: (tabId: number) => tabId === 91,
+      commitAction: vi.fn(),
+    }
+
+    const listed = await dispatchToolCall(
+      { id: 'list-origin', name: 'browser_list_tabs', args: {} },
+      'auto', undefined, undefined, undefined, undefined, undefined, context,
+    )
+    const text = (listed.result as { text: string }).text
+    const body = /<UNTRUSTED_PAGE_CONTENT nonce="[^"]+">\n([\s\S]*)\n<\/UNTRUSTED_PAGE_CONTENT/.exec(text)![1]!
+    const rows = (JSON.parse(body) as {
+      tabs: { tabId: number; origin: string; owned: boolean }[]
+    }).tabs
+    expect(rows.find((row) => row.tabId === 91)).toMatchObject({ origin: 'created', owned: true })
+    expect(rows.find((row) => row.tabId === 12)).toMatchObject({ origin: 'adopted', owned: false })
+
+    const closed = await dispatchToolCall(
+      { id: 'close-own', name: 'browser_close', args: {} },
+      'auto', undefined, undefined, undefined, undefined, undefined, context,
+    )
+    expect(closed).toMatchObject({ ok: true })
+    expect((closed.result as { text: string }).text).toContain('Closed 1 tab(s) opened by this session: [91].')
+    expect(chromeMock.remove).toHaveBeenCalledTimes(1)
+    expect(chromeMock.remove).toHaveBeenCalledWith(91)
+  })
+
+  it('closes nothing and succeeds when the session has not opened a tab', async () => {
+    mockChrome({ tabs: [managedTab(5)] })
+    const context = { unrestrictedAccess: true, ownsTab: () => false, commitAction: vi.fn() }
+
+    const answer = await dispatchToolCall(
+      { id: 'close-none', name: 'browser_close', args: {} },
+      'auto', undefined, undefined, undefined, undefined, undefined, context,
+    )
+
+    expect(answer).toMatchObject({ ok: true })
+    expect((answer.result as { text: string }).text).toBe(
+      'Closed no tabs: this session has not opened any tab (closed: []).',
+    )
+  })
+
+  it('refuses a named tab this session neither opened nor followed, while browser_close_tab keeps its semantics', async () => {
+    const chromeMock = mockChrome({ tabs: [managedTab(5)] })
+    const context = { unrestrictedAccess: true, ownsTab: () => false, commitAction: vi.fn() }
+
+    await expect(dispatchToolCall(
+      { id: 'close-foreign', name: 'browser_close', args: { tabId: 5 } },
+      'auto', undefined, undefined, undefined, undefined, undefined, context,
+    )).resolves.toMatchObject({
+      ok: false,
+      error: {
+        code: 'tab_outside',
+        message: expect.stringContaining("it is not this session's to close"),
+      },
+    })
+    expect(chromeMock.remove).not.toHaveBeenCalled()
+
+    // The legacy tool keeps its original contract: with tab isolation off it
+    // closes whatever tab it is pointed at, without an ownership check.
+    await expect(dispatchToolCall(
+      { id: 'close-legacy', name: 'browser_close_tab', args: { tabId: 5 } },
+      'auto', undefined, undefined, undefined, undefined, undefined, context,
+    )).resolves.toMatchObject({ ok: true })
+    expect(chromeMock.remove).toHaveBeenCalledWith(5)
   })
 })
