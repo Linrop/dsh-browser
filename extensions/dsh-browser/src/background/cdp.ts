@@ -912,6 +912,9 @@ export function pushConsoleEntry(
     timestamp: message.timestamp ?? Date.now(),
     ...(message.url === undefined ? {} : { url: redactUrlForModel(message.url) }),
   })
+  if (buffer.messages.length > MAX_LOGS_PER_TAB) {
+    buffer.messages.splice(0, buffer.messages.length - MAX_LOGS_PER_TAB)
+  }
   if (!dedupe) return true
   const dedupeLimit = resolved.dedupeLimit ?? MAX_CONSOLE_DEDUPE_KEYS
   buffer.keys.add(key)
@@ -919,9 +922,6 @@ export function pushConsoleEntry(
     const oldest = buffer.keys.values().next()
     if (oldest.done === true) break
     buffer.keys.delete(oldest.value)
-  }
-  if (buffer.messages.length > MAX_LOGS_PER_TAB) {
-    buffer.messages.splice(0, buffer.messages.length - MAX_LOGS_PER_TAB)
   }
   return true
 }

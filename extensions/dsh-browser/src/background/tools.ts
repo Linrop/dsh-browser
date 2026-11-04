@@ -19,6 +19,7 @@ import {
   type TabFrame,
 } from './frames.ts'
 import { wrapUntrustedContent } from '../security/untrusted.ts'
+import { redactModelText as redactPageText } from './cdp.ts'
 import { PAGE_READS, approvalPromptForCall, originFromUrl } from './authorization.ts'
 import {
   DebuggerUnavailableError,
@@ -1738,7 +1739,10 @@ function toolFailure(error: unknown): ToolAnswer {
   }
   return {
     ok: false,
-    error: { code: 'action-failed', message: error instanceof Error ? error.message : String(error) },
+    error: {
+      code: 'action-failed',
+      message: redactPageText(error instanceof Error ? error.message : String(error)),
+    },
   }
 }
 
@@ -1838,7 +1842,7 @@ async function dispatchEvaluateTool(
       const value = await evaluateWithoutDebugger(tab.id, code)
       text = `${EVALUATE_FALLBACK_PREFIX}${formatEvaluationResult({ value })}`
     } catch (fallbackError: unknown) {
-      const detail = fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
+      const detail = redactPageText(fallbackError instanceof Error ? fallbackError.message : String(fallbackError))
       if (/object reference chain is too long|circular|could not (?:be )?serializ|not serializable/i.test(detail)) {
         return {
           ok: false,
@@ -2184,10 +2188,13 @@ export async function dispatchOpenTab(
   const active = call.args.active !== false
 
   const approval = approvalPromptForCall(call, sharePageContent, [])
+  let pageContentReadable = sharePageContent === 'auto'
   if (approval !== undefined) {
     const authorization = authorize === undefined ? 'unavailable' : await authorize(approval)
     if (isCancelled(call, signal)) return cancelled()
     if (authorization !== 'approved') return approvalFailure(approval, authorization)
+    // On-demand sharing reads the page only for this approved action.
+    pageContentReadable = true
   }
 
   let created: chrome.tabs.Tab
@@ -2248,13 +2255,13 @@ export async function dispatchOpenTab(
   const status = active
     ? `Opened a new tab at ${parsed.href}.`
     : `Opened a new background tab at ${parsed.href}.`
-  if (!ready || sharePageContent === 'off' || isCancelled(call, signal)) {
+  if (!ready || !pageContentReadable || isCancelled(call, signal)) {
     return {
       ok: true,
       result: {
-        text: sharePageContent === 'off'
-          ? `${status} Page content sharing is disabled, so no snapshot was captured.`
-          : `${status} Call browser_snapshot again after the page loads.`,
+        text: pageContentReadable
+          ? `${status} Call browser_snapshot again after the page loads.`
+          : `${status} Page content sharing is disabled, so no snapshot was captured.`,
       },
     }
   }

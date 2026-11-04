@@ -488,6 +488,32 @@ describe('console buffer', () => {
     expect(readConsoleMessages(id, { onlyErrors: true }).messages[0]).toMatchObject({ type: 'error', text: 'hook error' })
     forgetTab(id)
   })
+
+  it('keeps a second same-millisecond page-hook line, because the hook never replays', () => {
+    const id = tabId()
+    const entry = { kind: 'console' as const, type: 'log', text: 'tick', url: 'https://example.com/', timestamp: 7 }
+    recordInstrumentEntry(id, entry)
+    recordInstrumentEntry(id, entry)
+    expect(readConsoleMessages(id).messages.map((message) => message.text)).toEqual(['tick', 'tick'])
+    forgetTab(id)
+  })
+
+  it('caps page-hook entries at the console buffer size', () => {
+    const id = tabId()
+    for (let i = 0; i < MAX_LOGS_PER_TAB + 3; i += 1) {
+      recordInstrumentEntry(id, {
+        kind: 'console',
+        type: 'log',
+        text: `line ${i}`,
+        url: 'https://example.com/',
+        timestamp: i,
+      })
+    }
+    const read = readConsoleMessages(id)
+    expect(read.total).toBe(MAX_LOGS_PER_TAB)
+    expect(read.messages.at(-1)?.text).toBe(`line ${MAX_LOGS_PER_TAB + 2}`)
+    forgetTab(id)
+  })
 })
 
 describe('network buffer', () => {
