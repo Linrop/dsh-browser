@@ -14,6 +14,7 @@ import type { BridgeState } from '../background/bridge.ts'
 import type { AffinityTab, TabAffinityDecision, TabAffinityState } from '../background/tab-affinity.ts'
 import type { RecordingStatus } from '../content/recorder.ts'
 import { connectPanel, type PanelApi, type PanelSettings } from './api.ts'
+import { currentWindowId, readStoredValue } from './extension-context.ts'
 import { renderMarkdown } from './markdown.ts'
 import whaleUrl from '../../assets/icons/deepseek-256.png'
 import type { ApprovalDecision, ApprovalRequest } from '../security/approval.ts'
@@ -568,8 +569,7 @@ export function App(): React.JSX.Element {
 
   // Settings: seed from storage; the panel only reads them (no editor).
   useEffect(() => {
-    void chrome.storage.local.get('dshSettings').then((stored) => {
-      const raw = stored.dshSettings as Partial<PanelSettings> | undefined
+    void readStoredValue<Partial<PanelSettings>>('dshSettings').then((raw) => {
       setSettings({
         bridgeUrl: raw?.bridgeUrl ?? '',
         token: raw?.token ?? '',
@@ -637,8 +637,8 @@ export function App(): React.JSX.Element {
     const offSelection = api.onSelection(setSelection)
     // A side panel has no sender.tab, so it reports its own window; the
     // background answers with whatever that window already had selected.
-    void Promise.resolve(chrome.windows.getCurrent())
-      .then((window) => { if (window.id !== undefined) return api.registerWindow(window.id) })
+    void currentWindowId()
+      .then((windowId) => { if (windowId !== undefined) return api.registerWindow(windowId) })
       .catch(() => {})
     const offResumeHint = api.onSessionResumeHint((sessionId) => {
       setResumeHint({ ready: true, sessionId })

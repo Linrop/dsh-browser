@@ -15,6 +15,7 @@ import type { TabAffinityDecision, TabAffinityState } from '../background/tab-af
 import type { ApprovalDecision, ApprovalRequest } from '../security/approval.ts'
 import { parsePageSelection, type PageSelection } from '../selection.ts'
 import { getUiLocale } from '../i18n.ts'
+import { extensionRuntime } from './extension-context.ts'
 
 /** Panel-side subset of the extension settings. */
 export type PanelSettings = Settings
@@ -314,7 +315,15 @@ export function connectPanel(): PanelApi {
     if (reconnectPromise !== null) return reconnectPromise
 
     const attempt = new Promise<void>((resolve) => { setTimeout(resolve, delayMs) })
-      .then(() => port ?? attach(chrome.runtime.connect({ name: 'dsh-panel' })))
+      .then(() => {
+        if (port !== null) return port
+        // Reloading the extension drops the runtime API while this document
+        // stays alive; report the lost connection instead of throwing a
+        // TypeError the user reads as a panel defect.
+        const runtime = extensionRuntime()
+        if (runtime === undefined) throw connectionError()
+        return attach(runtime.connect({ name: 'dsh-panel' }))
+      })
     reconnectPromise = attempt
     void attempt.then(
       () => { if (reconnectPromise === attempt) reconnectPromise = null },
@@ -365,7 +374,9 @@ export function connectPanel(): PanelApi {
   }
 
   try {
-    attach(chrome.runtime.connect({ name: 'dsh-panel' }))
+    const runtime = extensionRuntime()
+    if (runtime === undefined) throw connectionError()
+    attach(runtime.connect({ name: 'dsh-panel' }))
   } catch {
     void ensurePort(150).catch(() => {})
   }

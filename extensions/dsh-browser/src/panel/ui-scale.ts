@@ -15,6 +15,8 @@
  * @module
  */
 
+import { readStoredValue, writeStoredValue } from './extension-context.ts'
+
 /** `chrome.storage.local` key holding the persisted scale. */
 export const UI_SCALE_STORAGE_KEY = 'dshPanelUiScale'
 
@@ -67,8 +69,7 @@ export function applyUiScale(scale: number, root: HTMLElement = document.documen
 /** Read the persisted scale; falls back to the default when storage is empty. */
 export async function loadUiScale(): Promise<number> {
   try {
-    const stored = await chrome.storage.local.get(UI_SCALE_STORAGE_KEY)
-    return normalizeUiScale(stored[UI_SCALE_STORAGE_KEY])
+    return normalizeUiScale(await readStoredValue<number>(UI_SCALE_STORAGE_KEY))
   } catch {
     return DEFAULT_UI_SCALE
   }
@@ -76,5 +77,5 @@ export async function loadUiScale(): Promise<number> {
 
 /** Persist the scale so every side panel window opens at the chosen size. */
 export function saveUiScale(scale: number): void {
-  void chrome.storage.local.set({ [UI_SCALE_STORAGE_KEY]: normalizeUiScale(scale) }).catch(() => {})
+  writeStoredValue(UI_SCALE_STORAGE_KEY, normalizeUiScale(scale))
 }
