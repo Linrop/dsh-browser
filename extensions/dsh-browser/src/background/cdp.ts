@@ -1,0 +1,1883 @@
+/**
+ * Lazy Chrome DevTools Protocol access for tab-native browser tools.
+ *
+ * The debugger is attached only when a tool first needs a privilege the
+ * content script cannot provide (MAIN-world evaluation, surface screenshots,
+ * console and network telemetry). Every entry point gates on a capability
+ * probe first: Firefox and restricted Chrome builds have no
+ * `chrome.debugger`, and a tab already owned by DevTools refuses attachment.
+ * Both map to `debugger-unavailable`, which the tool layer turns into the
+ * documented page-side fallback instead of a crash.
+ *
+ * State lives in this module so it survives between tool calls: one attached
+ * session per tab with the set of enabled protocol domains, plus bounded
+ * console and network buffers that clear when the tab's page moves to another
+ * domain.
+ *
+ * @module
+ */
+
+import type { ToolErrorCode } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
+import { installInstrument, type InstrumentEntry } from '../content/instrument.ts'
+
+/** Protocol version Chrome's `debugger.attach` requires. */
+export const DEBUGGER_PROTOCOL_VERSION = '1.3'
+
+/** Console messages retained per tab. */
+export const MAX_LOGS_PER_TAB = 10_000
+
+/** Network requests retained per tab. */
+export const MAX_REQUESTS_PER_TAB = 1_000
+
+/** Longest text kept for one console message before it is cut. */
+export const MAX_CONSOLE_TEXT = 16_384
+
+/** Largest base64 screenshot accepted on the wire before the quality ladder. */
+export const MAX_SCREENSHOT_BASE64 = 4 * 1024 * 1024
+
+/** Ordered domains the tool layer may enable. */
+type ProtocolDomain = 'Runtime' | 'Page' | 'Network' | 'Log'
+
+/** A `debugger-unavailable` failure carrying its bridge code. */
+export class DebuggerUnavailableError extends Error {
+  readonly code: ToolErrorCode = 'debugger-unavailable'
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'DebuggerUnavailableError'
+  }
+}
+
+/** A page value that cannot cross `returnByValue` serialization. */
+export class JsResultNotSerializableError extends Error {
+  readonly code: ToolErrorCode = 'js-result-not-serializable'
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'JsResultNotSerializableError'
+  }
+}
+
+/** A screenshot that stays above the wire budget after the quality ladder. */
+export class ScreenshotTooLargeError extends Error {
+  readonly code: ToolErrorCode = 'action-failed'
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'ScreenshotTooLargeError'
+  }
+}
+
+/** The subset of `chrome.debugger` this module calls. */
+interface DebuggerApi {
+  attach(target: { tabId: number }, requiredVersion: string): Promise<void>
+  detach(target: { tabId: number }): Promise<void>
+  sendCommand(target: { tabId: number }, method: string, params?: object): Promise<object>
+  onDetach: chrome.events.Event<(source: { tabId?: number }, reason: string) => void>
+  onEvent: chrome.events.Event<(source: { tabId?: number }, method: string, params?: object) => void>
+}
+
+interface TabSession {
+  tabId: number
+  enabled: Set<ProtocolDomain>
+}
+
+const sessions = new Map<number, TabSession>()
+const pendingAttachments = new Map<number, Promise<TabSession>>()
+const idleDetachTimers = new Map<number, ReturnType<typeof setTimeout>>()
+/**
+ * Per-tab generation that a detach request increments.
+ *
+ * An attach that started under an older generation must not install its
+ * session after the tab was detached: the tab may have closed, left this
+ * session, or been replaced, and re-attaching it would leak a debugger
+ * session for a target no tool may touch any more.
+ */
+const attachGenerations = new Map<number, number>()
+/** Tabs where the user dismissed the debugging infobar for this worker lifetime. */
+const userDeclinedTabs = new Set<number>()
+let listenersInstalled = false
+
+/** Detach a tab that has not needed the debugger for this long. */
+export const IDLE_DETACH_MS = 60_000
+
+/** Read the debugger API without assuming every browser build ships it. */
+function debuggerApi(): DebuggerApi | undefined {
+  const chromeValue = Reflect.get(globalThis, 'chrome')
+  if (typeof chromeValue !== 'object' || chromeValue === null) return undefined
+  const candidate = Reflect.get(chromeValue, 'debugger')
+  if (typeof candidate !== 'object' || candidate === null) return undefined
+  const api = candidate as DebuggerApi
+  return typeof api.attach === 'function' && typeof api.sendCommand === 'function' ? api : undefined
+}
+
+/**
+ * Whether this browser build exposes `chrome.debugger`.
+ * @returns true when CDP tools can attempt attachment.
+ */
+export function isDebuggerAvailable(): boolean {
+  return debuggerApi() !== undefined
+}
+
+function installDebuggerListeners(api: DebuggerApi): void {
+  if (listenersInstalled) return
+  listenersInstalled = true
+  api.onDetach.addListener((source, reason) => {
+    try {
+      if (source.tabId === undefined) return
+      const tabId = source.tabId
+      sessions.delete(tabId)
+      pendingAttachments.delete(tabId)
+      clearIdleDetach(tabId)
+      if (reason === 'canceled_by_user') {
+        // The user clicked the infobar's cancel button. Stop offering to
+        // attach for this document and let the next call use the page-side
+        // fallback instead of failing or throwing.
+        userDeclinedTabs.add(tabId)
+        consoleBuffers.delete(tabId)
+        networkBuffers.delete(tabId)
+      }
+    } catch {
+      // A detach notification must never surface as an uncaught error.
+    }
+  })
+  api.onEvent.addListener((source, method, params) => {
+    try {
+      if (source.tabId === undefined || params === undefined) return
+      handleDebuggerEvent(source.tabId, method, params as Record<string, unknown>)
+    } catch {
+      // Malformed protocol events are dropped, not thrown into the worker.
+    }
+  })
+}
+
+function attachFailure(error: unknown): DebuggerUnavailableError {
+  const detail = error instanceof Error ? error.message : String(error)
+  if (/already attached|another debugger/i.test(detail)) {
+    return new DebuggerUnavailableError(
+      `The browser debugger is already attached to this tab, usually because DevTools is open on it. Close DevTools and retry, or use a workspace where another extension is not debugging this tab. (${detail})`,
+    )
+  }
+  if (/not supported|permission|denied|not allowed|cannot attach/i.test(detail)) {
+    return new DebuggerUnavailableError(
+      `The browser refused to attach the debugger to this tab. Grant the extension its debugger permission, or use a tool with a page-side fallback. (${detail})`,
+    )
+  }
+  return new DebuggerUnavailableError(
+    `The browser debugger could not attach to this tab. Retry after the page finishes loading. (${detail})`,
+  )
+}
+
+/**
+ * Attach the debugger to one tab, coalescing concurrent attempts.
+ *
+ * The tab must be attached at most once per worker lifetime: a second
+ * `attach` while DevTools or another extension owns the target is refused and
+ * reported as `debugger-unavailable`.
+ * @param tabId - the tab to instrument.
+ */
+export async function ensureAttached(tabId: number): Promise<void> {
+  if (sessions.has(tabId)) {
+    scheduleIdleDetach(tabId)
+    return
+  }
+  if (userDeclinedTabs.has(tabId)) {
+    throw new DebuggerUnavailableError(
+      'The debugging permission notice for this tab was dismissed, so the debugger cannot attach here. Reload the page or the extension, or use the page-side fallback.',
+    )
+  }
+  const api = debuggerApi()
+  if (api === undefined) {
+    throw new DebuggerUnavailableError(
+      'The browser debugger is unavailable in this browser build (Firefox and some Chrome builds have no chrome.debugger API). Use the page-side fallback or a browser that supports the debugger permission.',
+    )
+  }
+  installDebuggerListeners(api)
+  const generation = attachGenerations.get(tabId) ?? 0
+  let pending = pendingAttachments.get(tabId)
+  if (pending === undefined) {
+    pending = api.attach({ tabId }, DEBUGGER_PROTOCOL_VERSION)
+      .then((): TabSession => ({ tabId, enabled: new Set<ProtocolDomain>() }))
+    pendingAttachments.set(tabId, pending)
+  }
+  let session: TabSession
+  try {
+    session = await pending
+  } catch (error: unknown) {
+    throw attachFailure(error)
+  } finally {
+    if (pendingAttachments.get(tabId) === pending) pendingAttachments.delete(tabId)
+  }
+  if ((attachGenerations.get(tabId) ?? 0) !== generation) {
+    // A detach request landed while attach was in flight. Release the target
+    // instead of resurrecting a session the caller already gave up on.
+    try {
+      await api.detach({ tabId })
+    } catch {
+      // The target may already be gone; discarding the session is what matters.
+    }
+    throw new DebuggerUnavailableError(
+      'The debugger attachment was cancelled because the tab stopped belonging to this session. Retry on the current tab.',
+    )
+  }
+  sessions.set(tabId, session)
+  scheduleIdleDetach(tabId)
+}
+
+/**
+ * Invalidate any attach still in flight for a tab.
+ * @param tabId - tab whose pending attach must not install a session.
+ * @returns the new generation for that tab.
+ */
+function bumpAttachGeneration(tabId: number): number {
+  const next = (attachGenerations.get(tabId) ?? 0) + 1
+  attachGenerations.set(tabId, next)
+  return next
+}
+
+function clearIdleDetach(tabId: number): void {
+  const timer = idleDetachTimers.get(tabId)
+  if (timer !== undefined) {
+    clearTimeout(timer)
+    idleDetachTimers.delete(tabId)
+  }
+}
+
+function scheduleIdleDetach(tabId: number): void {
+  clearIdleDetach(tabId)
+  idleDetachTimers.set(tabId, setTimeout(() => {
+    idleDetachTimers.delete(tabId)
+    void detachTab(tabId)
+  }, IDLE_DETACH_MS))
+}
+
+/** Detach one tab and forget its protocol state. */
+export async function detachTab(tabId: number): Promise<void> {
+  bumpAttachGeneration(tabId)
+  sessions.delete(tabId)
+  pendingAttachments.delete(tabId)
+  clearIdleDetach(tabId)
+  const api = debuggerApi()
+  if (api === undefined) return
+  try {
+    await api.detach({ tabId })
+  } catch {
+    // The target may already be gone; the state above is what matters.
+  }
+}
+
+/** Forget every buffer and session for a tab that closed or left this session. */
+export function forgetTab(tabId: number): void {
+  consoleBuffers.delete(tabId)
+  networkBuffers.delete(tabId)
+  userDeclinedTabs.delete(tabId)
+  forgetInstrumentChannel(tabId)
+  void detachTab(tabId)
+}
+
+/** Detach a tab whose last ownership claim was released while it stays open. */
+export function releaseTab(tabId: number): void {
+  void detachTab(tabId)
+}
+
+async function send(tabId: number, method: string, params?: object): Promise<Record<string, unknown>> {
+  const api = debuggerApi()
+  if (api === undefined) {
+    throw new DebuggerUnavailableError('The browser debugger is unavailable in this browser build.')
+  }
+  if (!sessions.has(tabId)) await ensureAttached(tabId)
+  try {
+    const result = (await api.sendCommand({ tabId }, method, params ?? {})) as Record<string, unknown>
+    scheduleIdleDetach(tabId)
+    return result
+  } catch (error: unknown) {
+    const detail = error instanceof Error ? error.message : String(error)
+    if (/not attached|detached|target closed|no target/i.test(detail)) {
+      sessions.delete(tabId)
+      throw new DebuggerUnavailableError(`The debugger session for this tab ended: ${detail}`)
+    }
+    throw error
+  }
+}
+
+async function ensureDomain(tabId: number, domain: ProtocolDomain): Promise<void> {
+  const session = sessions.get(tabId)
+  if (session?.enabled.has(domain) === true) return
+  await send(tabId, `${domain}.enable`, {})
+  sessions.get(tabId)?.enabled.add(domain)
+}
+
+// ---- Real input through the Input domain ----
+
+/** Mouse buttons the Input domain accepts. */
+export type CdpMouseButton = 'left' | 'right' | 'middle'
+
+/** Modifier keys, mapped to the protocol's bit mask. */
+const MODIFIER_BITS: Record<string, number> = { alt: 1, ctrl: 2, meta: 4, shift: 8 }
+
+/** Bit mask for a pressed mouse button, as the protocol reports it in `buttons`. */
+const BUTTON_BITS: Record<CdpMouseButton, number> = { left: 1, right: 2, middle: 4 }
+
+/** Interpolated pointer moves between a drag's start and end. */
+export const CDP_DRAG_STEPS = 5
+
+/** Longest pause between drag segments, so page handlers can run between moves. */
+const DRAG_STEP_DELAY_MS = 8
+
+/**
+ * Parse a `ctrl+shift` style modifier list into the protocol bit mask.
+ * @param spec - comma/plus separated modifier names.
+ * @returns the bit mask, or undefined when a name is unknown.
+ */
+export function modifierMask(spec: string | undefined): number | undefined {
+  if (spec === undefined) return 0
+  const names = spec.split(/[+,]/).map((name) => name.trim().toLowerCase()).filter((name) => name !== '')
+  let mask = 0
+  for (const name of names) {
+    if (name === 'cmd' || name === 'command' || name === 'win') {
+      mask |= MODIFIER_BITS.meta!
+      continue
+    }
+    const bit = MODIFIER_BITS[name]
+    if (bit === undefined) return undefined
+    mask |= bit
+  }
+  return mask
+}
+
+interface InputPointerEvent {
+  type: 'mouseMoved' | 'mousePressed' | 'mouseReleased'
+  x: number
+  y: number
+  button?: CdpMouseButton | 'none'
+  buttons?: number
+  clickCount?: number
+  modifiers?: number
+}
+
+/**
+ * Dispatch one real mouse event through the browser input pipeline.
+ *
+ * Coordinates are viewport CSS pixels of the tab's main frame.
+ * @param tabId - target tab.
+ * @param event - protocol event fields.
+ */
+async function dispatchMouseEvent(tabId: number, event: InputPointerEvent): Promise<void> {
+  await send(tabId, 'Input.dispatchMouseEvent', event as unknown as Record<string, unknown>)
+}
+
+/**
+ * Move the real pointer to a viewport point.
+ * @param tabId - target tab.
+ * @param point - viewport CSS pixels in the main frame.
+ * @param modifiers - protocol modifier bit mask.
+ */
+export async function movePointer(tabId: number, point: { x: number; y: number }, modifiers = 0): Promise<void> {
+  await ensureAttached(tabId)
+  await dispatchMouseEvent(tabId, {
+    type: 'mouseMoved',
+    x: point.x,
+    y: point.y,
+    button: 'none',
+    buttons: 0,
+    modifiers,
+  })
+}
+
+/**
+ * Click a viewport point with real mouse press/release events.
+ * @param tabId - target tab.
+ * @param point - viewport CSS pixels in the main frame.
+ * @param options - button, click count, and modifier mask.
+ */
+export async function clickPointer(
+  tabId: number,
+  point: { x: number; y: number },
+  options: { button: CdpMouseButton; count: number; modifiers: number },
+): Promise<void> {
+  await ensureAttached(tabId)
+  await dispatchMouseEvent(tabId, {
+    type: 'mouseMoved',
+    x: point.x,
+    y: point.y,
+    button: 'none',
+    buttons: 0,
+    modifiers: options.modifiers,
+  })
+  const buttons = BUTTON_BITS[options.button]
+  for (let clickCount = 1; clickCount <= options.count; clickCount += 1) {
+    await dispatchMouseEvent(tabId, {
+      type: 'mousePressed',
+      x: point.x,
+      y: point.y,
+      button: options.button,
+      buttons,
+      clickCount,
+      modifiers: options.modifiers,
+    })
+    await dispatchMouseEvent(tabId, {
+      type: 'mouseReleased',
+      x: point.x,
+      y: point.y,
+      button: options.button,
+      buttons: 0,
+      clickCount,
+      modifiers: options.modifiers,
+    })
+  }
+}
+
+/**
+ * Drag between two viewport points with real press, interpolated moves, and release.
+ * @param tabId - target tab.
+ * @param from - start point in viewport CSS pixels.
+ * @param to - end point in viewport CSS pixels.
+ * @param modifiers - protocol modifier bit mask.
+ */
+export async function dragPointer(
+  tabId: number,
+  from: { x: number; y: number },
+  to: { x: number; y: number },
+  modifiers = 0,
+): Promise<void> {
+  await ensureAttached(tabId)
+  await dispatchMouseEvent(tabId, {
+    type: 'mouseMoved',
+    x: from.x,
+    y: from.y,
+    button: 'none',
+    buttons: 0,
+    modifiers,
+  })
+  await dispatchMouseEvent(tabId, {
+    type: 'mousePressed',
+    x: from.x,
+    y: from.y,
+    button: 'left',
+    buttons: BUTTON_BITS.left,
+    clickCount: 1,
+    modifiers,
+  })
+  for (let step = 1; step <= CDP_DRAG_STEPS; step += 1) {
+    const fraction = step / CDP_DRAG_STEPS
+    await dispatchMouseEvent(tabId, {
+      type: 'mouseMoved',
+      x: Math.round(from.x + (to.x - from.x) * fraction),
+      y: Math.round(from.y + (to.y - from.y) * fraction),
+      button: 'none',
+      buttons: BUTTON_BITS.left,
+      modifiers,
+    })
+    if (step < CDP_DRAG_STEPS) await new Promise((resolve) => setTimeout(resolve, DRAG_STEP_DELAY_MS))
+  }
+  await dispatchMouseEvent(tabId, {
+    type: 'mouseReleased',
+    x: to.x,
+    y: to.y,
+    button: 'left',
+    buttons: 0,
+    clickCount: 1,
+    modifiers,
+  })
+}
+
+// ---- Console and network telemetry ----
+
+/** One console message or page exception kept for `browser_console`. */
+export interface CapturedConsoleMessage {
+  type: string
+  text: string
+  url?: string
+  line?: number
+  column?: number
+  timestamp: number
+}
+
+/** One network request kept for `browser_network`. */
+export interface CapturedNetworkRequest {
+  url: string
+  method: string
+  status: number
+  errorText?: string
+  /** Request headers with credential-bearing names already replaced. */
+  requestHeaders?: Record<string, string>
+  /** Response headers with credential-bearing names already replaced. */
+  responseHeaders?: Record<string, string>
+  /** Size of the request body. The body itself is never recorded. */
+  postDataBytes?: number
+  /** True when the body was cut by the protocol cap, so the size is a lower bound. */
+  postDataBytesTruncated?: boolean
+  timestamp: number
+}
+
+interface ConsoleBuffer {
+  domain?: string
+  messages: CapturedConsoleMessage[]
+}
+
+interface NetworkBuffer {
+  domain?: string
+  requests: Map<string, CapturedNetworkRequest>
+}
+
+const consoleBuffers = new Map<number, ConsoleBuffer>()
+const networkBuffers = new Map<number, NetworkBuffer>()
+
+function hostOf(url: string | undefined): string | undefined {
+  if (url === undefined || url === '') return undefined
+  try {
+    return new URL(url).hostname
+  } catch {
+    return undefined
+  }
+}
+
+function consoleBufferFor(tabId: number): ConsoleBuffer {
+  let buffer = consoleBuffers.get(tabId)
+  if (buffer === undefined) {
+    buffer = { messages: [] }
+    consoleBuffers.set(tabId, buffer)
+  }
+  return buffer
+}
+
+function networkBufferFor(tabId: number): NetworkBuffer {
+  let buffer = networkBuffers.get(tabId)
+  if (buffer === undefined) {
+    buffer = { requests: new Map() }
+    networkBuffers.set(tabId, buffer)
+  }
+  return buffer
+}
+
+/**
+ * Clear telemetry when the tab's page moves to another domain.
+ *
+ * Same-domain navigations keep the buffer so a model can compare a reload;
+ * crossing a domain boundary starts fresh, because messages from the previous
+ * origin are no longer about the page being inspected.
+ * @param tabId - the tab that committed a navigation.
+ * @param url - the new committed document URL, when known.
+ */
+export function noteTabNavigation(tabId: number, url: string | undefined): void {
+  userDeclinedTabs.delete(tabId)
+  // A committed main-frame navigation replaces the document, so the installed
+  // hook and its token are gone with it.
+  forgetInstrumentChannel(tabId)
+  const domain = hostOf(url)
+  if (domain === undefined) return
+  const consoleBuffer = consoleBuffers.get(tabId)
+  if (consoleBuffer !== undefined) {
+    if (consoleBuffer.domain === undefined) consoleBuffer.domain = domain
+    else if (consoleBuffer.domain !== domain) {
+      consoleBuffer.messages.length = 0
+      consoleBuffer.domain = domain
+    }
+  }
+  const networkBuffer = networkBuffers.get(tabId)
+  if (networkBuffer !== undefined) {
+    if (networkBuffer.domain === undefined) networkBuffer.domain = domain
+    else if (networkBuffer.domain !== domain) {
+      networkBuffer.requests.clear()
+      networkBuffer.domain = domain
+    }
+  }
+}
+
+/**
+ * Seed the domain boundary of both buffers for a tab.
+ *
+ * The first capture call records which domain the tab is on; later navigation
+ * to another domain clears what was collected. A missing or unparseable URL
+ * leaves the boundary unset, so the first resolvable navigation sets it.
+ * @param tabId - target tab.
+ * @param pageUrl - the tab's current URL, when known.
+ */
+export function seedTelemetryDomain(tabId: number, pageUrl: string | undefined): void {
+  const domain = hostOf(pageUrl)
+  if (domain === undefined) return
+  const consoleBuffer = consoleBufferFor(tabId)
+  if (consoleBuffer.domain === undefined) consoleBuffer.domain = domain
+  const networkBuffer = networkBufferFor(tabId)
+  if (networkBuffer.domain === undefined) networkBuffer.domain = domain
+}
+
+function pushConsole(tabId: number, message: CapturedConsoleMessage): void {
+  const buffer = consoleBufferFor(tabId)
+  buffer.messages.push({
+    ...message,
+    text: redactModelText(message.text),
+    ...(message.url === undefined ? {} : { url: redactUrlForModel(message.url) }),
+  })
+  if (buffer.messages.length > MAX_LOGS_PER_TAB) {
+    buffer.messages.splice(0, buffer.messages.length - MAX_LOGS_PER_TAB)
+  }
+}
+
+function pushNetwork(tabId: number, requestId: string, request: CapturedNetworkRequest): void {
+  const buffer = networkBufferFor(tabId)
+  buffer.requests.set(requestId, {
+    ...request,
+    url: redactUrlForModel(request.url),
+    ...(request.requestHeaders === undefined ? {} : { requestHeaders: redactHeaders(request.requestHeaders) }),
+    ...(request.responseHeaders === undefined ? {} : { responseHeaders: redactHeaders(request.responseHeaders) }),
+  })
+  while (buffer.requests.size > MAX_REQUESTS_PER_TAB) {
+    const oldest = buffer.requests.keys().next()
+    if (oldest.done === true) break
+    buffer.requests.delete(oldest.value)
+  }
+}
+
+interface RemoteObjectLike {
+  type?: string
+  subtype?: string
+  value?: unknown
+  description?: string
+  unserializableValue?: string
+}
+
+function remoteObjectText(remote: RemoteObjectLike | undefined): string {
+  if (remote === undefined) return ''
+  if (typeof remote.unserializableValue === 'string') return remote.unserializableValue
+  if (remote.value !== undefined) {
+    if (typeof remote.value === 'string') return remote.value
+    try {
+      const json = JSON.stringify(remote.value)
+      return json === undefined ? String(remote.value) : json
+    } catch {
+      return String(remote.value)
+    }
+  }
+  if (typeof remote.description === 'string') return remote.description
+  return remote.type ?? ''
+}
+
+interface CallFrameLike {
+  functionName?: string
+  url?: string
+  lineNumber?: number
+  columnNumber?: number
+}
+
+function callFramesOf(params: Record<string, unknown>): CallFrameLike[] {
+  const stackTrace = params.stackTrace
+  if (typeof stackTrace !== 'object' || stackTrace === null) return []
+  const callFrames = (stackTrace as { callFrames?: unknown }).callFrames
+  if (!Array.isArray(callFrames)) return []
+  return callFrames.filter((frame): frame is CallFrameLike => typeof frame === 'object' && frame !== null)
+}
+
+function exceptionText(params: Record<string, unknown>): { text: string; url?: string; line?: number; column?: number } {
+  const details = params.exceptionDetails
+  const record = typeof details === 'object' && details !== null ? details as Record<string, unknown> : {}
+  const exception = typeof record.exception === 'object' && record.exception !== null
+    ? record.exception as RemoteObjectLike
+    : undefined
+  const headline = typeof exception?.description === 'string'
+    ? exception.description
+    : typeof record.text === 'string'
+      ? record.text
+      : 'Uncaught exception'
+  const frames = callFramesOf(record)
+  const stack = frames.map((frame) => {
+    const name = typeof frame.functionName === 'string' && frame.functionName !== '' ? frame.functionName : '<anonymous>'
+    const url = frame.url ?? ''
+    const line = (frame.lineNumber ?? 0) + 1
+    const column = (frame.columnNumber ?? 0) + 1
+    return `    at ${name} (${url}:${line}:${column})`
+  })
+  const first = frames[0]
+  return {
+    text: redactModelText([headline, ...stack].join('\n')).slice(0, MAX_CONSOLE_TEXT),
+    ...(first?.url === undefined ? {} : { url: first.url }),
+    ...(first?.lineNumber === undefined ? {} : { line: first.lineNumber + 1 }),
+    ...(first?.columnNumber === undefined ? {} : { column: first.columnNumber + 1 }),
+  }
+}
+
+function logLevelType(level: unknown): string {
+  if (level === 'error') return 'error'
+  if (level === 'warning') return 'warn'
+  if (level === 'verbose') return 'debug'
+  return 'log'
+}
+
+/**
+ * Apply one CDP event to the tab's telemetry buffers.
+ *
+ * Exported for tests: the real listener is a thin wrapper, so every buffer
+ * rule (bounded growth, domain clearing, failure status) is exercised without
+ * a live debugger.
+ * @param tabId - tab the event belongs to.
+ * @param method - protocol method name.
+ * @param params - protocol event payload.
+ */
+export function handleDebuggerEvent(tabId: number, method: string, params: Record<string, unknown>): void {
+  switch (method) {
+    case 'Runtime.consoleAPICalled': {
+      const args = Array.isArray(params.args) ? params.args as RemoteObjectLike[] : []
+      const frames = callFramesOf(params)
+      const first = frames[0]
+      pushConsole(tabId, {
+        type: typeof params.type === 'string' ? params.type : 'log',
+        text: args.map((arg) => remoteObjectText(arg)).join(' ').slice(0, MAX_CONSOLE_TEXT),
+        ...(first?.url === undefined ? {} : { url: first.url }),
+        ...(first?.lineNumber === undefined ? {} : { line: first.lineNumber + 1 }),
+        ...(first?.columnNumber === undefined ? {} : { column: first.columnNumber + 1 }),
+        timestamp: typeof params.timestamp === 'number' ? params.timestamp : Date.now(),
+      })
+      return
+    }
+    case 'Runtime.exceptionThrown': {
+      const exception = exceptionText(params)
+      pushConsole(tabId, {
+        type: 'exception',
+        text: exception.text,
+        ...(exception.url === undefined ? {} : { url: exception.url }),
+        ...(exception.line === undefined ? {} : { line: exception.line }),
+        ...(exception.column === undefined ? {} : { column: exception.column }),
+        timestamp: typeof params.timestamp === 'number' ? params.timestamp : Date.now(),
+      })
+      return
+    }
+    case 'Log.entryAdded': {
+      const rawEntry = params.entry
+      if (typeof rawEntry !== 'object' || rawEntry === null) return
+      const entry = rawEntry as Record<string, unknown>
+      pushConsole(tabId, {
+        type: logLevelType(entry.level),
+        text: (typeof entry.text === 'string' ? entry.text : '').slice(0, MAX_CONSOLE_TEXT),
+        ...(typeof entry.url === 'string' ? { url: entry.url } : {}),
+        ...(typeof entry.lineNumber === 'number' ? { line: entry.lineNumber } : {}),
+        timestamp: typeof entry.timestamp === 'number' ? entry.timestamp : Date.now(),
+      })
+      return
+    }
+    case 'Network.requestWillBeSent': {
+      const requestId = typeof params.requestId === 'string' ? params.requestId : undefined
+      const request = typeof params.request === 'object' && params.request !== null
+        ? params.request as Record<string, unknown>
+        : undefined
+      if (requestId === undefined || request === undefined) return
+      const url = typeof request.url === 'string' ? request.url : ''
+      const method = typeof request.method === 'string' ? request.method : 'GET'
+      const existing = networkBufferFor(tabId).requests.get(requestId)
+      const requestHeaders = headerRecord(request.headers)
+      // The protocol caps postData at `maxPostDataSize`, so its byte length is
+      // only a lower bound. The declared Content-Length is the real size when
+      // the page sent one.
+      const declaredBytes = contentLengthHeader(requestHeaders)
+      const recordedBytes = typeof request.postData === 'string'
+        ? new TextEncoder().encode(request.postData).length
+        : undefined
+      const postDataBytes = declaredBytes ?? recordedBytes
+      const bodySizeFields = postDataBytes === undefined
+        ? {}
+        : { postDataBytes, ...(declaredBytes === undefined && recordedBytes !== undefined ? { postDataBytesTruncated: true } : {}) }
+      pushNetwork(tabId, requestId, {
+        url,
+        method,
+        status: existing?.status ?? 0,
+        ...(existing?.errorText === undefined ? {} : { errorText: existing.errorText }),
+        ...(requestHeaders === undefined ? {} : { requestHeaders }),
+        // postData holds the request body; only its size may be retained.
+        ...bodySizeFields,
+        timestamp: typeof params.timestamp === 'number' ? params.timestamp : Date.now(),
+      })
+      return
+    }
+    case 'Network.responseReceived': {
+      const requestId = typeof params.requestId === 'string' ? params.requestId : undefined
+      const response = typeof params.response === 'object' && params.response !== null
+        ? params.response as Record<string, unknown>
+        : undefined
+      if (requestId === undefined || response === undefined) return
+      const existing = networkBufferFor(tabId).requests.get(requestId)
+      const responseHeaders = headerRecord(response.headers)
+      pushNetwork(tabId, requestId, {
+        url: typeof response.url === 'string' ? response.url : (existing?.url ?? ''),
+        method: existing?.method ?? 'GET',
+        status: typeof response.status === 'number' ? response.status : (existing?.status ?? 0),
+        ...(existing?.errorText === undefined ? {} : { errorText: existing.errorText }),
+        ...(existing?.requestHeaders === undefined ? {} : { requestHeaders: existing.requestHeaders }),
+        ...(existing?.postDataBytes === undefined ? {} : { postDataBytes: existing.postDataBytes }),
+        ...(existing?.postDataBytesTruncated === undefined ? {} : { postDataBytesTruncated: existing.postDataBytesTruncated }),
+        ...(responseHeaders === undefined ? {} : { responseHeaders }),
+        timestamp: existing?.timestamp ?? (typeof params.timestamp === 'number' ? params.timestamp : Date.now()),
+      })
+      return
+    }
+    case 'Network.loadingFailed': {
+      const requestId = typeof params.requestId === 'string' ? params.requestId : undefined
+      if (requestId === undefined) return
+      const errorText = typeof params.errorText === 'string' ? params.errorText : 'request failed'
+      // A cancelled or aborted navigation is a user action, not a failed
+      // request; reporting it as a 503 would mislead the model.
+      if (params.canceled === true || /ERR_ABORTED|canceled|cancelled/i.test(errorText)) return
+      const existing = networkBufferFor(tabId).requests.get(requestId)
+      if (existing === undefined) return
+      pushNetwork(tabId, requestId, { ...existing, status: 503, errorText })
+      return
+    }
+    default:
+      return
+  }
+}
+
+/** Record a console/network entry produced by the MAIN-world fallback hook. */
+export function recordInstrumentEntry(tabId: number, entry: InstrumentEntry): void {
+  if (entry.kind === 'console') {
+    pushConsole(tabId, {
+      type: entry.type,
+      text: entry.text.slice(0, MAX_CONSOLE_TEXT),
+      ...(entry.url === '' ? {} : { url: entry.url }),
+      ...(entry.line === undefined ? {} : { line: entry.line }),
+      ...(entry.column === undefined ? {} : { column: entry.column }),
+      timestamp: entry.timestamp,
+    })
+    return
+  }
+  const requestId = `${entry.method} ${entry.url} ${entry.timestamp}`
+  pushNetwork(tabId, requestId, {
+    url: entry.url,
+    method: entry.method,
+    status: entry.status,
+    ...(entry.errorText === undefined ? {} : { errorText: entry.errorText.slice(0, 512) }),
+    timestamp: entry.timestamp,
+  })
+}
+
+/**
+ * Enable console telemetry for a tab through CDP.
+ * @param tabId - target tab.
+ * @param pageUrl - current document URL, used to seed the domain boundary.
+ */
+export async function startConsoleCapture(tabId: number, pageUrl: string | undefined): Promise<void> {
+  await ensureAttached(tabId)
+  await ensureDomain(tabId, 'Runtime')
+  await ensureDomain(tabId, 'Log')
+  const buffer = consoleBufferFor(tabId)
+  if (buffer.domain === undefined) buffer.domain = hostOf(pageUrl)
+}
+
+/** Enable network telemetry for a tab through CDP, resetting stale state. */
+export async function startNetworkCapture(tabId: number, pageUrl: string | undefined): Promise<void> {
+  await ensureAttached(tabId)
+  const session = sessions.get(tabId)
+  if (session?.enabled.has('Network') !== true) {
+    try {
+      await send(tabId, 'Network.disable', {})
+    } catch {
+      // The domain may not be enabled yet; enabling fresh is the normal path.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await send(tabId, 'Network.enable', { maxPostDataSize: 65_536 })
+    sessions.get(tabId)?.enabled.add('Network')
+  }
+  const buffer = networkBufferFor(tabId)
+  if (buffer.domain === undefined) buffer.domain = hostOf(pageUrl)
+}
+
+/**
+ * Generate a one-time envelope channel name for the MAIN-world hook.
+ *
+ * The name is delivered out of band (injection argument plus an extension
+ * message) and never enters an entry envelope. It only filters look-alike
+ * page events; entry payloads remain page-controlled data.
+ * @returns a random channel name.
+ */
+export function newInstrumentChannel(): string {
+  const cryptoValue = Reflect.get(globalThis, 'crypto') as { randomUUID?: () => string } | undefined
+  if (typeof cryptoValue?.randomUUID === 'function') return cryptoValue.randomUUID()
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`
+}
+
+/**
+ * Per-document channel for the MAIN-world hook.
+ *
+ * The hook installs once per document and keeps emitting on its original
+ * channel, so a second console/network call must reuse that channel instead of
+ * rotating it and silencing the already-installed hook.
+ */
+const instrumentChannels = new Map<number, string>()
+
+/**
+ * The channel for a tab's current document, created on first use.
+ * @param tabId - target tab.
+ * @returns a stable channel for this document.
+ */
+export function instrumentChannelFor(tabId: number): string {
+  const existing = instrumentChannels.get(tabId)
+  if (existing !== undefined) return existing
+  const channel = newInstrumentChannel()
+  instrumentChannels.set(tabId, channel)
+  return channel
+}
+
+/** Forget the document channel after a navigation or when the tab is released. */
+function forgetInstrumentChannel(tabId: number): void {
+  instrumentChannels.delete(tabId)
+}
+
+/**
+ * Inject the MAIN-world console/network hook used without the debugger.
+ * @param tabId - target tab.
+ * @param channel - one-time channel the isolated world forwards on.
+ */
+export async function installPageInstrumentation(tabId: number, channel: string): Promise<void> {
+  await chrome.scripting.executeScript({
+    target: { tabId, frameIds: [0] },
+    world: 'MAIN',
+    func: installInstrument,
+    args: [channel],
+  })
+}
+
+/** Recording filter for `browser_console`. */
+export interface ConsoleQuery {
+  onlyErrors?: boolean
+  pattern?: string
+  limit?: number
+  clear?: boolean
+}
+
+/** Console messages selected by one query. */
+export interface ConsoleReadResult {
+  /** Messages after filtering, oldest first, capped at `limit`. */
+  messages: CapturedConsoleMessage[]
+  /** How many messages matched the filter before `limit` truncated them. */
+  total: number
+  /** How many messages the buffer held before this read. */
+  bufferTotal: number
+  /** True when the caller asked to clear the buffer; the buffer is empty after this read. */
+  cleared: boolean
+  /** True when pattern matching stopped early because the pattern was too expensive. */
+  patternAbandoned?: boolean
+  /** True when the pattern ran as a literal substring instead of a regular expression. */
+  patternDegraded?: boolean
+}
+
+/**
+ * Total time one `pattern` may spend matching the console buffer.
+ *
+ * A model-supplied regular expression is untrusted input; a catastrophic
+ * pattern over 10,000 retained messages would otherwise block the worker.
+ */
+export const CONSOLE_PATTERN_BUDGET_MS = 50
+
+/** How often the pattern scan checks whether it has spent its time budget. */
+const CONSOLE_PATTERN_CHECK_EVERY = 32
+
+/**
+ * Longest model-supplied pattern run as a regular expression.
+ *
+ * Longer patterns degrade to a case-insensitive substring test, because a
+ * long or expensive expression can occupy the worker on a single message.
+ */
+export const CONSOLE_PATTERN_MAX_LENGTH = 200
+
+/** How many leading characters of one message a pattern may inspect. */
+export const CONSOLE_PATTERN_MATCH_PREFIX = 512
+
+/** A compiled pattern, degraded to a literal contains test when unusable. */
+interface PatternMatcher {
+  test(text: string): boolean
+}
+
+/** A compiled pattern plus whether it degraded to literal substring matching. */
+interface CompiledPattern {
+  matcher: PatternMatcher
+  degraded: boolean
+}
+
+/**
+ * Compile a model-supplied pattern, bounding what one message can cost.
+ *
+ * A pattern over {@link CONSOLE_PATTERN_MAX_LENGTH}, or one the engine refuses
+ * to compile, becomes a literal substring test and is reported as degraded.
+ * @param pattern - the `pattern` argument.
+ * @returns the matcher and its degraded flag.
+ */
+function compilePattern(pattern: string): CompiledPattern {
+  if (pattern.length > CONSOLE_PATTERN_MAX_LENGTH) {
+    return { matcher: literalMatcher(pattern), degraded: true }
+  }
+  try {
+    const regex = new RegExp(pattern, 'i')
+    return { matcher: { test: (text) => regex.test(text.slice(0, CONSOLE_PATTERN_MATCH_PREFIX)) }, degraded: false }
+  } catch {
+    return { matcher: literalMatcher(pattern), degraded: true }
+  }
+}
+
+/**
+ * Build a case-insensitive literal matcher over the inspected prefix.
+ * @param pattern - literal text to find.
+ * @returns the matcher.
+ */
+function literalMatcher(pattern: string): PatternMatcher {
+  const literal = pattern.toLowerCase()
+  return { test: (text) => text.slice(0, CONSOLE_PATTERN_MATCH_PREFIX).toLowerCase().includes(literal) }
+}
+
+/** Apply `only_errors` and the pattern rule to the buffer within a time budget. */
+function selectConsoleMessages(
+  messages: CapturedConsoleMessage[],
+  query: ConsoleQuery,
+): { messages: CapturedConsoleMessage[]; patternAbandoned: boolean; patternDegraded: boolean } {
+  const onlyErrors = query.onlyErrors === true
+  const compiled = query.pattern === undefined || query.pattern === '' ? undefined : compilePattern(query.pattern)
+  if (compiled === undefined) {
+    return {
+      messages: messages.filter((message) => !onlyErrors || message.type === 'error' || message.type === 'exception'),
+      patternAbandoned: false,
+      patternDegraded: false,
+    }
+  }
+  const selected: CapturedConsoleMessage[] = []
+  const startedAt = Date.now()
+  for (let index = 0; index < messages.length; index += 1) {
+    // Check the budget between runs (a single run cannot be interrupted), and
+    // bound every run's input so one message cannot monopolize the worker.
+    if (index % CONSOLE_PATTERN_CHECK_EVERY === 0 && Date.now() - startedAt > CONSOLE_PATTERN_BUDGET_MS) {
+      return { messages: selected, patternAbandoned: true, patternDegraded: compiled.degraded }
+    }
+    const message = messages[index]!
+    if (onlyErrors && message.type !== 'error' && message.type !== 'exception') continue
+    if (compiled.matcher.test(message.text)) selected.push(message)
+  }
+  return { messages: selected, patternAbandoned: false, patternDegraded: compiled.degraded }
+}
+
+/**
+ * Read the console buffer of one tab, optionally discarding it afterwards.
+ *
+ * The filter and `limit` are applied before any clearing, and the clearing
+ * happens after the selection has been copied out, so `clear` returns the
+ * messages it read instead of an empty list.
+ * @param tabId - target tab.
+ * @param query - filters, limit, and clear flag.
+ * @returns the selected messages, oldest first, capped at `limit`.
+ */
+export function readConsoleMessages(tabId: number, query: ConsoleQuery = {}): ConsoleReadResult {
+  const buffer = consoleBufferFor(tabId)
+  const bufferTotal = buffer.messages.length
+  const limit = Math.min(Math.max(Math.floor(query.limit ?? 100), 1), 1_000)
+  const selected = selectConsoleMessages(buffer.messages, query)
+  const messages = selected.messages.slice(-limit)
+  const clear = query.clear === true
+  if (clear) buffer.messages.length = 0
+  return {
+    messages,
+    total: selected.messages.length,
+    bufferTotal,
+    cleared: clear,
+    ...(selected.patternAbandoned ? { patternAbandoned: true } : {}),
+    ...(selected.patternDegraded ? { patternDegraded: true } : {}),
+  }
+}
+
+/** Network request filter for `browser_network`. */
+export interface NetworkQuery {
+  urlPattern?: string
+  limit?: number
+  clear?: boolean
+}
+
+/** Network requests selected by one query. */
+export interface NetworkReadResult {
+  /** Requests after filtering, oldest first, capped at `limit`. */
+  requests: CapturedNetworkRequest[]
+  /** How many requests matched the filter before `limit` truncated them. */
+  total: number
+  /** How many requests the buffer held before this read. */
+  bufferTotal: number
+  /** True when the caller asked to clear the buffer; the buffer is empty after this read. */
+  cleared: boolean
+}
+
+/**
+ * Header-name fragments whose values never enter the model-facing buffer.
+ *
+ * Matching is by substring so vendor-prefixed and newly coined credential
+ * names (`x-goog-api-key`, `x-auth-token`, custom `*-api-key`) are covered
+ * without maintaining an exhaustive list of exact names.
+ */
+const SENSITIVE_HEADER_FRAGMENTS = [
+  'authorization',
+  'cookie',
+  'set-cookie',
+  'api-key',
+  'apikey',
+  'x-api-key',
+  'x-auth-token',
+  'x-csrf-token',
+  'proxy-authorization',
+  'x-goog-api-key',
+]
+
+/** Whether a header name carries credential material. */
+function isSensitiveHeader(name: string): boolean {
+  const lower = name.toLowerCase()
+  return SENSITIVE_HEADER_FRAGMENTS.some((fragment) => lower.includes(fragment))
+}
+
+/**
+ * Query parameter name fragments whose values are replaced with `***`.
+ *
+ * Matching is by substring so vendor-prefixed names (`x-amz-signature`,
+ * `sessionId`, `csrf_token`, `jwt`) are covered without maintaining an
+ * exhaustive list of exact names.
+ */
+const SENSITIVE_QUERY_NAMES = /token|secret|key|sig|session|csrf|jwt|password|passwd|auth|credential/i
+
+/** A `name=value` pair in a query-like string, used when a URL does not parse. */
+const QUERY_PAIR_PATTERN = /([?&;])([^=&#;?\s]+)=([^&#;\s]*)/g
+
+/** Userinfo in an authority, used when a URL does not parse. */
+const USERINFO_PATTERN = /\/\/[^/@\s]+@/g
+
+/**
+ * Normalize a CDP header map into lowercase-safe string pairs.
+ * @param value - protocol `headers` payload.
+ * @returns a header record, or undefined when the payload is not an object.
+ */
+function headerRecord(value: unknown): Record<string, string> | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const headers: Record<string, string> = {}
+  for (const [name, headerValue] of Object.entries(value as Record<string, unknown>)) {
+    headers[name] = typeof headerValue === 'string' ? headerValue : String(headerValue)
+  }
+  return headers
+}
+
+/**
+ * Read a declared request body size from the headers.
+ * @param headers - request headers as the protocol reported them.
+ * @returns the byte count, or undefined when no valid Content-Length exists.
+ */
+function contentLengthHeader(headers: Record<string, string> | undefined): number | undefined {
+  if (headers === undefined) return undefined
+  for (const [name, value] of Object.entries(headers)) {
+    if (name.toLowerCase() !== 'content-length') continue
+    const parsed = Number(value.trim())
+    return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined
+  }
+  return undefined
+}
+
+/**
+ * Replace credential-bearing header values.
+ * @param headers - raw request or response headers.
+ * @returns a copy where sensitive names carry `***` and other values are text-redacted.
+ */
+export function redactHeaders(headers: Record<string, string>): Record<string, string> {
+  const redacted: Record<string, string> = {}
+  for (const [name, value] of Object.entries(headers)) {
+    redacted[name] = isSensitiveHeader(name) ? '***' : redactModelText(value)
+  }
+  return redacted
+}
+
+/**
+ * Replace credential-bearing pairs and userinfo in an unparseable URL string.
+ * @param raw - page-supplied text the URL parser rejected.
+ * @returns the text with sensitive values masked.
+ */
+function redactUnparseableUrl(raw: string): string {
+  return raw
+    .replace(USERINFO_PATTERN, '//***:***@')
+    .replace(QUERY_PAIR_PATTERN, (match, separator: string, name: string) =>
+      SENSITIVE_QUERY_NAMES.test(name) ? `${separator}${name}=***` : match)
+}
+
+/**
+ * Hide credentials in a URL before it enters a buffer or the model's view.
+ *
+ * Covers both `user:pass@host` userinfo and query parameters whose names are
+ * commonly used for tokens, so a redirect URL cannot carry a session token
+ * into the transcript. A URL that does not parse still gets the same
+ * key-value masking applied to its whole text.
+ * @param raw - the page-supplied URL.
+ * @returns the redacted URL.
+ */
+export function redactUrlForModel(raw: string): string {
+  try {
+    const url = new URL(raw)
+    const hadUserinfo = url.username !== '' || url.password !== ''
+    if (hadUserinfo) {
+      url.username = '***'
+      url.password = '***'
+    }
+    let changedQuery = false
+    for (const name of [...url.searchParams.keys()]) {
+      if (SENSITIVE_QUERY_NAMES.test(name)) {
+        url.searchParams.set(name, '***')
+        changedQuery = true
+      }
+    }
+    return hadUserinfo || changedQuery ? url.toString() : raw
+  } catch {
+    return redactUnparseableUrl(raw)
+  }
+}
+
+/**
+ * Read the network buffer of one tab, optionally discarding it afterwards.
+ *
+ * The filter and `limit` are applied before any clearing, and the clearing
+ * happens after the selection has been copied out, so `clear` returns the
+ * requests it read instead of an empty list.
+ * @param tabId - target tab.
+ * @param query - URL substring, limit, and clear flag.
+ * @returns the selected requests, oldest first, capped at `limit`.
+ */
+export function readNetworkRequests(tabId: number, query: NetworkQuery = {}): NetworkReadResult {
+  const buffer = networkBufferFor(tabId)
+  const bufferTotal = buffer.requests.size
+  const limit = Math.min(Math.max(Math.floor(query.limit ?? 100), 1), 1_000)
+  const all = [...buffer.requests.values()]
+  const selected = query.urlPattern === undefined || query.urlPattern === ''
+    ? all
+    : all.filter((request) => request.url.includes(query.urlPattern as string))
+  const requests = selected.slice(-limit)
+  const clear = query.clear === true
+  if (clear) buffer.requests.clear()
+  return { requests, total: selected.length, bufferTotal, cleared: clear }
+}
+
+function clock(timestamp: number): string {
+  const date = new Date(timestamp)
+  const pad = (value: number, width = 2): string => String(value).padStart(width, '0')
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+/**
+ * Render console messages with the tool's documented layout.
+ * @param messages - selected messages, oldest first.
+ * @param fallback - append the page-side hook limitation note.
+ * @returns the model-facing text.
+ */
+export function formatConsoleMessages(messages: CapturedConsoleMessage[], fallback = false): string {
+  const suffix = fallback
+    ? '\n\n(captured by page-side hook: logs emitted before the hook installed and native exceptions outside window.onerror may be missing)'
+    : ''
+  if (messages.length === 0) {
+    return `No console messages found for this tab.${suffix}\n\nNote: console tracking starts when this tool is first called; call it before the page loads, or reload the page to capture from page load.`
+  }
+  const blocks = messages.map((message, index) => {
+    const location = message.url === undefined
+      ? ''
+      : ` (${redactUrlForModel(message.url)}:${message.line ?? 0}:${message.column ?? 0})`
+    return `[${index + 1}] [${clock(message.timestamp)}] [${message.type.toUpperCase()}]${location}\n${redactModelText(message.text)}`
+  })
+  return `Found ${messages.length} console messages:\n\n${blocks.join('\n\n')}${suffix}`
+}
+
+/**
+ * Render network requests with the tool's documented layout.
+ * @param requests - selected requests, oldest first.
+ * @param fallback - append the page-side hook limitation note.
+ * @returns the model-facing text.
+ */
+export function formatNetworkRequests(requests: CapturedNetworkRequest[], fallback = false): string {
+  const suffix = fallback
+    ? '\n\n(captured by page-side hook: document/resource requests and service-worker traffic are not covered)'
+    : ''
+  if (requests.length === 0) {
+    return `No network requests found for this tab.${suffix}\n\nNote: network tracking starts when this tool is first called; call it before the page loads, or reload the page to capture from page load.`
+  }
+  const blocks = requests.map((request, index) => [
+    `${index + 1}. url: ${request.url}`,
+    `   method: ${request.method}`,
+    `   statusCode: ${request.status}`,
+    ...(request.errorText === undefined ? [] : [`   error: ${request.errorText}`]),
+    ...(request.postDataBytes === undefined
+      ? []
+      : [`   requestBodyBytes: ${request.postDataBytes}${request.postDataBytesTruncated === true ? ' (at least; the recorded body was truncated)' : ''}`]),
+  ].join('\n'))
+  return `Found ${requests.length} network request(s):\n\n${blocks.join('\n\n')}${suffix}`
+}
+
+// ---- Evaluate ----
+
+/** `Runtime.evaluate` timeout before Chrome reports an execution timeout. */
+const REPL_TIMEOUT_MS = 30_000
+
+/** Outcome of one `Runtime.evaluate` round trip. */
+export interface EvaluateOutcome {
+  /** Result value when the page returned a JSON-representable value. */
+  value?: unknown
+  /** Remote-object description for functions, DOM nodes, and errors. */
+  description?: string
+  /** Rendered exception, when the evaluated code threw. */
+  exception?: string
+}
+
+interface EvaluateResponse extends Record<string, unknown> {
+  result?: RemoteObjectLike
+  exceptionDetails?: Record<string, unknown>
+}
+
+function illegalReturn(response: EvaluateResponse): boolean {
+  const details = response.exceptionDetails
+  if (details === undefined) return false
+  const exception = typeof details.exception === 'object' && details.exception !== null
+    ? details.exception as RemoteObjectLike
+    : undefined
+  const text = [details.text, exception?.description].filter((part): part is string => typeof part === 'string').join(' ')
+  return /Illegal return statement/i.test(text)
+}
+
+function serializationFailure(details: Record<string, unknown>): boolean {
+  const exception = typeof details.exception === 'object' && details.exception !== null
+    ? details.exception as RemoteObjectLike
+    : undefined
+  const text = [details.text, exception?.description].filter((part): part is string => typeof part === 'string').join(' ')
+  return /object reference chain is too long|could not (?:be )?serializ|circular|convert argument to a value|preview limit/i.test(text)
+}
+
+async function evaluateCommand(
+  tabId: number,
+  expression: string,
+  awaitPromise: boolean,
+  replMode: boolean,
+): Promise<EvaluateResponse> {
+  const response = await send(tabId, 'Runtime.evaluate', {
+    expression,
+    returnByValue: true,
+    awaitPromise,
+    replMode,
+    timeout: REPL_TIMEOUT_MS,
+  })
+  return response as EvaluateResponse
+}
+
+/**
+ * Evaluate JavaScript in the tab's MAIN world through CDP.
+ *
+ * REPL semantics are tried first so a bare last expression renders; a
+ * top-level `return` is syntactically illegal there, so that one failure
+ * retries as an async IIFE.
+ * @param tabId - tab whose page runs the code.
+ * @param code - the model-supplied source.
+ * @param awaitPromise - await a returned promise before answering.
+ * @returns the raw outcome; formatting and masking happen in {@link formatEvaluationResult}.
+ */
+export async function evaluateInPage(tabId: number, code: string, awaitPromise = true): Promise<EvaluateOutcome> {
+  await ensureAttached(tabId)
+  await ensureDomain(tabId, 'Runtime')
+  let response: EvaluateResponse
+  try {
+    response = await evaluateCommand(tabId, code, awaitPromise, true)
+    if (illegalReturn(response)) {
+      response = await evaluateCommand(tabId, `(async () => {\n${code}\n})()`, awaitPromise, false)
+    }
+  } catch (error: unknown) {
+    if (error instanceof DebuggerUnavailableError) throw error
+    const detail = error instanceof Error ? error.message : String(error)
+    if (/object reference chain is too long|could not (?:be )?serializ|circular/i.test(detail)) {
+      throw new JsResultNotSerializableError(
+        `The page value cannot be serialized. Return a string instead, for example: return JSON.stringify(value). (${detail})`,
+      )
+    }
+    throw error
+  }
+  const details = response.exceptionDetails
+  if (details !== undefined) {
+    if (serializationFailure(details)) {
+      throw new JsResultNotSerializableError(
+        'The page value cannot be serialized. Return a string instead, for example: return JSON.stringify(value).',
+      )
+    }
+    const exception = typeof details.exception === 'object' && details.exception !== null
+      ? details.exception as RemoteObjectLike
+      : undefined
+    const text = exception?.description ?? (typeof details.text === 'string' ? details.text : 'Uncaught exception')
+    if (/timed out|timeout/i.test(text)) {
+      return { exception: 'Execution timeout: code exceeded 30-second limit' }
+    }
+    return { exception: `JavaScript execution error: ${text}` }
+  }
+  const result = response.result
+  if (result === undefined) return { value: undefined }
+  if (typeof result.unserializableValue === 'string') return { value: result.unserializableValue }
+  if (result.value !== undefined) return { value: result.value }
+  if (typeof result.description === 'string') return { description: result.description }
+  return { value: result.type ?? 'undefined' }
+}
+
+// ---- Credential redaction ----
+
+const SENSITIVE_KEY = /password|token|secret|api[_-]?key|auth|credential|private[_-]?key|access[_-]?key|bearer|oauth|session/i
+const COOKIE_KEY = /cookie/i
+const JWT_SHAPE = /^eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}$/
+const BASE64_SHAPE = /^[A-Za-z0-9+/]{40,}={0,2}$/
+const HEX_SHAPE = /^(?:0x)?[0-9a-fA-F]{32,}$/
+
+/** Longest single string kept before truncation. */
+export const MAX_STRING_VALUE = 1_000
+
+/** How many array items are inspected before the rest is described. */
+export const MAX_ARRAY_ITEMS = 100
+
+/** How deep object traversal goes before the rest is described. */
+export const MAX_REDACTION_DEPTH = 5
+
+/**
+ * Shared text-level credential redaction.
+ *
+ * Console text, exception text, instrumented entries, and evaluated string
+ * values all pass through this one rule set, so a token cannot survive one
+ * reporting path while being blocked in another.
+ * @param value - page-supplied text.
+ * @returns the text with credential shapes replaced, bounded to 1000 characters.
+ */
+export function redactModelText(value: string): string {
+  return redactString(value)
+}
+
+function redactString(value: string): string {
+  if (value.includes('=') && (value.includes(';') || value.includes('&'))) {
+    return '[BLOCKED: Cookie/query string data]'
+  }
+  if (JWT_SHAPE.test(value)) return '[BLOCKED: jwt data]'
+  if (BASE64_SHAPE.test(value)) return '[BLOCKED: base64 data]'
+  if (HEX_SHAPE.test(value)) return '[BLOCKED: hex data]'
+  return value.length > MAX_STRING_VALUE ? `${value.slice(0, MAX_STRING_VALUE)}…[truncated]` : value
+}
+
+/**
+ * Replace credentials and oversized data with bounded placeholders.
+ *
+ * The walk is bounded in depth, array length, and string length so a hostile
+ * page cannot make one tool result unbounded. Cycles become `[Circular]`
+ * rather than throwing, because the model needs to know the value existed.
+ * @param value - any value returned by page evaluation.
+ * @param depth - current traversal depth (callers omit it).
+ * @param ancestors - objects on the current branch, used for cycle detection.
+ * @returns a JSON-safe value with secrets replaced.
+ */
+export function redactForModel(
+  value: unknown,
+  depth = 0,
+  ancestors: WeakSet<object> = new WeakSet(),
+): unknown {
+  if (depth > MAX_REDACTION_DEPTH) return '[TRUNCATED: max depth]'
+  if (value === undefined) return 'undefined'
+  if (value === null) return null
+  switch (typeof value) {
+    case 'string':
+      return redactString(value)
+    case 'number':
+    case 'boolean':
+      return value
+    case 'bigint':
+      return value.toString()
+    case 'symbol':
+      return value.toString()
+    case 'function':
+      return `[Function ${value.name === '' ? 'anonymous' : value.name}]`
+    default:
+      break
+  }
+  if (ancestors.has(value)) return '[Circular]'
+  ancestors.add(value)
+  try {
+    if (Array.isArray(value)) {
+      const kept = value.slice(0, MAX_ARRAY_ITEMS).map((item) => redactForModel(item, depth + 1, ancestors))
+      if (value.length > MAX_ARRAY_ITEMS) kept.push(`[TRUNCATED: ${value.length - MAX_ARRAY_ITEMS} more items]`)
+      return kept
+    }
+    const record = value as Record<string, unknown>
+    const redacted: Record<string, unknown> = {}
+    for (const [key, entry] of Object.entries(record)) {
+      if (COOKIE_KEY.test(key)) {
+        redacted[key] = '[BLOCKED: Cookie access]'
+        continue
+      }
+      if (SENSITIVE_KEY.test(key)) {
+        redacted[key] = '[BLOCKED: Sensitive key]'
+        continue
+      }
+      redacted[key] = redactForModel(entry, depth + 1, ancestors)
+    }
+    return redacted
+  } finally {
+    ancestors.delete(value)
+  }
+}
+
+/**
+ * Render one evaluation outcome as the model-facing `Result:` block.
+ * @param outcome - value or exception returned by {@link evaluateInPage}.
+ * @returns the text, with credentials already replaced.
+ */
+export function formatEvaluationResult(outcome: EvaluateOutcome): string {
+  if (outcome.exception !== undefined) return outcome.exception
+  if (outcome.description !== undefined) return `Result: ${JSON.stringify(redactString(outcome.description))}`
+  const redacted = redactForModel(outcome.value)
+  let json: string
+  try {
+    json = JSON.stringify(redacted, null, 2) ?? 'undefined'
+  } catch {
+    json = '"undefined"'
+  }
+  return `Result: ${json}`
+}
+
+// ---- Screenshot ----
+
+/** Viewport geometry used to place and size a screenshot clip. */
+export interface ViewportMetrics {
+  viewportWidth: number
+  viewportHeight: number
+  scrollX: number
+  scrollY: number
+  dpr: number
+}
+
+/** One captured image with its base64 payload. */
+export interface ScreenshotImage {
+  base64: string
+  mimeType: 'image/jpeg' | 'image/png'
+  width: number
+  height: number
+}
+
+/** Screenshot result: pixels plus the coordinate frame they came from. */
+export interface ScreenshotCapture {
+  image: ScreenshotImage
+  frame: {
+    viewportWidth: number
+    viewportHeight: number
+    screenshotWidth: number
+    screenshotHeight: number
+    dpr: number
+  }
+  /** The JPEG quality actually applied, when the capture was JPEG. */
+  quality?: ScreenshotQuality
+  /** Degradations the caller must report with the image, in model-facing prose. */
+  notes?: string[]
+}
+
+/** JPEG quality the size ladder actually used for one capture. */
+export interface ScreenshotQuality {
+  /** Quality the caller asked for. */
+  requested: number
+  /** Quality the returned bytes were encoded with. */
+  effective: number
+  /** True when the size ladder lowered the requested quality. */
+  reduced: boolean
+}
+
+/** Screenshot options after the tool layer validated them. */
+export interface ScreenshotOptions {
+  region?: [number, number, number, number]
+  scale: number
+  format: 'jpeg' | 'png'
+  quality: number
+}
+
+const VIEWPORT_EXPRESSION = 'JSON.stringify({viewportWidth: window.innerWidth, viewportHeight: window.innerHeight, scrollX: window.scrollX, scrollY: window.scrollY, dpr: window.devicePixelRatio || 1})'
+
+function parseMetrics(raw: unknown): ViewportMetrics | undefined {
+  if (typeof raw !== 'string') return undefined
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    const viewportWidth = typeof parsed.viewportWidth === 'number' ? parsed.viewportWidth : undefined
+    const viewportHeight = typeof parsed.viewportHeight === 'number' ? parsed.viewportHeight : undefined
+    if (viewportWidth === undefined || viewportHeight === undefined) return undefined
+    return {
+      viewportWidth,
+      viewportHeight,
+      scrollX: typeof parsed.scrollX === 'number' ? parsed.scrollX : 0,
+      scrollY: typeof parsed.scrollY === 'number' ? parsed.scrollY : 0,
+      dpr: typeof parsed.dpr === 'number' && parsed.dpr > 0 ? parsed.dpr : 1,
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Read the page's viewport geometry through the debugger.
+ * @param tabId - target tab.
+ * @returns CSS-pixel viewport size, scroll offset, and device pixel ratio.
+ */
+export async function readViewportMetrics(tabId: number): Promise<ViewportMetrics> {
+  const outcome = await evaluateInPage(tabId, VIEWPORT_EXPRESSION, false)
+  const metrics = parseMetrics(outcome.value)
+  if (metrics === undefined) {
+    throw new DebuggerUnavailableError('The page viewport could not be measured through the browser debugger.')
+  }
+  return metrics
+}
+
+interface CaptureResponse extends Record<string, unknown> {
+  data?: string
+}
+
+async function captureWithParams(tabId: number, params: Record<string, unknown>): Promise<string> {
+  const response = (await send(tabId, 'Page.captureScreenshot', params)) as CaptureResponse
+  return typeof response.data === 'string' ? response.data : ''
+}
+
+/**
+ * Capture a screenshot through CDP, shrinking JPEG quality until it fits.
+ * @param tabId - target tab.
+ * @param options - validated region, format, scale, and quality.
+ * @returns image bytes and the frame they were captured in.
+ */
+export async function captureScreenshot(tabId: number, options: ScreenshotOptions): Promise<ScreenshotCapture> {
+  await ensureAttached(tabId)
+  await ensureDomain(tabId, 'Page')
+  const metrics = await readViewportMetrics(tabId)
+  const [x0, y0, x1, y1] = options.region ?? [0, 0, metrics.viewportWidth, metrics.viewportHeight]
+  const width = x1 - x0
+  const height = y1 - y0
+  const clip = {
+    x: metrics.scrollX + x0,
+    y: metrics.scrollY + y0,
+    width,
+    height,
+    scale: options.scale,
+  }
+  const baseParams: Record<string, unknown> = {
+    format: options.format,
+    fromSurface: true,
+    captureBeyondViewport: false,
+    clip,
+    ...(options.format === 'jpeg' ? { quality: options.quality } : {}),
+  }
+  let base64 = await captureWithParams(tabId, baseParams)
+  let mimeType: ScreenshotImage['mimeType'] = options.format === 'png' ? 'image/png' : 'image/jpeg'
+  let effectiveQuality = options.format === 'jpeg' ? options.quality : undefined
+  if (base64 === '') {
+    throw new DebuggerUnavailableError('The browser debugger returned an empty screenshot.')
+  }
+  if (base64.length > MAX_SCREENSHOT_BASE64) {
+    // The wire cap is on base64 characters; recapture as JPEG and walk the
+    // quality ladder until it fits or the lowest usable quality is exhausted.
+    mimeType = 'image/jpeg'
+    let ladderQuality: number | undefined
+    for (let quality = Math.min(options.quality, 80); quality >= 10; quality -= 10) {
+      const candidate = await captureWithParams(tabId, {
+        format: 'jpeg',
+        quality,
+        fromSurface: true,
+        captureBeyondViewport: false,
+        clip,
+      })
+      if (candidate === '') continue
+      base64 = candidate
+      ladderQuality = quality
+      if (base64.length <= MAX_SCREENSHOT_BASE64) break
+    }
+    if (base64.length > MAX_SCREENSHOT_BASE64) {
+      throw new ScreenshotTooLargeError(
+        'The screenshot is too large even at the lowest JPEG quality. Capture a smaller region with the region argument.',
+      )
+    }
+    effectiveQuality = ladderQuality
+  }
+  const screenshotWidth = Math.max(1, Math.round(width * options.scale * metrics.dpr))
+  const screenshotHeight = Math.max(1, Math.round(height * options.scale * metrics.dpr))
+  return {
+    image: { base64, mimeType, width: screenshotWidth, height: screenshotHeight },
+    frame: {
+      viewportWidth: metrics.viewportWidth,
+      viewportHeight: metrics.viewportHeight,
+      screenshotWidth,
+      screenshotHeight,
+      dpr: metrics.dpr,
+    },
+    ...(effectiveQuality === undefined
+      ? {}
+      : { quality: { requested: options.quality, effective: effectiveQuality, reduced: effectiveQuality < options.quality } }),
+  }
+}
+
+/**
+ * Measure the viewport without the debugger, through an injected script.
+ * @param tabId - target tab.
+ * @returns metrics, or undefined when the page cannot be scripted.
+ */
+export async function readViewportMetricsWithoutDebugger(tabId: number): Promise<ViewportMetrics | undefined> {
+  try {
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [0] },
+      world: 'MAIN',
+      func: () => JSON.stringify({
+        viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight,
+        scrollX: window.scrollX,
+        scrollY: window.scrollY,
+        dpr: window.devicePixelRatio || 1,
+      }),
+    })
+    return parseMetrics(result?.result)
+  } catch {
+    return undefined
+  }
+}
+
+interface DecodedImage {
+  width: number
+  height: number
+}
+
+async function decodeImage(base64: string, mimeType: string): Promise<DecodedImage> {
+  const response = await fetch(`data:${mimeType};base64,${base64}`)
+  const bitmap = await createImageBitmap(await response.blob())
+  return { width: bitmap.width, height: bitmap.height }
+}
+
+function mimeTypeOfFormat(format: 'jpeg' | 'png'): ScreenshotImage['mimeType'] {
+  return format === 'png' ? 'image/png' : 'image/jpeg'
+}
+
+/**
+ * Crop, scale, and re-encode one capture without the debugger.
+ *
+ * One `drawImage` call covers both cropping and scaling, so the region and
+ * `scale` behave the same as in the debugger path. `format` selects the output
+ * encoding; JPEG quality is fixed because the tool's `quality` argument only
+ * applies to the CDP path.
+ * @param base64 - captured payload.
+ * @param mimeType - encoding of `base64`.
+ * @param crop - source rectangle in device pixels.
+ * @param scale - output scale relative to the cropped pixels.
+ * @param format - requested output encoding.
+ * @returns the rendered image.
+ */
+async function renderScreenshot(
+  base64: string,
+  mimeType: ScreenshotImage['mimeType'],
+  crop: { x: number; y: number; width: number; height: number },
+  scale: number,
+  format: 'jpeg' | 'png',
+): Promise<ScreenshotImage> {
+  const response = await fetch(`data:${mimeType};base64,${base64}`)
+  const bitmap = await createImageBitmap(await response.blob())
+  const x = Math.max(0, Math.round(crop.x))
+  const y = Math.max(0, Math.round(crop.y))
+  const width = Math.max(1, Math.min(Math.round(crop.width), bitmap.width - x))
+  const height = Math.max(1, Math.min(Math.round(crop.height), bitmap.height - y))
+  const targetWidth = Math.max(1, Math.round(width * scale))
+  const targetHeight = Math.max(1, Math.round(height * scale))
+  const canvas = new OffscreenCanvas(targetWidth, targetHeight)
+  const context = canvas.getContext('2d')
+  if (context === null) throw new ScreenshotTooLargeError('This browser cannot crop screenshots without the debugger.')
+  context.drawImage(bitmap, x, y, width, height, 0, 0, targetWidth, targetHeight)
+  bitmap.close()
+  const outputType = mimeTypeOfFormat(format)
+  const blob = await canvas.convertToBlob({ type: outputType, quality: 0.9 })
+  const buffer = new Uint8Array(await blob.arrayBuffer())
+  let binary = ''
+  for (const byte of buffer) binary += String.fromCharCode(byte)
+  return { base64: btoa(binary), mimeType: outputType, width: targetWidth, height: targetHeight }
+}
+
+/**
+ * Capture the visible viewport without the debugger.
+ *
+ * `captureVisibleTab` only sees the active tab of a window, so a background
+ * tab is refused with `debugger-unavailable` instead of a misleading empty
+ * image. The capture itself is at the device pixel ratio, so a region is
+ * converted from CSS pixels with the page's device pixel ratio, then cropped,
+ * scaled by `scale`, and encoded as `format` in one canvas pass.
+ * @param tabId - target tab.
+ * @param windowId - the tab's window, when known.
+ * @param options - validated region, format, scale, and quality.
+ * @returns image bytes, a best-effort coordinate frame, and any degradation notes.
+ */
+export async function captureVisibleTabScreenshot(
+  tabId: number,
+  windowId: number | undefined,
+  options: ScreenshotOptions,
+): Promise<ScreenshotCapture> {
+  let tab: chrome.tabs.Tab
+  try {
+    tab = await chrome.tabs.get(tabId)
+  } catch {
+    throw new DebuggerUnavailableError('The tab no longer exists.')
+  }
+  if (tab.active !== true) {
+    throw new DebuggerUnavailableError(
+      `Tab ${tabId} is not the active tab, and capturing a background tab needs the debugger permission. Activate this tab and retry, or grant the debugger permission.`,
+    )
+  }
+  const targetWindow = windowId ?? tab.windowId
+  if (targetWindow === undefined) {
+    throw new DebuggerUnavailableError('The tab has no window to capture from. Activate the tab and retry.')
+  }
+  let dataUrl: string
+  try {
+    dataUrl = options.format === 'png'
+      ? await chrome.tabs.captureVisibleTab(targetWindow, { format: 'png' })
+      : await chrome.tabs.captureVisibleTab(targetWindow, { format: 'jpeg', quality: options.quality })
+  } catch (error: unknown) {
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new DebuggerUnavailableError(
+      `The visible tab could not be captured: ${detail}. Grant the debugger permission, or activate the tab and retry.`,
+    )
+  }
+  const marker = 'base64,'
+  const markerIndex = dataUrl.indexOf(marker)
+  if (markerIndex < 0) throw new DebuggerUnavailableError('The browser returned an unreadable screenshot.')
+  const rawBase64 = dataUrl.slice(markerIndex + marker.length)
+  const captureMimeType = mimeTypeOfFormat(options.format)
+  const decoded = await decodeImage(rawBase64, captureMimeType)
+  const metrics = await readViewportMetricsWithoutDebugger(tabId)
+  const notes: string[] = []
+  if (metrics === undefined) {
+    notes.push(
+      'The page device pixel ratio could not be read without the debugger, so this coordinate frame assumes devicePixelRatio 1; the viewport size was derived from the captured pixels.',
+    )
+  }
+  const dpr = metrics === undefined ? 1 : metrics.dpr
+  let image: ScreenshotImage = {
+    base64: rawBase64,
+    mimeType: captureMimeType,
+    width: decoded.width,
+    height: decoded.height,
+  }
+  if (options.region !== undefined || options.scale !== 1) {
+    const crop = options.region === undefined
+      ? { x: 0, y: 0, width: decoded.width, height: decoded.height }
+      : (() => {
+        const [x0, y0, x1, y1] = options.region
+        return { x: x0 * dpr, y: y0 * dpr, width: (x1 - x0) * dpr, height: (y1 - y0) * dpr }
+      })()
+    try {
+      image = await renderScreenshot(rawBase64, captureMimeType, crop, options.scale, options.format)
+    } catch (error: unknown) {
+      if (options.region !== undefined) {
+        throw new ScreenshotTooLargeError(
+          'The browser cannot crop a visible-tab screenshot. Capture the whole viewport (omit region) or grant the debugger permission.',
+        )
+      }
+      // The capture already uses the requested format; only the scale is lost.
+      const detail = error instanceof Error ? error.message : String(error)
+      notes.push(`This degraded screenshot ignores scale: the browser could not resize it without the debugger (${detail}).`)
+    }
+  }
+  return {
+    image,
+    frame: {
+      viewportWidth: metrics?.viewportWidth ?? Math.round(decoded.width / dpr),
+      viewportHeight: metrics?.viewportHeight ?? Math.round(decoded.height / dpr),
+      screenshotWidth: image.width,
+      screenshotHeight: image.height,
+      dpr,
+    },
+    // captureVisibleTab applies the requested JPEG quality directly; there is
+    // no size ladder on this path.
+    ...(options.format === 'jpeg'
+      ? { quality: { requested: options.quality, effective: options.quality, reduced: false } }
+      : {}),
+    ...(notes.length === 0 ? {} : { notes }),
+  }
+}

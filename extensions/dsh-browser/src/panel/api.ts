@@ -8,6 +8,8 @@
 import type { BridgeCaps, RespondResult } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
 import type { ServerFrame } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
 import type { BridgeState } from '../background/bridge.ts'
+import type { LocalEventCounts } from '../background/events.ts'
+import type { RecordingStatus } from '../content/recorder.ts'
 import type { Settings } from '../background/index.ts'
 import type { TabAffinityDecision, TabAffinityState } from '../background/tab-affinity.ts'
 import type { ApprovalDecision, ApprovalRequest } from '../security/approval.ts'
@@ -89,7 +91,18 @@ interface SessionResumeHintMessage {
   sessionId: string | null
 }
 
-type BackgroundMessage = RpcResultMessage | RespondResultMessage | SettingsResultMessage | StatusMessage | EventMessage | ApprovalRequestMessage | ApprovalResolvedMessage | TabAffinityMessage | TabAffinityRebindResultMessage | SelectionMessage | SessionResumeHintMessage
+interface RecordingMessage {
+  type: 'recording'
+  status: RecordingStatus
+  error?: string
+}
+
+interface DiagnosticsMessage {
+  type: 'diagnostics'
+  counts: LocalEventCounts
+}
+
+type BackgroundMessage = RpcResultMessage | RespondResultMessage | SettingsResultMessage | StatusMessage | EventMessage | ApprovalRequestMessage | ApprovalResolvedMessage | TabAffinityMessage | TabAffinityRebindResultMessage | SelectionMessage | SessionResumeHintMessage | RecordingMessage | DiagnosticsMessage
 
 /** Structured gateway failure retained for product-level error handling. */
 export class PanelRpcError extends Error {
@@ -132,6 +145,13 @@ export interface PanelApi {
   setActiveSession(sessionId: string, isNew?: boolean): Promise<void>
   updateSettings(settings: Partial<PanelSettings>): Promise<void>
   requestStatus(): Promise<void>
+  /** Live recording state; `error` carries a rejected export start. */
+  onRecording(callback: (status: RecordingStatus, error?: string) => void): () => void
+  /** Worker-local event counters for the diagnostics view. */
+  onDiagnostics(callback: (counts: LocalEventCounts) => void): () => void
+  startRecording(): Promise<void>
+  exportRecording(): Promise<void>
+  clearRecording(): Promise<void>
 }
 
 /** Connect to the background service worker and return the panel API. */
@@ -157,6 +177,8 @@ export function connectPanel(): PanelApi {
   const tabAffinityListeners = new Set<(state: TabAffinityState) => void>()
   const selectionListeners = new Set<(selection: PageSelection | null) => void>()
   const sessionResumeHintListeners = new Set<(sessionId: string | null) => void>()
+  const recordingListeners = new Set<(status: RecordingStatus, error?: string) => void>()
+  const diagnosticsListeners = new Set<(counts: LocalEventCounts) => void>()
 
   let port: chrome.runtime.Port | null = null
   let reconnectPromise: Promise<chrome.runtime.Port> | null = null
@@ -233,6 +255,12 @@ export function connectPanel(): PanelApi {
       }
       case 'session.resume-hint':
         for (const listener of sessionResumeHintListeners) listener(msg.sessionId)
+        break
+      case 'recording':
+        for (const listener of recordingListeners) listener(msg.status, msg.error)
+        break
+      case 'diagnostics':
+        for (const listener of diagnosticsListeners) listener(msg.counts)
         break
     }
   }
@@ -453,6 +481,23 @@ export function connectPanel(): PanelApi {
     },
     requestStatus() {
       return send({ type: 'request-status' })
+    },
+    onRecording(callback) {
+      recordingListeners.add(callback)
+      return () => { recordingListeners.delete(callback) }
+    },
+    onDiagnostics(callback) {
+      diagnosticsListeners.add(callback)
+      return () => { diagnosticsListeners.delete(callback) }
+    },
+    startRecording() {
+      return send({ type: 'recording.start' })
+    },
+    exportRecording() {
+      return send({ type: 'recording.export' })
+    },
+    clearRecording() {
+      return send({ type: 'recording.clear' })
     },
   }
 }

@@ -8,6 +8,62 @@
 /** Default ceiling for replacing a model-driven snapshot round trip. */
 const NAVIGATION_READY_TIMEOUT_MS = 8_000
 
+/** Browser-owned page families the extension cannot inject into or operate. */
+export type RestrictedPageKind = 'chrome' | 'extension' | 'edge' | 'about' | 'devtools' | 'view-source'
+
+/** Scheme prefix each restricted page family starts with. */
+const RESTRICTED_PREFIXES: ReadonlyArray<readonly [RestrictedPageKind, string]> = [
+  ['chrome', 'chrome://'],
+  ['extension', 'chrome-extension://'],
+  ['edge', 'edge://'],
+  ['devtools', 'devtools://'],
+  ['view-source', 'view-source:'],
+  ['about', 'about:'],
+]
+
+/** One refusal the tool layer turns into a `protected-page` tool error. */
+export interface RestrictedPageRefusal {
+  code: 'protected-page'
+  message: string
+}
+
+/**
+ * Classify a tab URL as a browser-owned page the extension cannot assist.
+ *
+ * `about:blank` is the one exception: it is an empty document a frame or a new
+ * tab legitimately holds, and no page content exists to protect.
+ * @param url - tab URL, which Chrome may leave empty for a pending navigation.
+ * @returns the restricted page family, or undefined for an assistable page.
+ */
+export function classifyRestrictedPage(url: string | undefined): RestrictedPageKind | undefined {
+  if (url === undefined) return undefined
+  const normalized = url.trim().toLowerCase()
+  if (normalized === '') return undefined
+  if (normalized === 'about:blank' || normalized.startsWith('about:blank?') || normalized.startsWith('about:blank#')) {
+    return undefined
+  }
+  for (const [kind, prefix] of RESTRICTED_PREFIXES) {
+    if (normalized.startsWith(prefix)) return kind
+  }
+  return undefined
+}
+
+/**
+ * Build the one refusal every restricted page reports.
+ *
+ * The message names the page family and the supported escape (browser-level
+ * navigation or picking another tab) so the model can recover without guessing.
+ * @param kind - restricted page family from {@link classifyRestrictedPage}.
+ * @returns the stable `protected-page` refusal.
+ */
+export function restrictedPageRefusal(kind: RestrictedPageKind): RestrictedPageRefusal {
+  const label = kind === 'about' ? 'about:' : kind === 'view-source' ? 'view-source:' : `${kind}://`
+  return {
+    code: 'protected-page',
+    message: `This page cannot be assisted here: ${label} pages are owned by the browser, so DOM snapshots, clicks, typing, scrolling, and text extraction are unavailable. Navigate to a normal HTTP(S) page, or use browser_list_tabs to choose a tab that can be assisted.`,
+  }
+}
+
 /** A cancellable wait for the next content-script document in one frame. */
 export interface NavigationWait {
   ready: Promise<boolean>

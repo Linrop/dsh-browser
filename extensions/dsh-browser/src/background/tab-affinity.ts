@@ -47,6 +47,16 @@ export type TabTargetResolution =
   | { kind: 'handoff' }
   | { kind: 'lost' }
 
+/**
+ * How a tab entered this connection's ownership set.
+ *
+ * Every entry is a user-facing decision: the tab a session bound to when the
+ * user started working, a tab the model opened, or a tab the user explicitly
+ * told the model to follow. Ownership never outlives the connection, and a
+ * tab outside the set is refused rather than silently operated.
+ */
+export type TabOwnershipOrigin = 'bound' | 'opened' | 'followed'
+
 function sameTab(left: AffinityTab | null, right: AffinityTab | null): boolean {
   return left?.tabId === right?.tabId
     && left?.windowId === right?.windowId
@@ -65,6 +75,15 @@ export class TabAffinityController {
   private revision = 0
   private sessionTabs = new Map<string, AffinityTab>()
   private focusedSessionId: string | null = null
+  private readonly ownedTabs = new Map<number, TabOwnershipOrigin>()
+
+  /**
+   * Notified when a tab stops belonging to this connection.
+   *
+   * The owner uses it to release per-tab browser state (a debugger session)
+   * that must not outlive ownership even when the tab itself stays open.
+   */
+  onOwnershipReleased: ((tabId: number) => void) | undefined
 
   snapshot(): TabAffinityState {
     return {
@@ -79,6 +98,7 @@ export class TabAffinityController {
   /** Associate a session with its controlled tab. */
   bindSession(sessionId: string, tab: AffinityTab): void {
     this.sessionTabs.set(sessionId, { ...tab })
+    this.claimTab(tab.tabId, 'bound')
   }
 
   sessionMap(): Record<string, AffinityTab> {
@@ -92,6 +112,7 @@ export class TabAffinityController {
   restoreSessionTabs(sessions: Record<string, AffinityTab>): void {
     for (const [sid, tab] of Object.entries(sessions)) {
       this.sessionTabs.set(sid, { ...tab })
+      this.claimTab(tab.tabId, 'bound')
     }
   }
 
@@ -180,6 +201,7 @@ export class TabAffinityController {
     if (sid !== undefined && sid !== '') {
       if (this.sessionTabs.has(sid)) return false
       this.sessionTabs.set(sid, { ...tab })
+      this.claimTab(tab.tabId, 'bound')
       if (this.focusedSessionId === null) this.focusedSessionId = sid
       if (this.focusedSessionId === sid) {
         this.active = { ...tab }
@@ -208,6 +230,7 @@ export class TabAffinityController {
     if (sid === '') return false
     const previous = this.sessionTabs.get(sid)
     this.sessionTabs.set(sid, { ...tab })
+    this.claimTab(tab.tabId, 'bound')
     this.focusedSessionId = sid
     this.active = { ...tab }
     this.controlled = { ...tab }
@@ -228,6 +251,7 @@ export class TabAffinityController {
     this.pinned = false
     this.hasBound = true
     this.lost = false
+    this.claimTab(tab.tabId, 'bound')
     if (sid !== undefined && sid !== '') {
       this.sessionTabs.set(sid, { ...tab })
       this.focusedSessionId = sid
@@ -246,6 +270,7 @@ export class TabAffinityController {
     this.pinned = false
     this.hasBound = true
     this.lost = false
+    this.claimTab(tab.tabId, 'bound')
     if (sid !== undefined && sid !== '') {
       this.sessionTabs.set(sid, { ...tab })
       this.focusedSessionId = sid
@@ -258,6 +283,7 @@ export class TabAffinityController {
   restoreControlled(tab: AffinityTab): boolean {
     if (this.controlled !== null || this.hasBound || this.lost) return false
     this.controlled = { ...tab }
+    this.claimTab(tab.tabId, 'bound')
     this.hasBound = true
     this.revision += 1
     return true
@@ -293,8 +319,59 @@ export class TabAffinityController {
     return result
   }
 
+  /**
+   * Record one tab as belonging to this connection.
+   *
+   * Ownership is deliberately additive and connection-scoped: only the session
+   * binding, an opened tab, or an approved follow claims a tab, and no browser
+   * tool can widen the set on its own.
+   * @param tabId - Chrome tab id to own.
+   * @param origin - which user-facing decision claimed it.
+   */
+  claimTab(tabId: number, origin: TabOwnershipOrigin): void {
+    if (!Number.isInteger(tabId) || tabId < 0) return
+    this.ownedTabs.set(tabId, origin)
+  }
+
+  /**
+   * Whether one tab belongs to this connection.
+   * @param tabId - Chrome tab id.
+   * @returns true when a claim still covers the tab.
+   */
+  ownsTab(tabId: number): boolean {
+    return this.ownedTabs.has(tabId)
+  }
+
+  /** Owned tab ids with their claiming decision, for diagnostics and cleanup. */
+  ownedTabOrigins(): Array<{ tabId: number; origin: TabOwnershipOrigin }> {
+    return [...this.ownedTabs.entries()].map(([tabId, origin]) => ({ tabId, origin }))
+  }
+
+  /**
+   * Drop every ownership claim.
+   *
+   * Called when the connection or its session ends; the affinity binding keeps
+   * its own lifecycle and is cleared separately.
+   */
+  clearOwnedTabs(): void {
+    for (const tabId of [...this.ownedTabs.keys()]) this.releaseOwnership(tabId)
+    this.ownedTabs.clear()
+  }
+
+  /** Drop one claim and notify the owner that the tab is no longer ours. */
+  private releaseOwnership(tabId: number): boolean {
+    if (!this.ownedTabs.delete(tabId)) return false
+    try {
+      this.onOwnershipReleased?.(tabId)
+    } catch {
+      // A cleanup callback must not break the affinity state machine.
+    }
+    return true
+  }
+
   /** Remove stale state when Chrome closes a tracked tab. */
   removeTab(tabId: number): boolean {
+    const ownershipRemoved = this.releaseOwnership(tabId)
     let sessionRemoved = false
     for (const [sid, sTab] of this.sessionTabs.entries()) {
       if (sTab.tabId === tabId) {
@@ -305,7 +382,7 @@ export class TabAffinityController {
     }
     if (this.controlled?.tabId !== tabId && this.active?.tabId !== tabId) {
       if (sessionRemoved) this.revision += 1
-      return sessionRemoved
+      return sessionRemoved || ownershipRemoved
     }
     const previousActive = this.active
     const previousControlled = this.controlled
@@ -318,12 +395,17 @@ export class TabAffinityController {
       this.lost = true
     }
     if (this.active?.tabId === tabId) this.active = null
-    return this.bumpIfChanged(previousActive, previousControlled, previousKept) || sessionRemoved
+    return this.bumpIfChanged(previousActive, previousControlled, previousKept) || sessionRemoved || ownershipRemoved
   }
 
   /** Transfer tracked identity when Chrome replaces a tab without a user switch. */
   replaceTab(removedTabId: number, addedTabId: number): boolean {
     if (removedTabId === addedTabId) return false
+    const origin = this.ownedTabs.get(removedTabId)
+    if (origin !== undefined) {
+      this.releaseOwnership(removedTabId)
+      this.claimTab(addedTabId, origin)
+    }
     let sessionReplaced = false
     for (const [sid, sTab] of this.sessionTabs.entries()) {
       if (sTab.tabId === removedTabId) {
@@ -378,6 +460,7 @@ export class TabAffinityController {
     this.pinned = false
     this.hasBound = true
     this.lost = false
+    this.claimTab(this.active.tabId, 'followed')
     if (sessionId !== undefined && sessionId.trim() !== '') {
       this.sessionTabs.set(sessionId, { ...this.active })
     }

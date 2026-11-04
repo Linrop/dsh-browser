@@ -71,6 +71,11 @@ describe('panel session transitions', () => {
         .mockRejectedValueOnce(new Error('runtime port unavailable')),
       updateSettings: vi.fn(async () => {}),
       requestStatus: vi.fn(async () => {}),
+      onRecording: vi.fn(() => unsubscribe),
+      onDiagnostics: vi.fn(() => unsubscribe),
+      startRecording: vi.fn(async () => {}),
+      exportRecording: vi.fn(async () => {}),
+      clearRecording: vi.fn(async () => {}),
     }
 
     root = createRoot(document.querySelector('#root')!)
@@ -114,7 +119,12 @@ describe('panel session transitions', () => {
         open: async () => { throw new Error('unexpected stream') },
         failure: (error) => ({ code: 'internal', message: String(error), details: {} }),
       },
-    }, { createSharedFetchHandler: () => ({ fetch: async () => { throw new Error('unexpected fetch') } }) })
+    }, {
+      createSharedFetchHandler: () => ({ fetch: async () => { throw new Error('unexpected fetch') } }),
+      // dsh 0.2 requires an in-process Peer for gateway calls; this panel test
+      // never streams, so an opaque token is enough.
+      createPeer: () => ({ principal: { kind: 'owner' } }),
+    })
     const original = rpc.getMockImplementation()!
     rpc.mockImplementation(async (method, payload) => {
       if (method !== 'session.models' && method !== 'session.selectModel') return original(method, payload)

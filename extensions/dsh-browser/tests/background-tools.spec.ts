@@ -243,7 +243,7 @@ describe('dispatchToolCall', () => {
     expect(chromeMock.sendMessage).not.toHaveBeenCalled()
   })
 
-  it('rejects DOM actions on protected pages before requesting approval', async () => {
+  it('refuses DOM actions on browser-owned pages with protected-page', async () => {
     const chromeMock = mockChrome({ tab: { id: 8, url: 'about:config' } })
     const authorize = vi.fn(async () => 'approved' as const)
 
@@ -252,7 +252,7 @@ describe('dispatchToolCall', () => {
       'auto', undefined, authorize,
     )).resolves.toMatchObject({
       ok: false,
-      error: { code: 'content-unavailable', message: expect.stringContaining('DOM is protected') },
+      error: { code: 'protected-page', message: expect.stringContaining('This page cannot be assisted here: about:') },
     })
     expect(authorize).not.toHaveBeenCalled()
     expect(chromeMock.sendMessage).not.toHaveBeenCalled()

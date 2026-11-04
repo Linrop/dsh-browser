@@ -18,8 +18,43 @@ import {
   type TabFrame,
 } from './frames.ts'
 import { wrapUntrustedContent } from '../security/untrusted.ts'
-import { approvalPromptForCall, originFromUrl } from './authorization.ts'
-import { waitForNextDocumentReady } from './navigation.ts'
+import { PAGE_READS, approvalPromptForCall, originFromUrl } from './authorization.ts'
+import {
+  DebuggerUnavailableError,
+  JsResultNotSerializableError,
+  ScreenshotTooLargeError,
+  captureScreenshot,
+  captureVisibleTabScreenshot,
+  clickPointer,
+  dragPointer,
+  ensureAttached,
+  evaluateInPage,
+  formatConsoleMessages,
+  formatEvaluationResult,
+  formatNetworkRequests,
+  installPageInstrumentation,
+  modifierMask,
+  movePointer,
+  CONSOLE_PATTERN_BUDGET_MS,
+  CONSOLE_PATTERN_MATCH_PREFIX,
+  CONSOLE_PATTERN_MAX_LENGTH,
+  instrumentChannelFor,
+  readConsoleMessages,
+  readNetworkRequests,
+  seedTelemetryDomain,
+  startConsoleCapture,
+  startNetworkCapture,
+  type CdpMouseButton,
+  type EvaluateOutcome,
+  type ScreenshotCapture,
+  type ScreenshotOptions,
+} from './cdp.ts'
+import {
+  classifyRestrictedPage,
+  restrictedPageRefusal,
+  waitForNextDocumentReady,
+  type RestrictedPageKind,
+} from './navigation.ts'
 import type { ApprovalAuthorization, ApprovalPrompt } from '../security/approval.ts'
 import { getUiLocale } from '../i18n.ts'
 
@@ -54,6 +89,10 @@ const ACTION_DELTA_TOOLS = new Set([
   'browser_press',
   'browser_scroll',
   'browser_wait',
+  'browser_select',
+  'browser_hover',
+  'browser_drag',
+  'browser_upload_file',
 ])
 const ACTION_DELTA_GUIDANCE = 'The page settled and its current changes are included below. Continue from this state; take another snapshot only when broader page context is needed.'
 const NAVIGATION_CANDIDATE_TOOLS = new Set([
@@ -63,6 +102,8 @@ const NAVIGATION_CANDIDATE_TOOLS = new Set([
   'browser_forward',
   'browser_reload',
   'browser_open_tab',
+  'browser_evaluate',
+  'browser_drag',
 ])
 const TAB_NATIVE_TOOLS = new Set([
   'browser_snapshot',
@@ -70,6 +111,11 @@ const TAB_NATIVE_TOOLS = new Set([
   'browser_back',
   'browser_forward',
   'browser_reload',
+  'browser_screenshot',
+  'browser_resize',
+  'browser_console',
+  'browser_network',
+  'browser_evaluate',
 ])
 const STATE_CHANGING_PAGE_TOOLS = new Set([
   'browser_click',
@@ -80,6 +126,27 @@ const STATE_CHANGING_PAGE_TOOLS = new Set([
   'browser_back',
   'browser_forward',
   'browser_reload',
+  'browser_upload_file',
+  'browser_select',
+  'browser_drag',
+  'browser_evaluate',
+])
+/** Tools implemented by the background worker itself, never by a content script. */
+const BACKGROUND_PAGE_TOOLS = new Set([
+  'browser_evaluate',
+  'browser_screenshot',
+  'browser_console',
+  'browser_network',
+  'browser_resize',
+])
+/** Tools addressed by a snapshot element index, which needs a current snapshot baseline. */
+const ELEMENT_TARGET_TOOLS = new Set([
+  'browser_click',
+  'browser_type',
+  'browser_select',
+  'browser_hover',
+  'browser_upload_file',
+  'browser_drag',
 ])
 /** Tools that operate on the browser tab collection rather than one page document. */
 export const TAB_MANAGEMENT_TOOL_NAMES = new Set([
@@ -112,12 +179,41 @@ export interface TabManagementContext {
   unrestrictedAccess: boolean
   /** Controlled tab for the calling session, when one still exists. */
   controlledTabId?: number
+  /** Whether tab isolation refuses targets outside this session's owned tabs. */
+  tabIsolation?: boolean
+  /** Membership test for the session's owned tabs, supplied by the affinity controller. */
+  ownsTab?: (tabId: number) => boolean
   /** Rebind subsequent tools to one existing tab without activating it. */
   followTab?: (tab: chrome.tabs.Tab) => void | Promise<void>
   /** Mark the point after which a state-changing operation cannot be withdrawn. */
   commitAction?: () => void
   /** Restore withdrawability when a content-script action was not delivered. */
   rollbackActionCommit?: () => void
+}
+
+/**
+ * Refuse a tab this session never opened, followed, or bound to.
+ *
+ * Tab isolation makes the connection's ownership set the only source of
+ * targets: a tool call that points anywhere else fails closed instead of
+ * operating a tab the user never handed over.
+ * @param tabId - the resolved target tab.
+ * @param context - affinity context carrying the ownership test.
+ * @returns the `tab_outside` refusal, or undefined when the target is allowed.
+ */
+export function resolveTargetTab(
+  tabId: number,
+  context: Pick<TabManagementContext, 'tabIsolation' | 'ownsTab'>,
+): ToolAnswer | undefined {
+  if (context.tabIsolation !== true || context.ownsTab === undefined) return undefined
+  if (context.ownsTab(tabId)) return undefined
+  return {
+    ok: false,
+    error: {
+      code: 'tab_outside',
+      message: `Tab ${tabId} is outside this session's tabs. Bind, follow, or open a tab in the side panel before operating it, or call browser_list_tabs to find the controlled tab.`,
+    },
+  }
 }
 
 function isToolAnswer(value: unknown): value is ToolAnswer {
@@ -171,6 +267,12 @@ function unavailable(message: string): ToolAnswer {
   return { ok: false, error: { code: 'content-unavailable', message } }
 }
 
+/** Report one browser-owned page with the shared `protected-page` refusal. */
+function restrictedPageAnswer(kind: RestrictedPageKind): ToolAnswer {
+  const refusal = restrictedPageRefusal(kind)
+  return { ok: false, error: { code: refusal.code, message: refusal.message } }
+}
+
 function tabMetadataSnapshot(
   tabId: number,
   windowId: number | undefined,
@@ -178,7 +280,7 @@ function tabMetadataSnapshot(
   url: string | undefined,
   maxChars: number,
 ): ToolAnswer {
-  const status = 'The current tab is available only through browser-level controls because its page DOM is protected or inaccessible. DOM snapshot, click, type, press, scroll, wait, and text extraction are unavailable here. Navigate, back, forward, and reload remain available.'
+  const status = 'The current tab is available only through browser-level controls because its page DOM is protected or inaccessible. DOM snapshot, click, type, press, select, scroll, wait, text extraction, find, and file upload are unavailable here. Navigate, back, forward, reload, screenshot, resize, console and network telemetry, and JavaScript evaluation remain available.'
   const separator = '\n\n'
   const remaining = maxChars - status.length - separator.length
   if (remaining <= 0) return { ok: true, result: { text: status.slice(0, maxChars) } }
@@ -601,6 +703,7 @@ async function dispatchTabManagementTool(
         index: tab.index,
         active: tab.active,
         controlled: tab.id === context.controlledTabId,
+        owned: context.ownsTab === undefined || context.ownsTab(tab.id),
         title: tab.title ?? '',
         url: tabUrl(tab),
       }))
@@ -616,6 +719,13 @@ async function dispatchTabManagementTool(
   }
   const before = await findTab(tabId)
   if (before === undefined) return unavailable(`Tab ${tabId} is no longer open. Call browser_list_tabs again.`)
+  // browser_follow_tab is the one explicit way to widen the owned set, so it is
+  // allowed to name a tab the session does not own yet; the approval below is
+  // the user's consent for that expansion.
+  if (call.name !== 'browser_follow_tab') {
+    const outsideRefusal = resolveTargetTab(tabId, context)
+    if (outsideRefusal !== undefined) return outsideRefusal
+  }
   const approval = tabManagementApproval(call, before)
   const rejected = await authorizeTabManagement(approval, context.unrestrictedAccess, authorize, call, signal)
   if (rejected !== undefined) return rejected
@@ -655,6 +765,295 @@ async function dispatchTabManagementTool(
   return unavailable(`Unsupported tab-management tool: ${call.name}`)
 }
 
+// ---- Real pointer input through CDP, with the synthesized-event fallback ----
+
+/** Viewport geometry returned by the internal `browser_pointer_rect` action. */
+interface PointerRect {
+  x: number
+  y: number
+  width: number
+  height: number
+  visible: boolean
+}
+
+/** Parsed real-input options of one `browser_click`. */
+interface RealClickOptions {
+  button: CdpMouseButton
+  count: number
+  modifiers: number
+}
+
+/** The real-input plan for one tool call. */
+type PointerKind = 'hover' | 'click' | 'drag'
+
+/**
+ * Whether this click opted into real input by passing one of its new
+ * arguments. A plain left click keeps the existing content-script path so the
+ * documented behavior of the original tools does not change.
+ * @param args - tool arguments.
+ * @returns true when `button`, `count`, or `modifiers` was supplied.
+ */
+function clickRequestsRealInput(args: Record<string, unknown>): boolean {
+  return args.button !== undefined || args.count !== undefined || args.modifiers !== undefined
+}
+
+function pointerKindOf(call: ToolCall): PointerKind | undefined {
+  if (call.name === 'browser_hover') return 'hover'
+  if (call.name === 'browser_drag') return 'drag'
+  if (call.name === 'browser_click' && clickRequestsRealInput(call.args)) return 'click'
+  return undefined
+}
+
+/**
+ * Validate the click-only real-input arguments.
+ * @param args - tool arguments.
+ * @returns parsed options, or the `bad-args` answer.
+ */
+function parseRealClickOptions(args: Record<string, unknown>): { options: RealClickOptions } | { error: ToolAnswer } {
+  const button = args.button === undefined ? 'left' : args.button
+  if (button !== 'left' && button !== 'right' && button !== 'middle') {
+    return { error: badArgs('button must be "left", "right", or "middle".') }
+  }
+  const count = args.count === undefined ? 1 : args.count
+  if (typeof count !== 'number' || !Number.isInteger(count) || count < 1 || count > 3) {
+    return { error: badArgs('count must be an integer from 1 to 3.') }
+  }
+  if (args.modifiers !== undefined && typeof args.modifiers !== 'string') {
+    return { error: badArgs('modifiers must be a string such as "ctrl+shift".') }
+  }
+  const modifiers = modifierMask(typeof args.modifiers === 'string' ? args.modifiers : undefined)
+  if (modifiers === undefined) {
+    return { error: badArgs('modifiers contains an unknown key; use alt, ctrl, meta, or shift, joined by "+".') }
+  }
+  return { options: { button, count, modifiers } }
+}
+
+/** The coordinate lookup arguments the internal action needs. */
+function pointerRectArgs(call: ToolCall, settle = false): Record<string, unknown> {
+  const args: Record<string, unknown> = { ...(settle ? { settle: true } : {}) }
+  if (call.name === 'browser_drag') {
+    if (call.args.from_index !== undefined || call.args.to_index !== undefined) {
+      args.from_index = call.args.from_index
+      args.to_index = call.args.to_index
+    } else {
+      args.from = call.args.from
+      args.to = call.args.to
+    }
+    return args
+  }
+  if (call.args.index !== undefined) {
+    args.index = call.args.index
+    return args
+  }
+  args.x = call.args.x
+  args.y = call.args.y
+  return args
+}
+
+function isPointerRect(value: unknown): value is PointerRect {
+  if (typeof value !== 'object' || value === null) return false
+  const record = value as Record<string, unknown>
+  return typeof record.x === 'number'
+    && typeof record.y === 'number'
+    && record.visible === true
+}
+
+function parseDragRects(text: string): { from: PointerRect; to: PointerRect } | undefined {
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>
+    return isPointerRect(parsed.from) && isPointerRect(parsed.to)
+      ? { from: parsed.from, to: parsed.to }
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function parseSingleRect(text: string): PointerRect | undefined {
+  try {
+    const parsed = JSON.parse(text) as unknown
+    return isPointerRect(parsed) ? parsed : undefined
+  } catch {
+    return undefined
+  }
+}
+
+async function sendPointerRect(
+  tabId: number,
+  frame: TabFrame,
+  call: ToolCall,
+  budget: ContentBudget | undefined,
+  includePageDelta: boolean,
+): Promise<ToolAnswer> {
+  return await sendAction(
+    tabId,
+    { id: call.id, name: 'browser_pointer_rect', args: pointerRectArgs(call, includePageDelta) },
+    frame,
+    budget,
+    includePageDelta,
+  ) as ToolAnswer
+}
+
+/**
+ * Append the fallback disclosure to a synthesized-action answer.
+ * @param answer - the content-script path's answer.
+ * @param note - the degradation note, when real input was unavailable.
+ * @returns the answer with the note appended to a successful text result.
+ */
+function withPointerDegradation(answer: ToolAnswer, note: string | undefined): ToolAnswer {
+  if (note === undefined || !answer.ok) return answer
+  const text = answerText(answer)
+  if (text === undefined) return answer
+  return {
+    ...answer,
+    result: { ...(answer.result as Record<string, unknown>), text: `${text}\n\n${note}` },
+  }
+}
+
+/** Status line for a real-input action. */
+function pointerStatus(kind: PointerKind, call: ToolCall, rect: PointerRect, to?: PointerRect, options?: RealClickOptions): string {
+  const index = typeof call.args.index === 'number' ? call.args.index : undefined
+  if (kind === 'hover') {
+    return index === undefined
+      ? `Hovered at (${rect.x}, ${rect.y}) with real mouse events through the browser input pipeline.`
+      : `Hovered over [${index}] at (${rect.x}, ${rect.y}) with real mouse events through the browser input pipeline.`
+  }
+  if (kind === 'click') {
+    const button = options?.button ?? 'left'
+    const label = button === 'left' ? '' : `${button} button, `
+    const count = options !== undefined && options.count > 1 ? `${options.count} clicks, ` : ''
+    return `Clicked [${index ?? '?'}] (${label}${count}real mouse events).`
+  }
+  return `Dragged from (${rect.x}, ${rect.y}) to (${to?.x ?? '?'}, ${to?.y ?? '?'}) with real mouse events through the browser input pipeline.`
+}
+
+/**
+ * Run a hover, drag, or option-carrying click through real CDP input events.
+ *
+ * A plain left click never reaches this function. When the debugger is
+ * unavailable, cannot attach, or the target lives in an iframe, the caller
+ * falls back to the content script's synthesized events and this function
+ * only contributes the degradation note.
+ * @param tabId - target tab.
+ * @param tabUrl - current URL, used to refuse protected pages.
+ * @param frames - the tab's frames.
+ * @param call - tool call being dispatched.
+ * @param budget - output budget used for the automatic page delta.
+ * @param includeActionDelta - whether automatic page context is allowed.
+ * @param signal - bridge lifetime.
+ * @param targetStillAllowed - final fail-closed guard.
+ * @param commitAction - marks the withdrawability boundary.
+ * @returns a settled answer, or a degradation notice when the content fallback must run.
+ */
+async function dispatchRealPointerTool(
+  tabId: number,
+  tabUrl: string | undefined,
+  frames: TabFrame[],
+  call: ToolCall,
+  budget: ContentBudget,
+  includeActionDelta: boolean,
+  signal: AbortSignal | undefined,
+  targetStillAllowed: (() => boolean) | undefined,
+  commitAction: (() => void) | undefined,
+): Promise<{ answer?: ToolAnswer; degradedNote?: string } | undefined> {
+  const kind = pointerKindOf(call)
+  if (kind === undefined) return undefined
+  // CDP coordinates are main-frame viewport pixels. An iframe target keeps the
+  // synthesized path, whose coordinates are frame-local and already correct.
+  const frame = frames.find((candidate) => candidate.frameId === 0)
+  if (frame === undefined || requestedFrame(call.args) !== 0 || !isInjectablePage(tabUrl)) {
+    return { degradedNote: POINTER_IFRAME_DEGRADATION }
+  }
+  let options: RealClickOptions | undefined
+  if (kind === 'click') {
+    const parsed = parseRealClickOptions(call.args)
+    if ('error' in parsed) return { answer: parsed.error }
+    options = parsed.options
+  }
+  if (isCancelled(call, signal)) return { answer: cancelled() }
+  if (targetStillAllowed?.() === false) return { answer: targetChanged() }
+  try {
+    await ensureAttached(tabId)
+  } catch (error: unknown) {
+    if (error instanceof DebuggerUnavailableError) return { degradedNote: `${POINTER_DEBUGGER_DEGRADATION} (${error.message})` }
+    return { answer: toolFailure(error) }
+  }
+  let rects: { from: PointerRect; to: PointerRect } | PointerRect
+  try {
+    const lookup = await sendPointerRect(tabId, frame, call, undefined, false)
+    const text = answerText(lookup)
+    if (text === undefined) {
+      // The content script refused the target (missing element, changed page);
+      // let its own path report that with the documented message.
+      return { degradedNote: POINTER_TARGET_DEGRADATION }
+    }
+    if (kind === 'drag') {
+      const parsed = parseDragRects(text)
+      if (parsed === undefined) return { degradedNote: POINTER_TARGET_DEGRADATION }
+      if (!parsed.from.visible || !parsed.to.visible) return { degradedNote: POINTER_OFFSCREEN_DEGRADATION }
+      rects = parsed
+    } else {
+      const parsed = parseSingleRect(text)
+      if (parsed === undefined) return { degradedNote: POINTER_TARGET_DEGRADATION }
+      if (!parsed.visible) return { degradedNote: POINTER_OFFSCREEN_DEGRADATION }
+      rects = parsed
+    }
+  } catch {
+    return { degradedNote: POINTER_TARGET_DEGRADATION }
+  }
+  if (isCancelled(call, signal)) return { answer: cancelled() }
+  if (targetStillAllowed?.() === false) return { answer: targetChanged() }
+  if (STATE_CHANGING_PAGE_TOOLS.has(call.name)) commitAction?.()
+  try {
+    if (kind === 'hover') {
+      await movePointer(tabId, rects as PointerRect)
+    } else if (kind === 'click') {
+      await clickPointer(tabId, rects as PointerRect, options as RealClickOptions)
+    } else {
+      const drag = rects as { from: PointerRect; to: PointerRect }
+      await dragPointer(tabId, drag.from, drag.to)
+    }
+  } catch (error: unknown) {
+    return { answer: toolFailure(error) }
+  }
+  const single = rects as PointerRect
+  const drag = rects as { from: PointerRect; to: PointerRect }
+  const status = pointerStatus(kind, call, kind === 'drag' ? drag.from : single, kind === 'drag' ? drag.to : undefined, options)
+  const hasSnapshotBaseline = snapshotDocumentsByTab.get(tabId)?.get(0) === frameDocumentKey(frame)
+  if (!includeActionDelta || !hasSnapshotBaseline) return { answer: { ok: true, result: { text: status } } }
+  try {
+    const deltaAnswer = await sendPointerRect(tabId, frame, call, budget, true)
+    const pageContent = answerPageContent(deltaAnswer)
+    return {
+      answer: pageContent === undefined
+        ? { ok: true, result: { text: status } }
+        : { ok: true, result: { text: wrapActionDelta(status, pageContent, frame, budget.maxChars) } },
+    }
+  } catch {
+    // The action already landed; a missing delta is not a failure.
+    return { answer: { ok: true, result: { text: status } } }
+  }
+}
+
+const POINTER_DEBUGGER_DEGRADATION = 'The browser debugger was unavailable, so this action was synthesized as DOM events inside the page instead of using the browser input pipeline; canvas, cross-origin iframe, and system-level drop targets may ignore it.'
+const POINTER_IFRAME_DEGRADATION = 'This target is an iframe, so the action was synthesized as DOM events inside that frame instead of using the browser input pipeline; system-level drop targets may ignore it.'
+const POINTER_TARGET_DEGRADATION = 'The real-input coordinate lookup failed, so this action was synthesized as DOM events inside the page instead of using the browser input pipeline.'
+const POINTER_OFFSCREEN_DEGRADATION = 'The target could not be kept fully inside the viewport for real pointer events, so this action was synthesized as DOM events inside the page instead.'
+const POINTER_SYNTHETIC_CLICK_SEMANTICS = 'The requested button, click count, and modifiers were simulated on those synthesized events instead of the browser input pipeline.'
+
+/**
+ * Add the click-semantics disclosure to a synthesized click's degradation note.
+ * @param call - tool call being answered.
+ * @param note - the degradation note produced by the real-input attempt.
+ * @returns the note with the click disclosure appended for option-carrying clicks.
+ */
+function degradationNoteFor(call: ToolCall, note: string | undefined): string | undefined {
+  if (note === undefined) return undefined
+  return call.name === 'browser_click' && clickRequestsRealInput(call.args)
+    ? `${note} ${POINTER_SYNTHETIC_CLICK_SEMANTICS}`
+    : note
+}
+
 /**
  * Dispatch one tool call to the selected tab's content script.
  * @param call - the tool call to execute.
@@ -687,9 +1086,11 @@ export async function dispatchToolCall(
     return dispatchTabManagementTool(call, effectiveBudget, authorize, signal, tabManagement)
   }
   // Privacy boundary: with sharing off, no page content may leave the page.
+  // PAGE_READS is the shared list of tools that return page content, so a new
+  // read tool added there is gated here without a second hand-maintained list.
   if (!tabManagement.unrestrictedAccess
     && sharePageContent === 'off'
-    && (call.name === 'browser_snapshot' || call.name === 'browser_get_text')) {
+    && PAGE_READS.has(call.name)) {
     return { ok: false, error: { code: 'action-failed', message: 'Page content sharing is disabled in Settings > Page content sharing.' } }
   }
   const tab = targetTab ?? (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0]
@@ -698,13 +1099,25 @@ export async function dispatchToolCall(
     return { ok: false, error: { code: 'no-active-tab', message: 'No active tab is available for browser operations.' } }
   }
   if (targetStillAllowed?.() === false) return targetChanged()
+  const outsideRefusal = resolveTargetTab(tab.id, tabManagement)
+  if (outsideRefusal !== undefined) return outsideRefusal
+  const restrictedPage = classifyRestrictedPage(tab.url)
+  if (restrictedPage !== undefined && !TAB_NATIVE_TOOLS.has(call.name)) {
+    return restrictedPageAnswer(restrictedPage)
+  }
   const frames = await listTabFrames(tab.id, tab.url)
   if (isCancelled(call, signal)) return cancelled()
   if (targetStillAllowed?.() === false) return targetChanged()
   const frameError = validateFrameTarget(call, frames)
   if (frameError !== undefined) return frameError
+  // Validate real-input click arguments before element-baseline checks, so a
+  // malformed button/count/modifiers is always reported as bad-args.
+  if (call.name === 'browser_click' && clickRequestsRealInput(call.args)) {
+    const parsedClick = parseRealClickOptions(call.args)
+    if ('error' in parsedClick) return parsedClick.error
+  }
   if (!isInjectablePage(tab.url) && !TAB_NATIVE_TOOLS.has(call.name)) {
-    return unavailable('The current page DOM is protected by the browser. Only snapshot metadata, navigate, back, forward, and reload are available on this page.')
+    return unavailable('The current page DOM is protected by the browser. DOM actions and text reads that need the content script are unavailable on this page, while snapshot metadata, navigate, back, forward, reload, screenshot, resize, console and network telemetry, and JavaScript evaluation remain available.')
   }
   const targetError = validateElementTarget(call, tab.id, frames)
   if (targetError !== undefined) return targetError
@@ -733,12 +1146,33 @@ export async function dispatchToolCall(
     const refreshedTargetError = validateElementTarget(call, tab.id, executionFrames)
     if (refreshedTargetError !== undefined) return refreshedTargetError
   }
+  const backgroundAnswer = await dispatchBackgroundPageTool(
+    { id: tab.id, url: tab.url, windowId: tab.windowId },
+    call,
+    effectiveBudget,
+    signal,
+    tabManagement.commitAction,
+  )
+  if (backgroundAnswer !== undefined) return backgroundAnswer
+  const pointerAttempt = await dispatchRealPointerTool(
+    tab.id,
+    tab.url,
+    executionFrames,
+    call,
+    effectiveBudget,
+    tabManagement.unrestrictedAccess || sharePageContent === 'auto',
+    signal,
+    targetStillAllowed,
+    tabManagement.commitAction,
+  )
+  if (pointerAttempt?.answer !== undefined) return pointerAttempt.answer
+  const pointerDegradedNote = degradationNoteFor(call, pointerAttempt?.degradedNote)
   if (!isInjectablePage(tab.url)) {
     return await dispatchTabNativeTool(tab.id, tab.url, tab.title, tab.windowId, call, effectiveBudget, signal, targetStillAllowed, tabManagement.commitAction)
       ?? unavailable('The current page DOM is protected by the browser.')
   }
   try {
-    return await dispatchOnce(
+    return withPointerDegradation(await dispatchOnce(
       tab.id,
       executionFrames,
       call,
@@ -748,7 +1182,7 @@ export async function dispatchToolCall(
       tabManagement.unrestrictedAccess || sharePageContent === 'auto',
       tabManagement.commitAction,
       tabManagement.rollbackActionCommit,
-    )
+    ), pointerDegradedNote)
   } catch (error: unknown) {
     if (isCancelled(call, signal)) return cancelled()
     if (!contentScriptReceiverMissing(error)) {
@@ -779,7 +1213,7 @@ export async function dispatchToolCall(
           return unavailable('The page changed while the content script was loading. Call browser_snapshot again before retrying.')
         }
       }
-      return await dispatchOnce(
+      return withPointerDegradation(await dispatchOnce(
         tab.id,
         refreshedFrames,
         call,
@@ -789,10 +1223,387 @@ export async function dispatchToolCall(
         tabManagement.unrestrictedAccess || sharePageContent === 'auto',
         tabManagement.commitAction,
         tabManagement.rollbackActionCommit,
-      )
+      ), pointerDegradedNote)
     } catch {
       return unavailable('The content script did not answer after it was loaded. Call browser_snapshot again before retrying.')
     }
+  }
+}
+
+
+// ---- Background-native page tools (CDP with documented fallbacks) ----
+
+const EVALUATE_DEFAULT_MAX_CHARS = 20_000
+const EVALUATE_MAX_CHARS = 51_200
+const CONSOLE_DEFAULT_LIMIT = 100
+const NETWORK_DEFAULT_LIMIT = 100
+const EVALUATE_FALLBACK_PREFIX = '(evaluated without REPL semantics: add an explicit return)\n(evaluated without the browser debugger: this path always awaits the result, so await=false has no effect)\n'
+
+function badArgs(message: string): ToolAnswer {
+  return { ok: false, error: { code: 'bad-args', message } }
+}
+
+function toolFailure(error: unknown): ToolAnswer {
+  if (error instanceof DebuggerUnavailableError
+    || error instanceof JsResultNotSerializableError
+    || error instanceof ScreenshotTooLargeError) {
+    return { ok: false, error: { code: error.code, message: error.message } }
+  }
+  return {
+    ok: false,
+    error: { code: 'action-failed', message: error instanceof Error ? error.message : String(error) },
+  }
+}
+
+function truncateOutput(text: string, maxChars: number): string {
+  return text.length > maxChars
+    ? `${text.slice(0, maxChars)}\n[OUTPUT TRUNCATED: exceeded ${maxChars} characters]`
+    : text
+}
+
+function boundedInteger(value: unknown, fallback: number, min: number, max: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
+  return Math.min(Math.max(Math.floor(value), min), max)
+}
+
+function isScreenshotFormat(value: unknown): value is 'jpeg' | 'png' {
+  return value === 'jpeg' || value === 'png'
+}
+
+function parseScreenshotOptions(args: Record<string, unknown>): { options: ScreenshotOptions } | { error: string } {
+  const format = args.format === undefined ? 'jpeg' : args.format
+  if (!isScreenshotFormat(format)) return { error: 'format must be "jpeg" or "png".' }
+  const scale = args.scale === undefined ? 1 : args.scale
+  if (typeof scale !== 'number' || !Number.isFinite(scale) || scale < 0.1 || scale > 1) {
+    return { error: 'scale must be a number between 0.1 and 1.' }
+  }
+  const quality = args.quality === undefined ? 80 : args.quality
+  if (typeof quality !== 'number' || !Number.isFinite(quality) || quality < 1 || quality > 100) {
+    return { error: 'quality must be a number between 1 and 100.' }
+  }
+  let region: [number, number, number, number] | undefined
+  if (args.region !== undefined) {
+    const raw = args.region
+    if (!Array.isArray(raw) || raw.length !== 4 || raw.some((part) => typeof part !== 'number' || !Number.isFinite(part))) {
+      return { error: 'region must be four finite numbers [x0, y0, x1, y1].' }
+    }
+    const [x0, y0, x1, y1] = raw as [number, number, number, number]
+    if (x1 <= x0 || y1 <= y0) return { error: 'region must satisfy x1 > x0 and y1 > y0.' }
+    region = [x0, y0, x1, y1]
+  }
+  return {
+    options: {
+      scale,
+      format,
+      quality: Math.floor(quality),
+      ...(region === undefined ? {} : { region }),
+    },
+  }
+}
+
+/**
+ * Whether a fallback failure is the page's own execution policy, not a missing
+ * debugger. CSP refusals and sandboxed frames read as `debugger-unavailable`,
+ * which would send the model to the wrong remedy.
+ * @param detail - error text from the injected script.
+ * @returns true when the page refused to run the script.
+ */
+function pageRefusedExecution(detail: string): boolean {
+  return /content security policy|CSP|refused to execute|refused to evaluate|sandboxed|blocked script execution|permission denied|not allowed to load local resource/i.test(detail)
+}
+
+/** Fallback evaluated in the page's MAIN world when CDP cannot attach. */
+async function evaluateInMainWorld(code: string): Promise<unknown> {
+  const AsyncFunction = Object.getPrototypeOf(async function (): Promise<undefined> { return undefined }).constructor as new (body: string) => () => Promise<unknown>
+  const run = new AsyncFunction(code)
+  return await run()
+}
+
+async function evaluateWithoutDebugger(tabId: number, code: string): Promise<unknown> {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId, frameIds: [0] },
+    world: 'MAIN',
+    func: evaluateInMainWorld,
+    args: [code],
+  })
+  return results[0]?.result
+}
+
+async function dispatchEvaluateTool(
+  tab: { id: number; url?: string },
+  call: ToolCall,
+  commitAction?: () => void,
+): Promise<ToolAnswer> {
+  const code = typeof call.args.code === 'string' ? call.args.code : undefined
+  if (code === undefined || code.trim() === '') return badArgs('code must be a non-empty string.')
+  const restricted = classifyRestrictedPage(tab.url)
+  if (restricted !== undefined) return restrictedPageAnswer(restricted)
+  const maxChars = boundedInteger(call.args.max_chars, EVALUATE_DEFAULT_MAX_CHARS, 1, EVALUATE_MAX_CHARS)
+  const awaitPromise = call.args.await !== false
+  commitAction?.()
+  let text: string
+  try {
+    const outcome: EvaluateOutcome = await evaluateInPage(tab.id, code, awaitPromise)
+    text = formatEvaluationResult(outcome)
+  } catch (error: unknown) {
+    if (!(error instanceof DebuggerUnavailableError)) return toolFailure(error)
+    try {
+      const value = await evaluateWithoutDebugger(tab.id, code)
+      text = `${EVALUATE_FALLBACK_PREFIX}${formatEvaluationResult({ value })}`
+    } catch (fallbackError: unknown) {
+      const detail = fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
+      if (/object reference chain is too long|circular|could not (?:be )?serializ|not serializable/i.test(detail)) {
+        return {
+          ok: false,
+          error: {
+            code: 'js-result-not-serializable',
+            message: `The page value cannot be serialized. Return a string instead, for example: return JSON.stringify(value). (${detail})`,
+          },
+        }
+      }
+      if (pageRefusedExecution(detail)) {
+        return {
+          ok: false,
+          error: {
+            code: 'action-failed',
+            message: `The page's security policy refused to run JavaScript, so browser_evaluate cannot execute here (${detail}). Use the DOM tools instead: browser_snapshot, browser_get_text, browser_find, browser_click, browser_type.`,
+          },
+        }
+      }
+      return {
+        ok: false,
+        error: {
+          code: 'debugger-unavailable',
+          message: `JavaScript could not be evaluated: the browser debugger is unavailable and the page-side fallback failed (${detail}). Grant the debugger permission, or evaluate on a normal HTTP(S) page.`,
+        },
+      }
+    }
+  }
+  return { ok: true, result: { text: truncateOutput(text, maxChars) } }
+}
+
+async function dispatchScreenshotTool(
+  tab: { id: number; windowId?: number },
+  call: ToolCall,
+): Promise<ToolAnswer> {
+  const parsed = parseScreenshotOptions(call.args)
+  if ('error' in parsed) return badArgs(parsed.error)
+  const save = call.args.save !== false
+  let capture: ScreenshotCapture
+  try {
+    capture = await captureScreenshot(tab.id, parsed.options)
+  } catch (error: unknown) {
+    if (!(error instanceof DebuggerUnavailableError)) return toolFailure(error)
+    try {
+      capture = await captureVisibleTabScreenshot(tab.id, tab.windowId, parsed.options)
+    } catch (fallbackError: unknown) {
+      return toolFailure(fallbackError)
+    }
+  }
+  const format = capture.image.mimeType === 'image/png' ? 'png' : 'jpeg'
+  const notes = capture.notes ?? []
+  const qualityText = capture.quality === undefined
+    ? ''
+    : capture.quality.reduced
+      ? ` JPEG quality ${capture.quality.effective} (lowered from requested ${capture.quality.requested} by the size ladder).`
+      : ` JPEG quality ${capture.quality.effective} (requested).`
+  const head = `Screenshot captured (${capture.image.width}x${capture.image.height} px, ${format}).${qualityText} Viewport: ${capture.frame.viewportWidth}x${capture.frame.viewportHeight} CSS px (dpr ${capture.frame.dpr}).`
+  const text = [
+    head,
+    ...notes,
+    // The host writes the file itself; without `save` the base64 payload must
+    // not cross the bridge at all, and the caller reports dimensions only.
+    ...(save ? [] : ['Not saved (save=false): only the dimensions were measured, and the image bytes were not transferred.']),
+  ].join('\n')
+  const image = save
+    ? capture.image
+    : { mimeType: capture.image.mimeType, width: capture.image.width, height: capture.image.height }
+  return { ok: true, result: { text, image, frame: capture.frame } }
+}
+
+async function enablePageInstrumentation(tabId: number, pageUrl: string | undefined): Promise<ToolAnswer | undefined> {
+  try {
+    // The isolated world must exist before the hook, because it owns the
+    // channel check that keeps look-alike page events out of the telemetry
+    // buffer. Entry payloads stay untrusted page content.
+    try {
+      await injectContentScript(tabId)
+    } catch {
+      // The script may already be present from an earlier injection.
+    }
+    const channel = instrumentChannelFor(tabId)
+    try {
+      await chrome.tabs.sendMessage(tabId, { type: 'DSH_INSTRUMENT_CHANNEL', channel }, { frameId: 0 })
+    } catch {
+      // Fail closed: without the handshake the isolated world forwards nothing,
+      // which is safe, and the hook install below still reports page limits.
+    }
+    await installPageInstrumentation(tabId, channel)
+    seedTelemetryDomain(tabId, pageUrl)
+    return undefined
+  } catch (error: unknown) {
+    const detail = error instanceof Error ? error.message : String(error)
+    return {
+      ok: false,
+      error: {
+        code: 'debugger-unavailable',
+        message: `The browser debugger is unavailable, and the page-side hook could not be installed (${detail}). Grant the debugger permission, or use a normal HTTP(S) page.`,
+      },
+    }
+  }
+}
+
+async function dispatchConsoleTool(
+  tab: { id: number; url?: string },
+  call: ToolCall,
+  budget: ContentBudget,
+): Promise<ToolAnswer> {
+  const onlyErrors = call.args.only_errors === true
+  const clear = call.args.clear === true
+  const pattern = typeof call.args.pattern === 'string' && call.args.pattern !== '' ? call.args.pattern : undefined
+  const limit = boundedInteger(call.args.limit, CONSOLE_DEFAULT_LIMIT, 1, 1_000)
+  let fallback = false
+  try {
+    await startConsoleCapture(tab.id, tab.url)
+  } catch (error: unknown) {
+    if (!(error instanceof DebuggerUnavailableError)) return toolFailure(error)
+    fallback = true
+    const refused = await enablePageInstrumentation(tab.id, tab.url)
+    if (refused !== undefined) return refused
+  }
+  const read = readConsoleMessages(tab.id, { onlyErrors, pattern, limit, clear })
+  const patternNotes: string[] = []
+  if (read.patternDegraded === true) {
+    patternNotes.push(`The pattern is longer than ${CONSOLE_PATTERN_MAX_LENGTH} characters or too expensive to run as a regular expression, so matching degraded to a case-insensitive substring test of the first ${CONSOLE_PATTERN_MATCH_PREFIX} characters of each message.`)
+  }
+  if (read.patternAbandoned === true) {
+    patternNotes.push(`Pattern matching stopped after ${CONSOLE_PATTERN_BUDGET_MS} ms because the pattern was too expensive for this buffer; messages after the stop point were not tested. Narrow the pattern or omit it to inspect the messages.`)
+  }
+  const patternNote = patternNotes.length === 0 ? '' : `\n\n(${patternNotes.join(' ')})`
+  if (read.cleared) {
+    // `clear` discards the buffer after this read, so the selected messages
+    // still leave the page; the status states how many were returned and how
+    // many the clear actually discarded.
+    if (read.messages.length === 0) {
+      const text = read.bufferTotal === 0
+        ? 'Cleared 0 console message(s) for this tab.'
+        : `Cleared 0 matching console message(s); returned 0 of 0 matching, then cleared all ${read.bufferTotal} buffered message(s) for this tab.`
+      return { ok: true, result: { text: truncateOutput(`${text}${patternNote}`, budget.maxChars) } }
+    }
+    return {
+      ok: true,
+      result: {
+        text: truncateOutput(
+          `${formatConsoleMessages(read.messages, fallback)}${patternNote}\n\n(From ${read.bufferTotal} buffered console message(s): returned ${read.messages.length} of ${read.total} matching, then cleared all ${read.bufferTotal} buffered message(s) for this tab.)`,
+          budget.maxChars,
+        ),
+      },
+    }
+  }
+  return { ok: true, result: { text: truncateOutput(`${formatConsoleMessages(read.messages, fallback)}${patternNote}`, budget.maxChars) } }
+}
+
+async function dispatchNetworkTool(
+  tab: { id: number; url?: string },
+  call: ToolCall,
+  budget: ContentBudget,
+): Promise<ToolAnswer> {
+  const urlPattern = typeof call.args.url_pattern === 'string' && call.args.url_pattern !== '' ? call.args.url_pattern : undefined
+  const clear = call.args.clear === true
+  const limit = boundedInteger(call.args.limit, NETWORK_DEFAULT_LIMIT, 1, 1_000)
+  let fallback = false
+  try {
+    await startNetworkCapture(tab.id, tab.url)
+  } catch (error: unknown) {
+    if (!(error instanceof DebuggerUnavailableError)) return toolFailure(error)
+    fallback = true
+    const refused = await enablePageInstrumentation(tab.id, tab.url)
+    if (refused !== undefined) return refused
+  }
+  const read = readNetworkRequests(tab.id, { urlPattern, limit, clear })
+  if (read.cleared) {
+    // `clear` discards the buffer after this read, so the selected requests
+    // still leave the page; the status states how many were returned and how
+    // many the clear actually discarded.
+    if (read.requests.length === 0) {
+      const text = read.bufferTotal === 0
+        ? 'Cleared 0 network request(s) for this tab.'
+        : `Cleared 0 matching network request(s); returned 0 of 0 matching, then cleared all ${read.bufferTotal} buffered request(s) for this tab.`
+      return { ok: true, result: { text: truncateOutput(text, budget.maxChars) } }
+    }
+    return {
+      ok: true,
+      result: {
+        text: truncateOutput(
+          `${formatNetworkRequests(read.requests, fallback)}\n\n(From ${read.bufferTotal} buffered network request(s): returned ${read.requests.length} of ${read.total} matching, then cleared all ${read.bufferTotal} buffered request(s) for this tab.)`,
+          budget.maxChars,
+        ),
+      },
+    }
+  }
+  return { ok: true, result: { text: truncateOutput(formatNetworkRequests(read.requests, fallback), budget.maxChars) } }
+}
+
+async function dispatchResizeTool(tabId: number, call: ToolCall, commitAction?: () => void): Promise<ToolAnswer> {
+  const width = call.args.width
+  const height = call.args.height
+  if (typeof width !== 'number' || !Number.isFinite(width) || width < 1 || width > 7_680
+    || typeof height !== 'number' || !Number.isFinite(height) || height < 1 || height > 4_320) {
+    return badArgs('width and height must be numbers within 1..7680 and 1..4320.')
+  }
+  const targetWidth = Math.floor(width)
+  const targetHeight = Math.floor(height)
+  let tab: chrome.tabs.Tab
+  try {
+    tab = await chrome.tabs.get(tabId)
+  } catch {
+    return unavailable(`Tab ${tabId} is no longer open. Call browser_list_tabs again.`)
+  }
+  if (tab.windowId === undefined) {
+    return { ok: false, error: { code: 'action-failed', message: `Tab ${tabId} is not attached to a browser window.` } }
+  }
+  commitAction?.()
+  try {
+    await chrome.windows.update(tab.windowId, { width: targetWidth, height: targetHeight })
+  } catch (error: unknown) {
+    const detail = error instanceof Error ? error.message : String(error)
+    return { ok: false, error: { code: 'action-failed', message: `The window holding tab ${tabId} could not be resized: ${detail}` } }
+  }
+  return {
+    ok: true,
+    result: { text: `Resized the window holding tab ${tabId} to ${targetWidth}x${targetHeight}. The page layout may have changed; take a new snapshot.` },
+  }
+}
+
+/**
+ * Dispatch a tool the background worker executes itself.
+ *
+ * The caller has already resolved this tab through tab affinity and
+ * tab-isolation, so a debugger attachment made below only ever covers a tab
+ * this session owns. Everything here must degrade rather than throw when the
+ * browser refuses the debugger.
+ */
+async function dispatchBackgroundPageTool(
+  tab: { id: number; url?: string; windowId?: number },
+  call: ToolCall,
+  budget: ContentBudget,
+  signal: AbortSignal | undefined,
+  commitAction?: () => void,
+): Promise<ToolAnswer | undefined> {
+  if (!BACKGROUND_PAGE_TOOLS.has(call.name)) return undefined
+  if (isCancelled(call, signal)) return cancelled()
+  try {
+    switch (call.name) {
+      case 'browser_evaluate': return await dispatchEvaluateTool(tab, call, commitAction)
+      case 'browser_screenshot': return await dispatchScreenshotTool(tab, call)
+      case 'browser_console': return await dispatchConsoleTool(tab, call, budget)
+      case 'browser_network': return await dispatchNetworkTool(tab, call, budget)
+      case 'browser_resize': return await dispatchResizeTool(tab.id, call, commitAction)
+      default: return undefined
+    }
+  } catch (error: unknown) {
+    if (isCancelled(call, signal)) return cancelled()
+    return toolFailure(error)
   }
 }
 
@@ -807,7 +1618,13 @@ function validateFrameTarget(call: ToolCall, frames: TabFrame[]): ToolAnswer | u
 }
 
 function validateElementTarget(call: ToolCall, tabId: number, frames: TabFrame[]): ToolAnswer | undefined {
-  if (call.name !== 'browser_click' && call.name !== 'browser_type') return undefined
+  if (!ELEMENT_TARGET_TOOLS.has(call.name)) return undefined
+  // Coordinate-addressed calls (hover x/y, drag x/y) do not read a snapshot
+  // element, so they have no baseline to check.
+  const elementAddressed = call.name === 'browser_drag'
+    ? typeof call.args.from_index === 'number' && typeof call.args.to_index === 'number'
+    : typeof call.args.index === 'number'
+  if (!elementAddressed) return undefined
   const frameId = requestedFrame(call.args)
   const frame = frames.find((candidate) => candidate.frameId === frameId)
   const snapshotted = snapshotDocumentsByTab.get(tabId)?.get(frameId)

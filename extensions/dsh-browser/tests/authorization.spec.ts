@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from 'vitest'
-import { approvalPromptForCall, originFromUrl } from '../src/background/authorization.ts'
+import { approvalPromptForCall, isCrossOriginPrompt, originFromUrl } from '../src/background/authorization.ts'
 import type { TabFrame } from '../src/background/frames.ts'
 import type { ToolCall } from '../src/background/tools.ts'
 
@@ -8,6 +8,12 @@ const FRAMES: TabFrame[] = [
   { frameId: 0, parentFrameId: -1, documentId: 'top', url: 'https://app.example/page' },
   { frameId: 4, parentFrameId: 0, documentId: 'child', url: 'https://login.example.net/form' },
   { frameId: 5, parentFrameId: 4, documentId: 'about', url: 'about:blank' },
+]
+
+/** The same page plus an iframe that shares its origin. */
+const SAME_SITE_FRAMES: TabFrame[] = [
+  { frameId: 0, parentFrameId: -1, documentId: 'top', url: 'https://app.example/page' },
+  { frameId: 1, parentFrameId: 0, documentId: 'same', url: 'https://app.example/embed' },
 ]
 
 function call(name: string, args: Record<string, unknown> = {}): ToolCall {
@@ -24,19 +30,38 @@ describe('approvalPromptForCall', () => {
     expect(approvalPromptForCall(call('browser_snapshot'), 'auto', FRAMES, 'zh')).toBeUndefined()
   })
 
-  it('scopes a frame-local action to the frame origin and redacts typed text', () => {
+  it('scopes a same-origin frame-local action and redacts typed text', () => {
+    const prompt = approvalPromptForCall(call('browser_type', {
+      frame: 1,
+      index: 7,
+      text: 'my-password-must-not-appear',
+    }), 'auto', SAME_SITE_FRAMES, 'zh')
+
+    expect(prompt).toMatchObject({
+      kind: 'action',
+      origins: ['https://app.example'],
+      canTrust: true,
+    })
+    expect(prompt?.summary).toContain('27 个字符')
+    expect(prompt?.summary).not.toContain('my-password')
+  })
+
+  it('keeps a third-party frame action on its own origin without a migration prompt', () => {
     const prompt = approvalPromptForCall(call('browser_type', {
       frame: 4,
       index: 7,
       text: 'my-password-must-not-appear',
     }), 'auto', FRAMES, 'zh')
 
+    // An embedded frame is not a page migration: the action applies the frame
+    // origin's ordinary trust rules instead of prompting on every click.
     expect(prompt).toMatchObject({
       kind: 'action',
       origins: ['https://login.example.net'],
       canTrust: true,
     })
-    expect(prompt?.summary).toContain('27 个字符')
+    expect(isCrossOriginPrompt(prompt!)).toBe(false)
+    expect(prompt?.summary).not.toContain('跨域')
     expect(prompt?.summary).not.toContain('my-password')
   })
 
@@ -48,22 +73,37 @@ describe('approvalPromptForCall', () => {
     expect(prompt).toMatchObject({
       origins: ['https://app.example', 'https://bank.example'],
       canTrust: false,
-      summary: '导航到 https://bank.example/transfer',
+      crossOrigin: true,
+      fromOrigin: 'https://app.example',
+      toOrigin: 'https://bank.example',
     })
+    expect(prompt?.summary).toBe('导航到 https://bank.example/transfer（跨域 app.example → bank.example）')
     expect(prompt?.summary).not.toContain('secret')
   })
 
-  it('approves opening a new tab against only the destination origin', () => {
+  it('asks separately for a cross-origin new tab and never offers trust', () => {
     const prompt = approvalPromptForCall(call('browser_open_tab', {
       url: 'https://docs.example/guide?token=secret#section',
     }), 'auto', FRAMES, 'zh')
 
     expect(prompt).toMatchObject({
       origins: ['https://docs.example'],
-      canTrust: true,
-      summary: '在新标签页打开 https://docs.example/guide',
+      canTrust: false,
+      crossOrigin: true,
+      fromOrigin: 'https://app.example',
+      toOrigin: 'https://docs.example',
     })
+    expect(prompt?.summary).toBe('在新标签页打开 https://docs.example/guide（跨域 app.example → docs.example）')
     expect(prompt?.summary).not.toContain('secret')
+  })
+
+  it('keeps trust for a new tab on the page’s own origin', () => {
+    const prompt = approvalPromptForCall(call('browser_open_tab', {
+      url: 'https://app.example/other',
+    }), 'auto', FRAMES, 'zh')
+
+    expect(prompt).toMatchObject({ origins: ['https://app.example'], canTrust: true })
+    expect(isCrossOriginPrompt(prompt!)).toBe(false)
   })
 
   it('labels background tab opens in the approval summary', () => {
@@ -74,8 +114,8 @@ describe('approvalPromptForCall', () => {
 
     expect(prompt).toMatchObject({
       origins: ['https://docs.example'],
-      canTrust: true,
-      summary: '在后台新标签页打开 https://docs.example/guide',
+      canTrust: false,
+      summary: '在后台新标签页打开 https://docs.example/guide（跨域 app.example → docs.example）',
     })
   })
 

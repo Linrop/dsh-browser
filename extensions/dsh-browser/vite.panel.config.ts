@@ -12,9 +12,12 @@ export default defineConfig({
     rollupOptions: {
       input: resolve(import.meta.dirname, 'panel/index.html'),
       output: {
-        entryFileNames: 'panel/assets/[name].js',
+        entryFileNames: 'panel/assets/[name]-[hash].js',
         chunkFileNames: 'panel/assets/[name]-[hash].js',
-        assetFileNames: 'panel/assets/[name][extname]',
+        // Content-hashed asset names: Chrome may keep the previous stylesheet
+        // for a fixed URL across extension reloads, which made UI edits look
+        // unapplied; the hash changes the URL with the content.
+        assetFileNames: 'panel/assets/[name]-[hash][extname]',
       },
     },
   },

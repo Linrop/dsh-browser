@@ -4,7 +4,7 @@ English | [中文](README.zh.md)
 
 The **browser-operation end** of dsh: the model reads and operates the browser page you have open — extract content, click elements, fill forms, scroll, and navigate, all in the real page with your login state preserved. The side panel is the conversation entry.
 
-**Two explicit channels**: browser pages are still rendered as structured text (a numbered interactive-element inventory), so browser tools never take screenshots. Separately, a dsh 0.1.2 host can advertise multimodal image limits; the side panel then accepts PNG, JPEG, WebP, and GIF attachments and renders their durable history references.
+**Two explicit channels**: browser pages are still rendered as structured text (a numbered interactive-element inventory), so browser reads stay text; a screenshot is captured only when the model explicitly asks for `browser_screenshot`, which the host saves as a file. Separately, a dsh 0.1.2 host can advertise multimodal image limits; the side panel then accepts PNG, JPEG, WebP, and GIF attachments and renders their durable history references.
 
 ## What the model can do
 
@@ -21,6 +21,16 @@ The **browser-operation end** of dsh: the model reads and operates the browser p
 | Close tab | `browser_close_tab` | Close a listed tab |
 | Read region | `browser_get_text` | Lazy-loaded content / partial text |
 | Wait | `browser_wait` | Page load and render-settle detection |
+| Choose an option | `browser_select` | Select by option value, label, or index; an unmatched value lists the available options |
+| Search the inventory | `browser_find` | Rank inventory elements by a query and return the closest indices |
+| Attach files | `browser_upload_file` | Build `File` objects from host-supplied bytes and set them on a file input |
+| Hover / drag | `browser_hover` / `browser_drag` | Real input events through a debugger session on the controlled tab; synthesized DOM events when it cannot attach |
+| Click variants | `browser_click` with `button` / `count` / `modifiers` | Right/middle click, double/triple click, and modifier chords through a debugger session |
+| Run page JavaScript | `browser_evaluate` | Requires approval; results are redacted and length-capped |
+| Screenshot | `browser_screenshot` | Whole viewport or a clipped region, saved by the host as a file path |
+| Console and network | `browser_console` / `browser_network` | Buffered per tab from the first call; headers and URL credentials redacted, request bodies recorded as byte counts only |
+| Resize the window | `browser_resize` | Resize the window holding the controlled tab |
+| Batch | `browser_batch` | Sequential tool calls with stop-on-first-error |
 | Chat with images | `session.prompt` / `session.attachment` | Host-gated image selection, image-only sends, and durable history previews |
 | Quote what you highlight | side panel composer | The text you select in the page becomes a quote in the composer and rides along with your next message |
 
@@ -119,7 +129,7 @@ For extension-only development, load `extensions/dsh-browser/dist/` from `chrome
 
 ## Permissions
 
-Chrome uses `sidePanel`; Firefox uses `sidebar_action`. Both request `storage` (settings and recent-session continuity), `notifications` (optional reminders for approvals received while the panel is closed), `tabs` + `activeTab` + `scripting` (observe tab changes and inject/message the explicitly controlled tab, including lazy recovery for pages opened before install), `webNavigation` (enumerate and bind messages to that tab's frame documents), `alarms` (background keepalive), and `http/https` (content-script injection on normal pages). Firefox's AMO manifest declares the browsing activity, website content/activity, and personal communications that the add-on sends to the configured dsh/model service. The extension never changes the visible tab or silently follows a manual switch; background operation happens only after the user chooses to stay on the original tab.
+Chrome uses `sidePanel`; Firefox uses `sidebar_action`. Both request `storage` (settings and recent-session continuity), `notifications` (optional reminders for approvals received while the panel is closed), `tabs` + `activeTab` + `scripting` (observe tab changes and inject/message the explicitly controlled tab, including lazy recovery for pages opened before install), `webNavigation` (enumerate and bind messages to that tab's frame documents), `alarms` (background keepalive), and `http/https` (content-script injection on normal pages). Both also request `debugger`, used only for the controlled tab: it carries real pointer input, page JavaScript evaluation, clip/scale screenshots, and the console/network buffers. Chrome shows its "started debugging this browser" bar while a debugger session is attached; dismissing that bar detaches the session, and every tool that needed it falls back to the DOM-only implementation and says so. Firefox does not expose `chrome.debugger`; the extension detects the missing API and degrades every debugger-dependent tool to its DOM-only implementation instead of throwing. Firefox's AMO manifest declares the browsing activity, website content/activity, and personal communications that the add-on sends to the configured dsh/model service. The extension never changes the visible tab or silently follows a manual switch; background operation happens only after the user chooses to stay on the original tab.
 
 ## Known limitations
 
@@ -130,3 +140,6 @@ Chrome uses `sidePanel`; Firefox uses `sidebar_action`. Both request `storage` (
 - No automatic token rotation.
 - Synthetic `browser_press` events do not trigger browser-native default actions such as Tab focus movement, arrow-key scrolling, or Enter activation; use manual input when a workflow depends on those defaults.
 - `browser_wait` considers page load plus a fixed quiet window, but does not observe continuously changing DOM state; a live-updating SPA may be reported as stable.
+- Real pointer input, clip/scale screenshots, page JavaScript evaluation, and the console/network buffers all depend on a debugger session scoped to the controlled tab. The session attaches on demand, detaches after 60 seconds idle or when the tab leaves the session's ownership, and never targets a tab the user has not handed to this session. If the user dismisses Chrome's debugging bar, those tools fall back to DOM-only behavior and say so in the result.
+- The fallback screenshot path uses `captureVisibleTab`, so it can only capture the visible area of the active tab and ignores `scale`; the debugger path captures the controlled tab with clip and scale.
+- `browser_console` and `browser_network` start recording at the first call on a tab. Without a debugger session they hook `console`, `fetch`, and `XMLHttpRequest` in the page world, which misses requests issued before the hook, document/resource requests, and service-worker traffic; the result says which path produced it.

@@ -1,9 +1,7 @@
 :root {
   color-scheme: light;
-  /* Panel-wide text scale. The side panel has no browser zoom control, so the
-     topbar "Aa" button writes this token and every font-size is a multiple of
-     it. Only type scales: the px-based spacing and icon sizes stay put, which
-     keeps the narrow panel's layout intact at large sizes. */
+  /* Panel-wide text scale. Text no longer has a user-facing control, so the
+     token stays 1 while the existing calc() type rules keep reading it. */
   --ui-scale: 1;
   --canvas: #f4f6fa;
   --canvas-deep: #edf0f6;
@@ -111,7 +109,7 @@ textarea:focus-visible {
   display: grid;
   min-height: 58px;
   flex: 0 0 auto;
-  grid-template-columns: minmax(70px, 1fr) minmax(0, 1.75fr) minmax(106px, 1fr);
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
   padding: 10px 14px;
@@ -363,42 +361,30 @@ textarea:focus-visible {
 
 .connection {
   display: inline-flex;
-  max-width: 100%;
-  min-width: 0;
-  min-height: 26px;
+  flex: 0 0 auto;
   align-items: center;
   justify-self: start;
-  gap: 6px;
-  padding: 4px 8px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: var(--surface);
-  color: var(--muted);
-  font-size: calc(10.5px * var(--ui-scale));
-  font-weight: 600;
-  line-height: 1;
-  white-space: nowrap;
-}
-
-.connection-label {
-  overflow: hidden;
-  text-overflow: ellipsis;
+  padding: 4px;
 }
 
 .session-menu-trigger {
   display: inline-flex;
+  /* Content-sized pill: the middle grid cell stretches, the chip must not
+     follow it or it reads as a text field. `max-width` keeps long titles
+     ellipsizing inside the cell. */
+  width: max-content;
   min-width: 0;
   max-width: 100%;
-  min-height: 34px;
+  min-height: 32px;
   align-items: center;
   justify-content: center;
   justify-self: center;
   gap: 5px;
   padding: 5px 9px 5px 11px;
-  border: 1px solid transparent;
-  border-radius: 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
   outline: none;
-  background: transparent;
+  background: var(--surface);
   color: var(--ink-strong);
   cursor: pointer;
   font-size: calc(13.5px * var(--ui-scale));
@@ -422,13 +408,13 @@ textarea:focus-visible {
   stroke: currentColor;
   stroke-linecap: round;
   stroke-linejoin: round;
-  stroke-width: 1.7;
+  stroke-width: 1.25;
   transition: transform 150ms ease;
 }
 
 .session-menu-trigger:hover:not(:disabled),
 .session-menu-trigger[aria-expanded="true"] {
-  border-color: var(--line);
+  border-color: var(--line-strong);
   background: var(--canvas);
 }
 
@@ -484,7 +470,7 @@ textarea:focus-visible {
   stroke: currentColor;
   stroke-linecap: round;
   stroke-linejoin: round;
-  stroke-width: 1.55;
+  stroke-width: 1.25;
 }
 
 .icon-button:hover {
@@ -510,6 +496,74 @@ textarea:focus-visible {
   align-items: center;
   gap: 6px;
   justify-self: end;
+}
+
+.record-trigger.recording {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+  color: var(--blue-ink);
+}
+
+.recording-strip {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--blue-wash);
+  color: var(--blue-ink);
+  font-size: calc(11px * var(--ui-scale));
+}
+
+.recording-dot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--faint);
+}
+
+.recording-strip.active .recording-dot {
+  background: var(--blue);
+  animation: recording-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes recording-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.diagnostics > div {
+  display: grid;
+  gap: 2px;
+}
+
+.diagnostics dl {
+  display: grid;
+  gap: 4px;
+  margin: 8px 0 0;
+}
+
+.diagnostics dl > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.diagnostics dt {
+  color: var(--muted);
+}
+
+.diagnostics dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
 }
 
 .new-session-trigger {
@@ -584,7 +638,7 @@ textarea:focus-visible {
   stroke: currentColor;
   stroke-linecap: round;
   stroke-linejoin: round;
-  stroke-width: 1.7;
+  stroke-width: 1.25;
 }
 
 .scroll-to-bottom:hover {
@@ -891,7 +945,7 @@ textarea:focus-visible {
   stroke: currentColor;
   stroke-linecap: round;
   stroke-linejoin: round;
-  stroke-width: 1.55;
+  stroke-width: 1.25;
 }
 
 .tool-copy {
@@ -1396,22 +1450,26 @@ textarea:focus-visible {
 
 .composer {
   flex: 0 0 auto;
-  padding: 8px 12px 12px;
-  background: var(--canvas);
+  padding: 0 8px 4px;
 }
 
+/* Input card: the hairline stroke is an inset ring rather than a border so it
+   costs no layout; the soft outer shadow is the elevation tier. */
 .composer-box {
+  display: flex;
   overflow: hidden;
-  border: 1px solid var(--line-strong);
-  border-radius: 17px;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 8px;
+  border: 0;
+  border-radius: 20px;
   background: var(--surface);
-  box-shadow: var(--shadow);
-  transition: border-color 150ms ease, box-shadow 150ms ease;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.08), 0 2px 6px rgba(23, 32, 51, 0.06);
+  transition: box-shadow 150ms ease;
 }
 
 .composer-box:focus-within {
-  border-color: #aebcff;
-  box-shadow: 0 0 0 3px rgba(77, 107, 254, 0.1), var(--shadow);
+  box-shadow: inset 0 0 0 1px rgba(77, 107, 254, 0.4), 0 2px 6px rgba(23, 32, 51, 0.06);
 }
 
 /* Page selection: the quote the user attached, in the composer and in the
@@ -1424,7 +1482,7 @@ textarea:focus-visible {
 }
 
 .composer-box > .page-selection {
-  padding: 10px 12px 0;
+  padding: 0 14px;
 }
 
 .page-selection-quote,
@@ -1506,7 +1564,7 @@ textarea:focus-visible {
   display: flex;
   overflow-x: auto;
   gap: 7px;
-  padding: 10px 12px 0;
+  padding: 0 14px;
 }
 
 .draft-image {
@@ -1545,17 +1603,20 @@ textarea:focus-visible {
 
 .composer textarea {
   display: block;
-  width: 100%;
-  min-height: 55px;
+  width: auto;
+  min-height: 36px;
   max-height: 150px;
-  padding: 12px 13px 7px;
+  /* keeps the bar off the card's right edge; the right pad gives the 4px
+     back so the text column is unchanged. */
+  margin-right: 4px;
+  padding: 4px 8px 0 14px;
   resize: none;
   border: 0;
   outline: none;
   background: transparent;
   color: var(--ink);
-  font-size: calc(12.5px * var(--ui-scale));
-  line-height: 1.5;
+  font-size: calc(14px * var(--ui-scale));
+  line-height: 24px;
 }
 
 .composer textarea::placeholder,
@@ -1580,19 +1641,19 @@ textarea:focus-visible {
 .composer-model-trigger {
   display: inline-flex;
   max-width: min(280px, 100%);
-  min-height: 28px;
+  height: 28px;
   align-items: center;
   gap: 4px;
-  padding: 0 8px 0 10px;
-  border: 1px solid var(--line);
+  padding: 0 6px 0 8px;
+  border: 0;
   border-radius: 8px;
-  background: var(--canvas);
+  background: transparent;
   color: var(--muted);
   cursor: pointer;
   font: inherit;
-  font-size: calc(11px * var(--ui-scale));
-  font-weight: 600;
-  line-height: 1.2;
+  font-size: calc(13px * var(--ui-scale));
+  font-weight: 500;
+  line-height: 20px;
 }
 
 .composer-model-trigger > span {
@@ -1602,21 +1663,20 @@ textarea:focus-visible {
 }
 
 .composer-model-trigger svg {
-  width: 13px;
-  height: 13px;
+  width: 12px;
+  height: 12px;
   flex: 0 0 auto;
   fill: none;
   stroke: currentColor;
   stroke-linecap: round;
   stroke-linejoin: round;
-  stroke-width: 1.7;
+  stroke-width: 1.25;
   transition: transform 150ms ease;
 }
 
 .composer-model-trigger:hover:not(:disabled),
 .composer-model-trigger[aria-expanded="true"] {
-  border-color: var(--line-strong);
-  background: var(--surface);
+  background: var(--canvas-deep);
   color: var(--ink);
 }
 
@@ -1703,27 +1763,18 @@ textarea:focus-visible {
 
 .composer-actions {
   display: flex;
-  min-height: 37px;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 4px 6px 6px 13px;
+  padding: 2px 8px 6px;
 }
 
 .composer-actions-start {
   display: flex;
   min-width: 0;
   align-items: center;
-  gap: 7px;
-}
-
-.composer-actions-start > span {
-  overflow: hidden;
-  color: var(--faint);
-  font-size: calc(9.5px * var(--ui-scale));
-  line-height: 1;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  gap: 8px;
 }
 
 .image-file-input {
@@ -1732,18 +1783,20 @@ textarea:focus-visible {
 
 .composer-actions button {
   display: grid;
-  width: 30px;
-  height: 30px;
+  width: 34px;
+  height: 34px;
   flex: 0 0 auto;
   padding: 0;
   place-items: center;
-  border: 1px solid var(--blue);
-  border-radius: 10px;
+  border: 0;
+  border-radius: 999px;
   background: var(--blue);
   color: #ffffff;
   cursor: pointer;
-  box-shadow: 0 4px 10px rgba(77, 107, 254, 0.22);
-  transition: background-color 150ms ease, border-color 150ms ease, transform 150ms ease;
+  /* Opts out of the row's 2px downward shift so the larger send circle keeps
+     its seat against the 28px controls. */
+  transform: translateY(-2px);
+  transition: background-color 150ms ease, opacity 150ms ease;
 }
 
 .composer-actions button svg {
@@ -1753,47 +1806,41 @@ textarea:focus-visible {
   stroke: currentColor;
   stroke-linecap: round;
   stroke-linejoin: round;
-  stroke-width: 1.8;
+  stroke-width: 1.25;
 }
 
 .composer-actions button:hover:not(:disabled) {
-  border-color: var(--blue-hover);
   background: var(--blue-hover);
-  transform: translateY(-1px);
 }
 
 .composer-actions button.attachment-button {
-  width: 27px;
-  height: 27px;
-  border-color: transparent;
-  border-radius: 9px;
-  background: transparent;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--canvas-deep);
   color: var(--muted);
-  box-shadow: none;
+  transform: none;
 }
 
 .composer-actions button.attachment-button:hover:not(:disabled) {
-  border-color: var(--line);
-  background: var(--canvas-deep);
+  background: var(--line);
   color: var(--blue-ink);
 }
 
 .composer-actions button.attachment-button:disabled {
-  border-color: transparent;
-  background: transparent;
+  background: var(--canvas-deep);
   color: var(--faint);
 }
 
 .composer-actions button.stop-button {
-  border-color: var(--navy);
-  border-radius: 50%;
+  border: 0;
+  border-radius: 999px;
   background: var(--navy);
   color: #ffffff;
-  box-shadow: 0 4px 10px rgba(24, 32, 51, 0.2);
 }
 
 .composer-actions button.stop-button:hover:not(:disabled) {
-  border-color: #29334a;
   background: #29334a;
 }
 
@@ -1805,11 +1852,13 @@ textarea:focus-visible {
 }
 
 .composer-actions button:disabled {
-  border-color: #e3e7ee;
-  background: #e8ebf1;
-  color: #aeb6c4;
+  opacity: .4;
   cursor: default;
-  box-shadow: none;
+}
+
+.composer-actions button.stop-button:disabled {
+  opacity: 1;
+  cursor: progress;
 }
 
 .settings {
@@ -2480,7 +2529,7 @@ textarea:focus-visible {
   stroke: currentColor;
   stroke-linecap: round;
   stroke-linejoin: round;
-  stroke-width: 1.6;
+  stroke-width: 1.25;
 }
 
 .approval-detail,
@@ -2631,8 +2680,7 @@ textarea:focus-visible {
   }
 
   .connection {
-    gap: 5px;
-    padding-inline: 6px;
+    padding-inline: 2px;
   }
 
   .session-menu-trigger {
@@ -2988,109 +3036,4 @@ textarea:focus-visible {
 .relay-fetch:disabled {
   cursor: default;
   opacity: .55;
-}
-.text-size-panel {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 10px;
-  margin: 8px 12px 10px;
-  padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--surface);
-  box-shadow: var(--shadow);
-}
-
-.text-size-panel > strong {
-  min-width: 0;
-  flex: 1 1 auto;
-  overflow: hidden;
-  color: var(--ink-strong);
-  font-size: calc(11.5px * var(--ui-scale));
-  font-weight: 680;
-  letter-spacing: -0.01em;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.text-size-stepper {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 2px;
-  padding: 2px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: var(--canvas);
-}
-
-.text-size-stepper button {
-  display: grid;
-  width: 24px;
-  height: 24px;
-  padding: 0;
-  place-items: center;
-  border: none;
-  border-radius: 999px;
-  background: transparent;
-  color: var(--ink);
-  cursor: pointer;
-  transition: background-color 150ms ease, color 150ms ease;
-}
-
-.text-size-stepper button svg {
-  width: 14px;
-  height: 14px;
-  fill: none;
-  stroke: currentColor;
-  stroke-linecap: round;
-  stroke-width: 1.8;
-}
-
-.text-size-stepper button:hover:not(:disabled) {
-  background: var(--surface);
-  color: var(--blue-ink);
-}
-
-.text-size-stepper button:disabled {
-  opacity: 0.35;
-  cursor: not-allowed;
-}
-
-.text-size-value {
-  min-width: 42px;
-  color: var(--muted);
-  font-size: calc(10.5px * var(--ui-scale));
-  font-weight: 680;
-  font-variant-numeric: tabular-nums;
-  text-align: center;
-}
-
-.text-size-reset {
-  flex: 0 0 auto;
-  padding: 5px 10px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--surface);
-  color: var(--muted);
-  cursor: pointer;
-  font-size: calc(10.5px * var(--ui-scale));
-  font-weight: 680;
-}
-
-.text-size-reset:hover:not(:disabled) {
-  border-color: var(--line-strong);
-  color: var(--ink);
-}
-
-.text-size-reset:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-.text-size-trigger[aria-expanded="true"] {
-  border-color: var(--line);
-  background: var(--canvas);
-  color: var(--ink-strong);
 }
