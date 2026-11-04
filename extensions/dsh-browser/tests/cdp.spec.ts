@@ -10,6 +10,7 @@ import {
   MAX_LOGS_PER_TAB,
   MAX_REQUESTS_PER_TAB,
   MAX_SCREENSHOT_BASE64,
+  NativeDragUnavailableError,
   ScreenshotTooLargeError,
   captureScreenshot,
   captureVisibleTabScreenshot,
@@ -28,6 +29,7 @@ import {
   installPageInstrumentation,
   isDebuggerAvailable,
   noteTabNavigation,
+  pushConsoleEntry,
   readConsoleMessages,
   readNetworkRequests,
   recordInstrumentEntry,
@@ -301,6 +303,55 @@ describe('console buffer', () => {
     forgetTab(id)
   })
 
+  it('keeps console history across an idle detach and reattach', async () => {
+    vi.useFakeTimers()
+    try {
+      const id = tabId()
+      await startConsoleCapture(id, 'https://example.com/')
+      handleDebuggerEvent(id, 'Runtime.consoleAPICalled', { type: 'log', args: [{ value: 'page load' }], timestamp: 1 })
+      handleDebuggerEvent(id, 'Network.requestWillBeSent', {
+        requestId: 'r1',
+        request: { url: 'https://example.com/app.js', method: 'GET' },
+        timestamp: 2,
+      })
+      await vi.advanceTimersByTimeAsync(IDLE_DETACH_MS)
+      expect(debuggerApi.detach).toHaveBeenCalledWith({ tabId: id })
+      await ensureAttached(id)
+      expect(readConsoleMessages(id).messages.map((message) => message.text)).toEqual(['page load'])
+      expect(readNetworkRequests(id).requests.map((request) => request.url)).toEqual(['https://example.com/app.js'])
+      await detachTab(id)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('treats our own detach reported as canceled_by_user as no dismissal', async () => {
+    const id = tabId()
+    await startConsoleCapture(id, 'https://example.com/')
+    handleDebuggerEvent(id, 'Runtime.consoleAPICalled', { type: 'log', args: [{ value: 'kept' }], timestamp: 1 })
+    await detachTab(id)
+    // Chrome reports an extension-initiated detach as canceled_by_user too.
+    for (const listener of detachListeners) listener({ tabId: id }, 'canceled_by_user')
+    expect(readConsoleMessages(id).messages.map((message) => message.text)).toEqual(['kept'])
+    // The tab is still attachable, so the next console call keeps using CDP.
+    await ensureAttached(id)
+    await detachTab(id)
+  })
+
+  it('clears console and network history when the tab closes', () => {
+    const id = tabId()
+    seedTelemetryDomain(id, 'https://example.com/')
+    handleDebuggerEvent(id, 'Runtime.consoleAPICalled', { type: 'log', args: [{ value: 'gone' }], timestamp: 1 })
+    handleDebuggerEvent(id, 'Network.requestWillBeSent', {
+      requestId: 'r1',
+      request: { url: 'https://example.com/a', method: 'GET' },
+      timestamp: 2,
+    })
+    forgetTab(id)
+    expect(readConsoleMessages(id).total).toBe(0)
+    expect(readNetworkRequests(id).total).toBe(0)
+  })
+
   it('clears on a domain change but keeps the same domain across reloads', () => {
     const id = tabId()
     seedTelemetryDomain(id, 'https://example.com/page')
@@ -331,6 +382,91 @@ describe('console buffer', () => {
     const read = readConsoleMessages(id, { limit: 1 })
     expect(read.total).toBe(MAX_LOGS_PER_TAB)
     expect(read.messages[0]?.text).toBe(`m${MAX_LOGS_PER_TAB}`)
+    forgetTab(id)
+  })
+
+  it('does not duplicate Log history replayed by a reattach', async () => {
+    const id = tabId()
+    const history = [
+      { level: 'error', text: 'first replayed entry', url: 'https://example.com/a.js', lineNumber: 3, timestamp: 10 },
+      { level: 'warning', text: 'second replayed entry', url: 'https://example.com/a.js', lineNumber: 7, timestamp: 11 },
+    ]
+    await startConsoleCapture(id, 'https://example.com/')
+    for (const entry of history) handleDebuggerEvent(id, 'Log.entryAdded', { entry })
+    expect(readConsoleMessages(id).total).toBe(2)
+    // An idle detach followed by a reattach re-enables Log, which replays the
+    // same history with its original timestamps.
+    await detachTab(id)
+    await startConsoleCapture(id, 'https://example.com/')
+    for (const entry of history) handleDebuggerEvent(id, 'Log.entryAdded', { entry })
+    expect(readConsoleMessages(id).messages.map((message) => message.text))
+      .toEqual(['first replayed entry', 'second replayed entry'])
+    await detachTab(id)
+  })
+
+  it('adds only the new entry when a replayed history arrives with one new line', async () => {
+    const id = tabId()
+    const replayed = { level: 'error', text: 'history line', url: 'https://example.com/a.js', lineNumber: 3, timestamp: 10 }
+    handleDebuggerEvent(id, 'Log.entryAdded', { entry: replayed })
+    handleDebuggerEvent(id, 'Log.entryAdded', { entry: replayed })
+    handleDebuggerEvent(id, 'Log.entryAdded', {
+      entry: { level: 'error', text: 'fresh line', url: 'https://example.com/a.js', lineNumber: 4, timestamp: 12 },
+    })
+    expect(readConsoleMessages(id).messages.map((message) => message.text)).toEqual(['history line', 'fresh line'])
+    forgetTab(id)
+  })
+
+  it('does not duplicate Runtime console history replayed by a reattach', () => {
+    const id = tabId()
+    const replayed = { type: 'log', args: [{ value: 'runtime history' }], timestamp: 42 }
+    handleDebuggerEvent(id, 'Runtime.consoleAPICalled', replayed)
+    handleDebuggerEvent(id, 'Runtime.consoleAPICalled', replayed)
+    expect(readConsoleMessages(id).total).toBe(1)
+    forgetTab(id)
+  })
+
+  it('accepts a later genuine occurrence of the same text at a new timestamp', () => {
+    const id = tabId()
+    handleDebuggerEvent(id, 'Runtime.consoleAPICalled', { type: 'log', args: [{ value: 'tick' }], timestamp: 1 })
+    handleDebuggerEvent(id, 'Runtime.consoleAPICalled', { type: 'log', args: [{ value: 'tick' }], timestamp: 2 })
+    expect(readConsoleMessages(id).total).toBe(2)
+    forgetTab(id)
+  })
+
+  it('dedupes an unreplayed entry that carries no timestamp', () => {
+    const id = tabId()
+    const entry = { level: 'error', text: 'timestampless', url: 'https://example.com/a.js' }
+    expect(pushConsoleEntry(id, { type: 'error', text: 'timestampless', url: 'https://example.com/a.js' })).toBe(true)
+    expect(pushConsoleEntry(id, { type: 'error', text: 'timestampless', url: 'https://example.com/a.js' })).toBe(false)
+    handleDebuggerEvent(id, 'Log.entryAdded', { entry })
+    expect(readConsoleMessages(id).total).toBe(1)
+    forgetTab(id)
+  })
+
+  it('bounds the dedupe identities so the oldest identity can be replayed again', () => {
+    const id = tabId()
+    const entry = (text: string, timestamp: number) => ({ type: 'log', text, url: 'https://example.com/', timestamp })
+    expect(pushConsoleEntry(id, entry('one', 1), 2)).toBe(true)
+    expect(pushConsoleEntry(id, entry('two', 2), 2)).toBe(true)
+    expect(pushConsoleEntry(id, entry('three', 3), 2)).toBe(true)
+    expect(pushConsoleEntry(id, entry('three', 3), 2)).toBe(false)
+    // The identity of the oldest entry was evicted, so its replay buffers again.
+    expect(pushConsoleEntry(id, entry('one', 1), 2)).toBe(true)
+    expect(readConsoleMessages(id).total).toBe(4)
+    forgetTab(id)
+  })
+
+  it('does not duplicate network requests when the same events are replayed', () => {
+    const id = tabId()
+    const request = { requestId: 'r1', request: { url: 'https://example.com/app.js', method: 'GET' }, timestamp: 1 }
+    const response = { requestId: 'r1', response: { url: 'https://example.com/app.js', status: 200 }, timestamp: 2 }
+    handleDebuggerEvent(id, 'Network.requestWillBeSent', request)
+    handleDebuggerEvent(id, 'Network.responseReceived', response)
+    handleDebuggerEvent(id, 'Network.requestWillBeSent', request)
+    handleDebuggerEvent(id, 'Network.responseReceived', response)
+    const read = readNetworkRequests(id)
+    expect(read.total).toBe(1)
+    expect(read.requests[0]).toMatchObject({ url: 'https://example.com/app.js', status: 200 })
     forgetTab(id)
   })
 
@@ -759,13 +895,51 @@ describe('real input through the Input domain', () => {
   it('drags through five interpolated moves and releases at the destination', async () => {
     const commands = recordCommands()
     const id = tabId()
-    await dragPointer(id, { x: 0, y: 0 }, { x: 100, y: 50 })
+    expect(await dragPointer(id, { x: 0, y: 0 }, { x: 100, y: 50 })).toBe('mouse')
     const moves = commands.filter((command) => command.method === 'Input.dispatchMouseEvent' && command.params.type === 'mouseMoved')
     const draggedMoves = moves.filter((command) => command.params.buttons === 1)
     expect(draggedMoves).toHaveLength(CDP_DRAG_STEPS)
     expect(draggedMoves.at(-1)?.params).toMatchObject({ x: 100, y: 50 })
     const released = commands.at(-1)
     expect(released?.params).toMatchObject({ type: 'mouseReleased', x: 100, y: 50, button: 'left', buttons: 0 })
+    await detachTab(id)
+  })
+
+  it('drags a native DnD target with press, dragEnter, dragOver, drop, and release', async () => {
+    const commands = recordCommands()
+    const id = tabId()
+    expect(await dragPointer(id, { x: 0, y: 0 }, { x: 100, y: 50 }, { nativeDrag: true })).toBe('native')
+    const dragEvents = commands.filter((command) => command.method === 'Input.dispatchDragEvent')
+    expect(dragEvents.map((command) => command.params.type)).toEqual([
+      'dragEnter',
+      ...Array.from({ length: CDP_DRAG_STEPS }, () => 'dragOver'),
+      'drop',
+    ])
+    expect(dragEvents[0]?.params).toMatchObject({ x: 0, y: 0 })
+    expect(dragEvents.at(-1)?.params).toMatchObject({ type: 'drop', x: 100, y: 50 })
+    // Every event carries payload the page reads through getData('text/plain').
+    for (const event of dragEvents) {
+      const data = event.params.data as { items: Array<{ mimeType: string; data: string }>; dragOperationsMask: number }
+      expect(data.items).toEqual([{ mimeType: 'text/plain', data: expect.any(String) }])
+      expect(data.items[0]?.data).not.toBe('')
+      expect(data.dragOperationsMask).toBe(1)
+    }
+    const pressed = commands.findIndex((command) => command.method === 'Input.dispatchMouseEvent' && command.params.type === 'mousePressed')
+    const firstDrag = commands.findIndex((command) => command.method === 'Input.dispatchDragEvent')
+    expect(pressed).toBeGreaterThanOrEqual(0)
+    expect(pressed).toBeLessThan(firstDrag)
+    expect(commands.at(-1)?.params).toMatchObject({ type: 'mouseReleased', x: 100, y: 50 })
+    await detachTab(id)
+  })
+
+  it('reports native drag events as unavailable when the protocol refuses them', async () => {
+    sendCommandBehavior = async (method) => {
+      if (method === 'Input.dispatchDragEvent') throw new Error("'Input.dispatchDragEvent' wasn't found")
+      return {}
+    }
+    const id = tabId()
+    await expect(dragPointer(id, { x: 1, y: 2 }, { x: 3, y: 4 }, { nativeDrag: true }))
+      .rejects.toBeInstanceOf(NativeDragUnavailableError)
     await detachTab(id)
   })
 })

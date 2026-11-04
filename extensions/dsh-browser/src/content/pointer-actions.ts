@@ -21,6 +21,43 @@ interface Point {
 /** Number of interpolated moves between a drag's start and end. */
 const DRAG_STEPS = 5
 
+/**
+ * Drag event names a page can bind as inline handlers.
+ *
+ * The isolated world cannot read listeners registered through
+ * `addEventListener`, so native drag-and-drop detection reads the markers it
+ * can observe: the `draggable` attribute and inline drag handlers.
+ */
+const DRAG_EVENT_TYPES = ['dragstart', 'drag', 'dragenter', 'dragover', 'dragleave', 'drop', 'dragend'] as const
+
+/**
+ * Whether an endpoint carries native HTML5 drag-and-drop semantics.
+ *
+ * A drag source marked `draggable` and a drop zone with an inline drag handler
+ * both make the browser's native drag pipeline (rather than plain mouse
+ * events) the only way to produce a real drop.
+ * @param el - element at one drag endpoint, when one could be resolved.
+ * @returns true when the element or an ancestor looks like a native DnD target.
+ */
+function hasNativeDragSemantics(el: Element | null): boolean {
+  if (el === null) return false
+  for (let node: Element | null = el; node !== null; node = node.parentElement) {
+    const draggable = node.getAttribute('draggable')
+    if (draggable !== null && draggable !== 'false') return true
+    for (const type of DRAG_EVENT_TYPES) {
+      if (node.hasAttribute(`on${type}`)) return true
+      if (typeof Reflect.get(node, `on${type}`) === 'function') return true
+    }
+  }
+  // Drop zones often bind document- or window-level drag handlers.
+  for (const holder of [document, window]) {
+    for (const type of DRAG_EVENT_TYPES) {
+      if (typeof Reflect.get(holder, `on${type}`) === 'function') return true
+    }
+  }
+  return false
+}
+
 /** Round a point to whole CSS pixels (dispatch and status line agree). */
 function roundPoint(point: Point): Point {
   return { x: Math.round(point.x), y: Math.round(point.y) }
@@ -211,11 +248,17 @@ export function pointerRectAction(args: Record<string, unknown>, ids: ElementIds
  * afterwards so a scroll caused by the second look-up cannot leave stale
  * coordinates. The caller falls back to synthesized events when an endpoint is
  * no longer visible.
+ * The `nativeDrag` marker tells the background whether the endpoints need the
+ * browser's native drag pipeline; without it the background dispatches plain
+ * mouse events.
  * @param args - from_index/to_index or from/to.
  * @param ids - stable element id registry.
- * @returns viewport geometry for the start and end points.
+ * @returns viewport geometry for the start and end points, plus the marker.
  */
-export function dragRectsAction(args: Record<string, unknown>, ids: ElementIds): { from: PointerRect; to: PointerRect } {
+export function dragRectsAction(
+  args: Record<string, unknown>,
+  ids: ElementIds,
+): { from: PointerRect; to: PointerRect; nativeDrag: boolean } {
   const hasIndexes = args.from_index !== undefined || args.to_index !== undefined
   const hasPairs = args.from !== undefined || args.to !== undefined
   if (hasIndexes === hasPairs) {
@@ -229,6 +272,7 @@ export function dragRectsAction(args: Record<string, unknown>, ids: ElementIds):
     return {
       from: rectOf(fromElement, centreOf(fromElement)),
       to: rectOf(toElement, toPoint),
+      nativeDrag: hasNativeDragSemantics(fromElement) || hasNativeDragSemantics(toElement),
     }
   }
   const from = pairArg(args, 'from')
@@ -236,6 +280,7 @@ export function dragRectsAction(args: Record<string, unknown>, ids: ElementIds):
   return {
     from: { ...from, width: 0, height: 0, visible: inViewport(from) },
     to: { ...to, width: 0, height: 0, visible: inViewport(to) },
+    nativeDrag: hasNativeDragSemantics(elementAt(from)) || hasNativeDragSemantics(elementAt(to)),
   }
 }
 

@@ -136,10 +136,15 @@ Chrome 使用 `sidePanel`，Firefox 使用 `sidebar_action`。两者都申请 `s
 - 同时只有一个扩展连接桥。未打开侧栏的浏览器 Profile 不会抢占连接；另一个已打开的侧栏顶替连接后，被替换的一端会主动让权，不再反复重连互踢。
 - 标签页绑定属于整个扩展连接，而不是单个对话会话。
 - 可访问的跨源 iframe 会进入快照，并通过稳定的 `(frame, index)` 地址执行操作；受保护或已销毁的 frame 会标记为不可访问，不影响整页快照。
+- 带 `frame` 参数并按编号寻址的工具是 snapshot、click、type、press、get_text 与 wait；select、hover、drag、upload_file、find 只作用于主框架。
+- 历史前进/后退恢复的页面仍保留 iframe：当 Chrome 的 frame 枚举漏掉 bfcache 文档的子 frame 时，按 frame id 复用该文档上一次的 frame 树。
 - 验证码/纯图片按钮无法处理——工具结果会标注"存在无文本可访问名的元素"，提示用户手动完成该步。
 - 令牌无自动轮换。
 - `browser_press` 的合成按键不触发浏览器原生默认行为（Tab 焦点移动、方向键、Enter 激活等），仅用于框架内的键盘事件；依赖原生行为的场景请手动操作。
 - `browser_wait` 以加载完成 + 固定静默窗口为准，不观察持续 DOM 更新（连续刷新的 SPA 可能被报为稳定）。
 - 真实指针输入、裁剪/缩放截图、页面 JavaScript 执行与 console/network 缓冲都依赖绑定在受控标签页上的调试会话：按需 attach，空闲 60 秒或标签页移出本会话归属即 detach，绝不附加用户未交给本会话的标签页。用户点掉 Chrome 的调试信息栏后，这些工具回退到纯 DOM 行为并在结果里说明。
+- 真实输入只在标签页位于前台且窗口聚焦时才会到达页面；不满足时指针工具改为合成 DOM 事件，在结果里说明原因，并保留请求的按键、连击次数与修饰键语义（浏览器级默认行为如导航与原生右键菜单不会发生）。
+- 带原生拖放语义的目标会收到 `Input.dispatchDragEvent` 的 enter/over/drop（带 `text/plain` 载荷）；没有该语义的目标仍用普通鼠标拖拽序列，浏览器拒绝该协议时回退合成拖拽事件。
+- console/network 缓冲在调试会话空闲 detach 后仍然保留：直到页面来源变化、标签页关闭或会话结束才清空。重新 attach 时 Chrome 会重放日志历史，这些重放会与已有缓冲去重。
 - 降级截图走 `captureVisibleTab`，只能截当前活动标签页的可见区域，且忽略 `scale`；调试器路径才支持对受控标签页裁剪与缩放。
 - `browser_console` 与 `browser_network` 从首次在某个标签页调用时开始采集。没有调试会话时在页面主世界 hook `console`、`fetch` 与 `XMLHttpRequest`，会漏掉 hook 之前的请求、文档/资源请求与 Service Worker 流量；结果里会说明数据来自哪条路径。

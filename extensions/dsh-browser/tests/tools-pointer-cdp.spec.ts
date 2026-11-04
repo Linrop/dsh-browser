@@ -8,6 +8,11 @@ interface ChromeState {
   withDebugger?: boolean
   pointerRect?: unknown
   pageContent?: string
+  dragEventsUnavailable?: boolean
+  /** Omit `chrome.windows` entirely, as a browser build without the API does. */
+  withoutWindowsApi?: boolean
+  /** `chrome.windows.get(windowId).focused`; defaults to a focused window. */
+  windowFocused?: boolean
 }
 
 interface RecordedEvent {
@@ -52,6 +57,9 @@ function mockChrome(state: ChromeState): {
     attach: vi.fn(async () => undefined),
     detach: vi.fn(async () => undefined),
     sendCommand: vi.fn(async (_target: { tabId: number }, method: string, params?: object) => {
+      if (state.dragEventsUnavailable === true && method === 'Input.dispatchDragEvent') {
+        throw new Error("'Input.dispatchDragEvent' wasn't found")
+      }
       inputEvents.push({ method, params: (params ?? {}) as Record<string, unknown> })
       return {}
     }),
@@ -68,6 +76,9 @@ function mockChrome(state: ChromeState): {
       }),
       sendMessage,
     },
+    ...(state.withoutWindowsApi === true
+      ? {}
+      : { windows: { get: vi.fn(async (windowId: number) => ({ id: windowId, focused: state.windowFocused ?? true })) } }),
     webNavigation: { getAllFrames: vi.fn(async () => frames) },
     scripting: { executeScript: vi.fn(async () => [{ frameId: 0, result: undefined }]) },
     runtime: { id: 'test-extension', onMessage: { addListener: vi.fn(), removeListener: vi.fn() } },
@@ -159,6 +170,96 @@ describe('browser_hover and browser_drag real input', () => {
     const moves = inputEventsOf(chromeMock.inputEvents).filter((event) => event.params.type === 'mouseMoved' && event.params.buttons === 1)
     expect(moves).toHaveLength(5)
     expect(inputEventsOf(chromeMock.inputEvents).at(-1)?.params).toMatchObject({ type: 'mouseReleased', x: 40, y: 50 })
+  })
+
+  it('dispatches native drag events when the endpoints report native DnD semantics', async () => {
+    const chromeMock = mockChrome({
+      withDebugger: true,
+      pointerRect: {
+        from: { x: 1, y: 2, width: 0, height: 0, visible: true },
+        to: { x: 40, y: 50, width: 0, height: 0, visible: true },
+        nativeDrag: true,
+      },
+    })
+    const answer = await dispatch(call('browser_drag', { from: [1, 2], to: [40, 50] }))
+    expect(answer.ok).toBe(true)
+    expect(textOf(answer)).toContain('native drag events')
+    const dragEvents = chromeMock.inputEvents.filter((event) => event.method === 'Input.dispatchDragEvent')
+    expect(dragEvents.map((event) => event.params.type)).toContain('drop')
+    const actions = chromeMock.sendMessage.mock.calls
+      .map(([, message]) => (message as { action?: string }).action)
+    expect(actions).not.toContain('browser_drag')
+  })
+
+  it('dispatches native drag events for index-addressed endpoints too', async () => {
+    const chromeMock = mockChrome({
+      withDebugger: true,
+      pointerRect: {
+        from: { x: 1, y: 2, width: 10, height: 10, visible: true },
+        to: { x: 40, y: 50, width: 20, height: 20, visible: true },
+        nativeDrag: true,
+      },
+    })
+    await dispatch(call('browser_snapshot', {}))
+    const answer = await dispatch(call('browser_drag', { from_index: 1, to_index: 2 }))
+    expect(answer.ok).toBe(true)
+    expect(textOf(answer)).toContain('native drag events')
+    const dragEvents = chromeMock.inputEvents.filter((event) => event.method === 'Input.dispatchDragEvent')
+    expect(dragEvents.map((event) => event.params.type)).toEqual([
+      'dragEnter', 'dragOver', 'dragOver', 'dragOver', 'dragOver', 'dragOver', 'drop',
+    ])
+  })
+
+  it('falls back to synthesized drag events when the protocol has no dispatchDragEvent', async () => {
+    const chromeMock = mockChrome({
+      withDebugger: true,
+      dragEventsUnavailable: true,
+      pointerRect: {
+        from: { x: 1, y: 2, width: 0, height: 0, visible: true },
+        to: { x: 40, y: 50, width: 0, height: 0, visible: true },
+        nativeDrag: true,
+      },
+    })
+    const answer = await dispatch(call('browser_drag', { from: [1, 2], to: [40, 50] }))
+    expect(answer.ok).toBe(true)
+    expect(textOf(answer)).toContain('synthesized drag events')
+    expect(chromeMock.sendMessage).toHaveBeenCalledWith(
+      expect.any(Number),
+      expect.objectContaining({ action: 'browser_drag' }),
+      expect.anything(),
+    )
+  })
+
+  it('synthesizes instead of dispatching CDP input for a background tab', async () => {
+    const chromeMock = mockChrome({ withDebugger: true, tab: { active: false } })
+    const answer = await dispatch(call('browser_hover', { x: 5, y: 6 }))
+    expect(answer.ok).toBe(true)
+    expect(textOf(answer)).toContain('synthesized events')
+    expect(textOf(answer)).toContain('real input would not reach the page')
+    expect(inputEventsOf(chromeMock.inputEvents)).toHaveLength(0)
+    expect(chromeMock.sendMessage).toHaveBeenCalledWith(
+      expect.any(Number),
+      expect.objectContaining({ action: 'browser_hover' }),
+      expect.anything(),
+    )
+  })
+
+  it('synthesizes a button-carrying click when the window is not focused', async () => {
+    const chromeMock = mockChrome({ withDebugger: true, windowFocused: false })
+    await dispatch(call('browser_snapshot', {}))
+    const answer = await dispatch(call('browser_click', { index: 1, button: 'right' }))
+    expect(answer.ok).toBe(true)
+    expect(textOf(answer)).toContain('synthesized events')
+    expect(textOf(answer)).toContain('button, click count, and modifiers were simulated')
+    expect(inputEventsOf(chromeMock.inputEvents)).toHaveLength(0)
+  })
+
+  it('synthesizes when the browser build has no chrome.windows', async () => {
+    const chromeMock = mockChrome({ withDebugger: true, withoutWindowsApi: true })
+    const answer = await dispatch(call('browser_hover', { x: 5, y: 6 }))
+    expect(answer.ok).toBe(true)
+    expect(textOf(answer)).toContain('synthesized events')
+    expect(inputEventsOf(chromeMock.inputEvents)).toHaveLength(0)
   })
 
   it('falls back to synthesized events with a disclosure when the debugger is unavailable', async () => {

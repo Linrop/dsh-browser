@@ -12,6 +12,8 @@ import { DEFAULT_SNAPSHOT_MAX_CHARS } from '@yuxianglin/dsh-bridge-browser/src/p
 import type { ToolError } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
 import {
   allocateFrameBudgets,
+  forgetRecoveredSubframe,
+  forgetTabFrames,
   frameDocumentKey,
   frameOrigin,
   listTabFrames,
@@ -22,6 +24,7 @@ import { PAGE_READS, approvalPromptForCall, originFromUrl } from './authorizatio
 import {
   DebuggerUnavailableError,
   JsResultNotSerializableError,
+  NativeDragUnavailableError,
   ScreenshotTooLargeError,
   captureScreenshot,
   captureVisibleTabScreenshot,
@@ -45,14 +48,21 @@ import {
   startConsoleCapture,
   startNetworkCapture,
   type CdpMouseButton,
+  type DragPointerMode,
   type EvaluateOutcome,
   type ScreenshotCapture,
   type ScreenshotOptions,
 } from './cdp.ts'
 import {
+  realInputVerdict,
+  type RealInputState,
+  type RealInputUnavailableReason,
+} from './real-input.ts'
+import {
   classifyRestrictedPage,
   restrictedPageRefusal,
   waitForNextDocumentReady,
+  type NavigationWait,
   type RestrictedPageKind,
 } from './navigation.ts'
 import type { ApprovalAuthorization, ApprovalPrompt } from '../security/approval.ts'
@@ -104,6 +114,8 @@ const NAVIGATION_CANDIDATE_TOOLS = new Set([
   'browser_open_tab',
   'browser_evaluate',
   'browser_drag',
+  'browser_select',
+  'browser_upload_file',
 ])
 const TAB_NATIVE_TOOLS = new Set([
   'browser_snapshot',
@@ -155,12 +167,14 @@ export const TAB_MANAGEMENT_TOOL_NAMES = new Set([
   'browser_close_tab',
 ])
 const NAVIGATION_SNAPSHOT_GUIDANCE = 'Navigation completed and the current page snapshot is included below. Use it directly instead of taking an immediate duplicate snapshot.'
+const RECEIVER_MISSING_NAVIGATION_GRACE_MS = 1_500
 const pendingInjections = new Map<number, Promise<void>>()
 const snapshotDocumentsByTab = new Map<number, Map<number, string>>()
 
 /** Forget delta/element state whenever the user explicitly follows a new tab. */
 export function resetTabSnapshot(tabId: number): void {
   snapshotDocumentsByTab.delete(tabId)
+  forgetTabFrames(tabId)
 }
 
 /** Whether a successful tool may have changed the controlled tab's page URL. */
@@ -261,6 +275,111 @@ async function sendAction(
 
 function contentScriptReceiverMissing(error: unknown): boolean {
   return error instanceof Error && error.message.includes('Receiving end does not exist')
+}
+
+/**
+ * Whether a send failure means the request never got an answer because its
+ * receiving document went away, which is what a dispatched action that
+ * navigates the page looks like from the background worker.
+ */
+function contentScriptGoneAfterDispatch(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const message = error.message
+  return message.includes('Receiving end does not exist')
+    || message.includes('message port closed')
+    || message.includes('Extension context invalidated')
+}
+
+/**
+ * Report a dispatched action as successful when the page it operated is gone.
+ *
+ * Only a confirmed document replacement counts: the caller keeps its previous
+ * error when nothing navigated.
+ *
+ * @param tabId - tab the action was dispatched to.
+ * @param call - the tool call, for the status line.
+ * @param budget - snapshot budget for the replacement page.
+ * @param targetStillAllowed - affinity re-check for the replacement page.
+ * @returns the success answer carrying the new snapshot, or undefined.
+ */
+async function answerNavigatedAfterDispatch(
+  tabId: number,
+  call: ToolCall,
+  budget: ContentBudget,
+  targetStillAllowed: (() => boolean) | undefined,
+  before: TabFrame[],
+  beforeUrl: string | undefined,
+): Promise<ToolAnswer | undefined> {
+  if (!NAVIGATION_CANDIDATE_TOOLS.has(call.name) && !STATE_CHANGING_PAGE_TOOLS.has(call.name)) return undefined
+  if (targetStillAllowed?.() === false) return undefined
+  const beforeDocument = before.find((frame) => frame.frameId === 0)?.documentId
+  const after = await listTabFrames(tabId, undefined).catch(() => undefined)
+  const afterDocument = after?.find((frame) => frame.frameId === 0)?.documentId
+  const replacement = beforeDocument !== undefined && afterDocument !== undefined
+    ? beforeDocument !== afterDocument
+    // Frame records can omit the document id (restored documents, older Chrome);
+    // a changed tab URL is the fallback proof that the document was replaced.
+    : await tabDocumentReplaced(tabId, beforeUrl)
+  // A lost response without a replacement document is an ordinary failure: the
+  // caller must keep its error rather than report a click that never happened.
+  if (!replacement) return undefined
+  const status = dispatchedActionStatus(call)
+  try {
+    const snapshot = await snapshotAfterNavigation(
+      tabId,
+      call,
+      `${status} The page navigated.`,
+      budget,
+      targetStillAllowed,
+      NAVIGATION_SNAPSHOT_GUIDANCE,
+    )
+    // The snapshot is opportunistic: the action still succeeded when the new
+    // document is not readable yet, so report it and let the model snapshot.
+    if (snapshot !== undefined) return snapshot
+  } catch {
+    // Fall through to the status-only success.
+  }
+  return {
+    ok: true,
+    result: { text: `${status} The page navigated. Call browser_snapshot again after it loads.` },
+  }
+}
+
+/**
+ * Whether the tab now shows a different document than `beforeUrl`.
+ *
+ * @param tabId - tab to read.
+ * @param beforeUrl - URL observed before the action was dispatched.
+ * @returns true when the committed URL differs.
+ */
+async function tabDocumentReplaced(tabId: number, beforeUrl: string | undefined): Promise<boolean> {
+  if (beforeUrl === undefined) return false
+  try {
+    const tab = await chrome.tabs.get(tabId)
+    const url = tab.url ?? tab.pendingUrl
+    return url !== undefined && url !== beforeUrl
+  } catch {
+    return false
+  }
+}
+
+/** Short status line for an action whose response was lost to a navigation. */
+function dispatchedActionStatus(call: ToolCall): string {
+  const index = typeof call.args.index === 'number' ? ` [${call.args.index}]` : ''
+  switch (call.name) {
+    case 'browser_click':
+      return `Clicked${index}.`
+    case 'browser_select':
+      return `Selected an option in${index}.`
+    case 'browser_upload_file':
+      return `Uploaded files to${index}.`
+    case 'browser_drag':
+      return 'Dragged.'
+    case 'browser_evaluate':
+      return 'JavaScript executed.'
+    default:
+      return 'The action was dispatched.'
+  }
 }
 
 function unavailable(message: string): ToolAnswer {
@@ -466,18 +585,33 @@ async function snapshotAllFrames(
     const frame = frames[index]!
     if (outcome.status === 'rejected') {
       if (frame.frameId === 0) throw outcome.reason
+      if (frame.recovered === true) {
+        // A remembered subframe that no longer answers was destroyed while the
+        // main document stayed alive. Drop it silently; it is not part of the
+        // page any more, and reporting it would contradict the live DOM.
+        forgetRecoveredSubframe(tabId, frame.frameId)
+        continue
+      }
       sections.push(frameHeader(frame), '(This iframe was inaccessible or destroyed while loading.)')
       continue
     }
     const answer = outcome.value.response
     if (!isToolAnswer(answer)) {
       if (frame.frameId === 0) return unavailable('The page content script returned an invalid response.')
+      if (frame.recovered === true) {
+        forgetRecoveredSubframe(tabId, frame.frameId)
+        continue
+      }
       sections.push(frameHeader(frame), '(This iframe returned an invalid response.)')
       continue
     }
     const text = answerText(answer)
     if (text === undefined) {
       if (frame.frameId === 0) return answer
+      if (frame.recovered === true) {
+        forgetRecoveredSubframe(tabId, frame.frameId)
+        continue
+      }
       sections.push(frameHeader(frame), `(This iframe could not be read: ${answer.error?.message ?? 'unknown error'})`)
       continue
     }
@@ -510,8 +644,11 @@ async function snapshotAfterNavigation(
   status: string,
   budget: ContentBudget,
   targetStillAllowed?: () => boolean,
+  guidance: string = NAVIGATION_SNAPSHOT_GUIDANCE,
 ): Promise<ToolAnswer | undefined> {
-  const prefix = `${stripDuplicateSnapshotPrompt(status)}\n${NAVIGATION_SNAPSHOT_GUIDANCE}`
+  const prefix = guidance === ''
+    ? stripDuplicateSnapshotPrompt(status)
+    : `${stripDuplicateSnapshotPrompt(status)}\n${guidance}`
   const snapshotMaxChars = budget.maxChars - prefix.length - 2
   if (snapshotMaxChars < 500) return undefined
   const frames = await listTabFrames(tabId, undefined)
@@ -525,6 +662,86 @@ async function snapshotAfterNavigation(
   const snapshot = answerText(answer)
   if (snapshot === undefined) return undefined
   return { ok: true, result: { text: `${prefix}\n\n${snapshot}` } }
+}
+
+/**
+ * The status sentence for an action whose response was lost because the page
+ * navigated. It replaces the content script's own text, which never arrived.
+ */
+function dispatchedNavigationStatus(call: ToolCall, includeSnapshot: boolean): string {
+  const index = typeof call.args.index === 'number' ? ` [${call.args.index}]` : ''
+  const verb = call.name === 'browser_click'
+    ? `Clicked${index}.`
+    : call.name === 'browser_select'
+      ? `Selected an option in${index}.`
+      : call.name === 'browser_upload_file'
+        ? `Uploaded file(s) to${index}.`
+        : call.name === 'browser_drag'
+          ? 'Dragged the target.'
+          : 'The action was dispatched.'
+  if (!includeSnapshot) {
+    return `${verb} The page navigated; call browser_snapshot to read the new document.`
+  }
+  return `${verb} The page navigated; the current page snapshot is included below. Use it directly instead of taking an immediate duplicate snapshot.`
+}
+
+/**
+ * Wait for a readiness signal, giving up after `timeoutMs` without cancelling
+ * the shared listener; the caller cancels it when it keeps the original error.
+ */
+function navigationReadyWithin(ready: Promise<boolean>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<boolean>((resolve) => { timer = setTimeout(() => { resolve(false) }, timeoutMs) })
+  return Promise.race([ready, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer)
+  })
+}
+
+/**
+ * Turn a lost response into success when the document really was replaced.
+ *
+ * The readiness listener was armed before the dispatch and only reports a
+ * document other than the one that received the action, so it is the evidence
+ * that the page navigated. Without it the original send failure stands.
+ */
+async function answerDispatchedNavigation(
+  tabId: number,
+  call: ToolCall,
+  budget: ContentBudget,
+  navigationWait: NavigationWait | undefined,
+  error: unknown,
+  signal: AbortSignal | undefined,
+  targetStillAllowed: (() => boolean) | undefined,
+  includeActionDelta: boolean,
+): Promise<ToolAnswer | undefined> {
+  if (navigationWait === undefined || !contentScriptGoneAfterDispatch(error)) return undefined
+  // A missing receiver most often means the tab predates the content script,
+  // which the caller recovers by injecting and retrying. Give a late navigation
+  // only a short grace so that recovery is not delayed by the full readiness
+  // timeout; a closed port proves the script ran, so it waits in full.
+  const ready = contentScriptReceiverMissing(error)
+    ? await navigationReadyWithin(navigationWait.ready, RECEIVER_MISSING_NAVIGATION_GRACE_MS)
+    : await navigationWait.ready
+  if (!ready) return undefined
+  if (isCancelled(call, signal)) return cancelled()
+  if (targetStillAllowed?.() === false) return targetChanged()
+  if (includeActionDelta) {
+    try {
+      const snapshot = await snapshotAfterNavigation(
+        tabId,
+        call,
+        dispatchedNavigationStatus(call, true),
+        budget,
+        targetStillAllowed,
+        '',
+      )
+      if (snapshot !== undefined) return snapshot
+    } catch {
+      // The replacement page may still be settling; the action itself landed,
+      // so report the navigation instead of the stale delivery error.
+    }
+  }
+  return { ok: true, result: { text: dispatchedNavigationStatus(call, false) } }
 }
 
 async function dispatchOnce(
@@ -554,7 +771,10 @@ async function dispatchOnce(
   if (targetStillAllowed?.() === false) return targetChanged()
   const hasSnapshotBaseline = snapshotDocumentsByTab.get(tabId)?.get(frameId) === frameDocumentKey(frame)
   const requestPageDelta = includeActionDelta && hasSnapshotBaseline && ACTION_DELTA_TOOLS.has(call.name)
-  const navigationWait = includeActionDelta && isNavigationCandidateTool(call.name)
+  // Armed for every action that can navigate, not only when page content is
+  // shared: a lost response still proves the action landed, and only the
+  // snapshot half of the answer is gated on page-content permission.
+  const navigationWait = isNavigationCandidateTool(call.name)
     ? waitForNextDocumentReady(tabId, frameId, frame.documentId, signal)
     : undefined
   let response: unknown
@@ -569,6 +789,17 @@ async function dispatchOnce(
       requestPageDelta,
     )
   } catch (error: unknown) {
+    const navigationAnswer = await answerDispatchedNavigation(
+      tabId,
+      call,
+      budget,
+      navigationWait,
+      error,
+      signal,
+      targetStillAllowed,
+      includeActionDelta,
+    )
+    if (navigationAnswer !== undefined) return navigationAnswer
     if (stateChanging && contentScriptReceiverMissing(error)) rollbackActionCommit?.()
     navigationWait?.cancel()
     throw error
@@ -586,7 +817,7 @@ async function dispatchOnce(
     navigationWait?.cancel()
     return response
   }
-  if (answerNavigationPending(response) && navigationWait !== undefined) {
+  if (answerNavigationPending(response) && navigationWait !== undefined && includeActionDelta) {
     const ready = await navigationWait.ready
     if (isCancelled(call, signal)) return cancelled()
     if (targetStillAllowed?.() === false) return targetChanged()
@@ -828,6 +1059,52 @@ function parseRealClickOptions(args: Record<string, unknown>): { options: RealCl
   return { options: { button, count, modifiers } }
 }
 
+/**
+ * Read the browser facts that decide whether real input reaches a tab.
+ *
+ * `chrome.windows` is absent on Firefox, and a tab whose window cannot be
+ * read has no provable focus, so both are reported as unavailable rather than
+ * assumed focused.
+ * @param tabId - target tab.
+ * @returns active state of the tab and focus state of its window.
+ */
+async function readRealInputState(tabId: number): Promise<RealInputState> {
+  const windowsApi: typeof chrome.windows | undefined = chrome.windows
+  const windowApiAvailable = typeof windowsApi?.get === 'function'
+  let tabActive: boolean | undefined
+  let windowFocused: boolean | undefined
+  try {
+    const tab = await chrome.tabs.get(tabId)
+    tabActive = tab.active
+    if (windowApiAvailable && typeof tab.windowId === 'number') {
+      try {
+        windowFocused = (await windowsApi.get(tab.windowId)).focused
+      } catch {
+        // The window may have closed between the tab read and the window read.
+        windowFocused = undefined
+      }
+    }
+  } catch {
+    // A tab that cannot be re-read is no longer a provable input target.
+    tabActive = undefined
+  }
+  return { tabActive, windowApiAvailable, windowFocused }
+}
+
+/**
+ * Explain why real input was replaced by synthesized events.
+ * @param reason - blocking condition reported by `realInputVerdict`.
+ * @returns the model-facing disclosure appended to the action result.
+ */
+function pointerFocusDegradation(reason: RealInputUnavailableReason): string {
+  const detail = reason === 'tab-not-active'
+    ? 'the controlled tab is not focused because another tab is active in its window'
+    : reason === 'window-api-unavailable'
+      ? 'this browser build cannot report whether the controlled tab is focused'
+      : 'the controlled tab is not focused because its window is not focused'
+  return `(synthesized events: ${detail}, so real input would not reach the page)`
+}
+
 /** The coordinate lookup arguments the internal action needs. */
 function pointerRectArgs(call: ToolCall, settle = false): Record<string, unknown> {
   const args: Record<string, unknown> = { ...(settle ? { settle: true } : {}) }
@@ -858,11 +1135,11 @@ function isPointerRect(value: unknown): value is PointerRect {
     && record.visible === true
 }
 
-function parseDragRects(text: string): { from: PointerRect; to: PointerRect } | undefined {
+function parseDragRects(text: string): { from: PointerRect; to: PointerRect; nativeDrag: boolean } | undefined {
   try {
     const parsed = JSON.parse(text) as Record<string, unknown>
     return isPointerRect(parsed.from) && isPointerRect(parsed.to)
-      ? { from: parsed.from, to: parsed.to }
+      ? { from: parsed.from, to: parsed.to, nativeDrag: parsed.nativeDrag === true }
       : undefined
   } catch {
     return undefined
@@ -911,7 +1188,14 @@ function withPointerDegradation(answer: ToolAnswer, note: string | undefined): T
 }
 
 /** Status line for a real-input action. */
-function pointerStatus(kind: PointerKind, call: ToolCall, rect: PointerRect, to?: PointerRect, options?: RealClickOptions): string {
+function pointerStatus(
+  kind: PointerKind,
+  call: ToolCall,
+  rect: PointerRect,
+  to?: PointerRect,
+  options?: RealClickOptions,
+  dragMode?: DragPointerMode,
+): string {
   const index = typeof call.args.index === 'number' ? call.args.index : undefined
   if (kind === 'hover') {
     return index === undefined
@@ -924,7 +1208,8 @@ function pointerStatus(kind: PointerKind, call: ToolCall, rect: PointerRect, to?
     const count = options !== undefined && options.count > 1 ? `${options.count} clicks, ` : ''
     return `Clicked [${index ?? '?'}] (${label}${count}real mouse events).`
   }
-  return `Dragged from (${rect.x}, ${rect.y}) to (${to?.x ?? '?'}, ${to?.y ?? '?'}) with real mouse events through the browser input pipeline.`
+  const pipeline = dragMode === 'native' ? 'native drag events' : 'real mouse events'
+  return `Dragged from (${rect.x}, ${rect.y}) to (${to?.x ?? '?'}, ${to?.y ?? '?'}) with ${pipeline} through the browser input pipeline.`
 }
 
 /**
@@ -972,6 +1257,10 @@ async function dispatchRealPointerTool(
   }
   if (isCancelled(call, signal)) return { answer: cancelled() }
   if (targetStillAllowed?.() === false) return { answer: targetChanged() }
+  // `Input.dispatchMouseEvent` is a no-op for a background tab, so a dispatch
+  // there would be reported as success without ever reaching the page.
+  const verdict = realInputVerdict(await readRealInputState(tabId))
+  if (!verdict.usable) return { degradedNote: pointerFocusDegradation(verdict.reason) }
   try {
     await ensureAttached(tabId)
   } catch (error: unknown) {
@@ -1004,21 +1293,23 @@ async function dispatchRealPointerTool(
   if (isCancelled(call, signal)) return { answer: cancelled() }
   if (targetStillAllowed?.() === false) return { answer: targetChanged() }
   if (STATE_CHANGING_PAGE_TOOLS.has(call.name)) commitAction?.()
+  let dragMode: DragPointerMode | undefined
   try {
     if (kind === 'hover') {
       await movePointer(tabId, rects as PointerRect)
     } else if (kind === 'click') {
       await clickPointer(tabId, rects as PointerRect, options as RealClickOptions)
     } else {
-      const drag = rects as { from: PointerRect; to: PointerRect }
-      await dragPointer(tabId, drag.from, drag.to)
+      const drag = rects as { from: PointerRect; to: PointerRect; nativeDrag: boolean }
+      dragMode = await dragPointer(tabId, drag.from, drag.to, { nativeDrag: drag.nativeDrag })
     }
   } catch (error: unknown) {
+    if (error instanceof NativeDragUnavailableError) return { degradedNote: POINTER_NATIVE_DRAG_DEGRADATION }
     return { answer: toolFailure(error) }
   }
   const single = rects as PointerRect
   const drag = rects as { from: PointerRect; to: PointerRect }
-  const status = pointerStatus(kind, call, kind === 'drag' ? drag.from : single, kind === 'drag' ? drag.to : undefined, options)
+  const status = pointerStatus(kind, call, kind === 'drag' ? drag.from : single, kind === 'drag' ? drag.to : undefined, options, dragMode)
   const hasSnapshotBaseline = snapshotDocumentsByTab.get(tabId)?.get(0) === frameDocumentKey(frame)
   if (!includeActionDelta || !hasSnapshotBaseline) return { answer: { ok: true, result: { text: status } } }
   try {
@@ -1039,7 +1330,9 @@ const POINTER_DEBUGGER_DEGRADATION = 'The browser debugger was unavailable, so t
 const POINTER_IFRAME_DEGRADATION = 'This target is an iframe, so the action was synthesized as DOM events inside that frame instead of using the browser input pipeline; system-level drop targets may ignore it.'
 const POINTER_TARGET_DEGRADATION = 'The real-input coordinate lookup failed, so this action was synthesized as DOM events inside the page instead of using the browser input pipeline.'
 const POINTER_OFFSCREEN_DEGRADATION = 'The target could not be kept fully inside the viewport for real pointer events, so this action was synthesized as DOM events inside the page instead.'
+const POINTER_NATIVE_DRAG_DEGRADATION = 'The browser input pipeline could not dispatch native drag events for this target. This drag was replayed inside the page instead; canvas and system-level drop targets may ignore it.'
 const POINTER_SYNTHETIC_CLICK_SEMANTICS = 'The requested button, click count, and modifiers were simulated on those synthesized events instead of the browser input pipeline.'
+const POINTER_SYNTHETIC_DRAG_SEMANTICS = 'This drag used synthesized drag events inside the page.'
 
 /**
  * Add the click-semantics disclosure to a synthesized click's degradation note.
@@ -1049,6 +1342,7 @@ const POINTER_SYNTHETIC_CLICK_SEMANTICS = 'The requested button, click count, an
  */
 function degradationNoteFor(call: ToolCall, note: string | undefined): string | undefined {
   if (note === undefined) return undefined
+  if (call.name === 'browser_drag') return `${note} ${POINTER_SYNTHETIC_DRAG_SEMANTICS}`
   return call.name === 'browser_click' && clickRequestsRealInput(call.args)
     ? `${note} ${POINTER_SYNTHETIC_CLICK_SEMANTICS}`
     : note
@@ -1185,6 +1479,15 @@ export async function dispatchToolCall(
     ), pointerDegradedNote)
   } catch (error: unknown) {
     if (isCancelled(call, signal)) return cancelled()
+    // A dispatched action that navigates the page takes its answering document
+    // with it, so the send can fail as a closed port, a vanished receiver, or a
+    // timeout on the response. When the document really was replaced, the action
+    // succeeded: report it with the replacement page's snapshot instead of an
+    // error the model would retry into a duplicate click.
+    if (contentScriptGoneAfterDispatch(error) || !contentScriptReceiverMissing(error)) {
+      const navigated = await answerNavigatedAfterDispatch(tab.id, call, effectiveBudget, targetStillAllowed, executionFrames, tab.url)
+      if (navigated !== undefined) return navigated
+    }
     if (!contentScriptReceiverMissing(error)) {
       return unavailable('The content script stopped responding after the operation was dispatched. Call browser_snapshot before continuing.')
     }

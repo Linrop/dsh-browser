@@ -69,7 +69,7 @@ import {
 import { bumpEvent, eventCounters } from './events.ts'
 import { InteractionResponseRouter } from './responses.ts'
 import { normalizeToolError } from './error-map.ts'
-import { forgetTab, noteTabNavigation, recordInstrumentEntry } from './cdp.ts'
+import { forgetTab, noteTabNavigation, recordInstrumentEntry, releaseTab } from './cdp.ts'
 import { isInstrumentEntry } from '../content/instrument.ts'
 import {
   actionCoveredByTrustedOrigins,
@@ -202,8 +202,9 @@ const interactionResponses = new InteractionResponseRouter()
 const transientEvents = new TransientEventCache()
 const tabAffinity = new TabAffinityController()
 // A tab whose ownership is released (closed, replaced, or dropped with the
-// connection) must not keep a debugger session attached to it.
-tabAffinity.onOwnershipReleased = (tabId) => { forgetTab(tabId) }
+// connection) must not keep a debugger session attached to it. Only the tab's
+// closing or the session ending discards its console and network history.
+tabAffinity.onOwnershipReleased = (tabId) => { releaseTab(tabId) }
 const focusedWindow = new FocusedWindowTracker()
 const selections = new SelectionTracker()
 const pageSessionContexts = new PageSessionContextTracker({

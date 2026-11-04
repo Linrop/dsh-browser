@@ -45,13 +45,22 @@ function mockChrome(options: {
     documentId: `document-${options.tab.id}`,
     url: options.tab.url ?? '',
   }])
+  // Chrome resubscribes documents by id across a frame-tree omission, so a
+  // document addressed by a document that getAllFrames no longer reports must
+  // still resolve to its frame.
+  const frameIdsByDocument = new Map<string, number>()
   const sendMessage = vi.fn(async (
     _tabId: number,
     message: unknown,
     target?: { frameId?: number; documentId?: string },
   ) => {
+    for (const frame of currentFrames()) {
+      if (typeof frame.frameId === 'number' && frame.documentId !== undefined) {
+        frameIdsByDocument.set(frame.documentId, frame.frameId)
+      }
+    }
     const targetFrameId = target?.frameId
-      ?? currentFrames().find((frame) => frame.documentId === target?.documentId)?.frameId
+      ?? (target?.documentId === undefined ? undefined : frameIdsByDocument.get(target.documentId))
       ?? 0
     const response = options.respond?.(message, targetFrameId) ?? responses.shift()
     if (response instanceof Error) throw response
@@ -536,6 +545,171 @@ describe('dispatchToolCall', () => {
       args: { delta: false },
       budget: expect.objectContaining({ maxChars: expect.any(Number) }),
     }), { documentId: 'document-after' })
+  })
+
+  it('reports a dispatched click as success when the page navigated before answering', async () => {
+    const frames = [
+      { frameId: 0, parentFrameId: -1, documentId: 'document-before', url: 'https://app.example/start' },
+    ]
+    let snapshotText = 'Title: Start page'
+    const chromeMock = mockChrome({
+      tab: { id: 61, url: 'https://app.example/start' },
+      frames,
+      respond: (message) => (message as { action?: string }).action === 'browser_click'
+        ? new Error('The message port closed before a response was received.')
+        : { ok: true, result: { text: snapshotText } },
+    })
+    await dispatchToolCall(CALL, 'auto', { maxItems: 10, maxChars: 2_000 }, async () => 'approved')
+    chromeMock.sendMessage.mockClear()
+    snapshotText = 'Title: Next page'
+
+    const pending = dispatchToolCall(
+      { id: 'js-nav-click', name: 'browser_click', args: { index: 8 } },
+      'auto',
+      { maxItems: 10, maxChars: 2_000 },
+      async () => 'approved',
+    )
+    await vi.waitFor(() => { expect(chromeMock.sendMessage).toHaveBeenCalledTimes(1) })
+    frames[0] = { frameId: 0, parentFrameId: -1, documentId: 'document-after', url: 'https://app.example/next' }
+    chromeMock.emitContentReady(61, 0, 'document-after')
+
+    const answer = await pending
+    expect(answer).toMatchObject({ ok: true })
+    const text = (answer.result as { text: string }).text
+    expect(text).toContain('Clicked [8]. The page navigated; the current page snapshot is included below.')
+    expect(text).toContain('Use it directly instead of taking an immediate duplicate snapshot.')
+    expect(text).toContain('Title: Next page')
+    expect(text).toContain('UNTRUSTED_PAGE_CONTENT')
+    expect(chromeMock.sendMessage).toHaveBeenCalledTimes(2)
+    expect(chromeMock.sendMessage).toHaveBeenLastCalledWith(61, expect.objectContaining({
+      action: 'browser_snapshot',
+    }), { documentId: 'document-after' })
+  })
+
+  it('reports success when the receiver vanished because the page navigated', async () => {
+    const frames = [
+      { frameId: 0, parentFrameId: -1, documentId: 'document-before', url: 'https://app.example/start' },
+    ]
+    const chromeMock = mockChrome({
+      tab: { id: 66, url: 'https://app.example/start' },
+      frames,
+      respond: (message) => (message as { action?: string }).action === 'browser_click'
+        ? new Error('Could not establish connection. Receiving end does not exist.')
+        : { ok: true, result: { text: 'Title: Next page' } },
+    })
+    await dispatchToolCall(CALL, 'auto', { maxItems: 10, maxChars: 2_000 }, async () => 'approved')
+    chromeMock.sendMessage.mockClear()
+
+    const pending = dispatchToolCall(
+      { id: 'receiver-gone-click', name: 'browser_click', args: { index: 2 } },
+      'auto',
+      { maxItems: 10, maxChars: 2_000 },
+      async () => 'approved',
+    )
+    await vi.waitFor(() => { expect(chromeMock.sendMessage).toHaveBeenCalledTimes(1) })
+    frames[0] = { frameId: 0, parentFrameId: -1, documentId: 'document-after', url: 'https://app.example/next' }
+    chromeMock.emitContentReady(66, 0, 'document-after')
+
+    const answer = await pending
+    expect(answer).toMatchObject({ ok: true })
+    expect((answer.result as { text: string }).text)
+      .toContain('Clicked [2]. The page navigated; the current page snapshot is included below.')
+    expect(chromeMock.executeScript).not.toHaveBeenCalled()
+  })
+
+  it('keeps the delivery error when a lost response did not navigate', async () => {
+    vi.useFakeTimers()
+    try {
+      const chromeMock = mockChrome({
+        tab: { id: 62, url: 'https://app.example/form' },
+        respond: (message) => (message as { action?: string }).action === 'browser_click'
+          ? new Error('The message port closed before a response was received.')
+          : { ok: true, result: { text: 'Title: Form' } },
+      })
+      await dispatchToolCall(CALL, 'auto', { maxItems: 10, maxChars: 2_000 }, async () => 'approved')
+      chromeMock.sendMessage.mockClear()
+      const pending = dispatchToolCall(
+        { id: 'lost-response', name: 'browser_click', args: { index: 3 } },
+        'auto',
+        { maxItems: 10, maxChars: 2_000 },
+        async () => 'approved',
+      )
+      await vi.advanceTimersByTimeAsync(9_000)
+      const answer = await pending
+      expect(answer).toMatchObject({
+        ok: false,
+        error: { code: 'content-unavailable', message: expect.stringContaining('operation was dispatched') },
+      })
+      expect(chromeMock.executeScript).not.toHaveBeenCalled()
+      expect(chromeMock.sendMessage).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps a restored iframe in the snapshot when getAllFrames omits it', async () => {
+    const frames = [
+      { frameId: 0, parentFrameId: -1, documentId: 'top-doc', url: 'https://app.example/' },
+      { frameId: 636, parentFrameId: 0, documentId: 'child-doc', url: 'https://embed.example.net/' },
+    ]
+    const chromeMock = mockChrome({
+      tab: { id: 63, url: 'https://app.example/' },
+      frames,
+      respond: (_message, frameId) => ({ ok: true, result: { text: frameId === 0 ? 'TOP SNAPSHOT' : 'IFRAME SNAPSHOT' } }),
+    })
+
+    const first = await dispatchToolCall(CALL, 'auto', { maxItems: 10, maxChars: 2_000 })
+    expect((first.result as { text: string }).text).toContain('iframe frame=636')
+
+    // History restore: Chrome lists only the main frame, with the same document id.
+    frames.splice(1, 1)
+    const second = await dispatchToolCall(CALL, 'auto', { maxItems: 10, maxChars: 2_000 })
+    const text = (second.result as { text: string }).text
+    expect(text).toContain('iframe frame=636 parent=0 origin=https://embed.example.net')
+    expect(text).toContain('IFRAME SNAPSHOT')
+    expect(chromeMock.sendMessage.mock.calls.map((entry) => entry[2])).toContainEqual({ documentId: 'child-doc' })
+  })
+
+  it('still includes the iframe when the frame tree returns an unaddressable entry', async () => {
+    const frames: Array<{ frameId: number; parentFrameId: number; documentId?: string; url: string }> = [
+      { frameId: 0, parentFrameId: -1, documentId: 'top-doc', url: 'https://app.example/' },
+      { frameId: 636, parentFrameId: 0, documentId: 'child-doc', url: 'https://embed.example.net/' },
+    ]
+    mockChrome({
+      tab: { id: 64, url: 'https://app.example/' },
+      frames,
+      respond: (_message, frameId) => ({ ok: true, result: { text: frameId === 0 ? 'TOP SNAPSHOT' : 'IFRAME SNAPSHOT' } }),
+    })
+    await dispatchToolCall(CALL, 'auto', { maxItems: 10, maxChars: 2_000 })
+
+    const stale = [
+      { frameId: 0, parentFrameId: -1, documentId: 'top-doc', url: 'https://app.example/' },
+      { frameId: undefined, parentFrameId: 0, documentId: 'child-doc', url: 'https://embed.example.net/' },
+    ] as unknown as typeof frames
+    frames.splice(0, frames.length, ...stale)
+    const answer = await dispatchToolCall(CALL, 'auto', { maxItems: 10, maxChars: 2_000 })
+    const text = (answer.result as { text: string }).text
+    expect(text).toContain('iframe frame=636')
+    expect(text).toContain('IFRAME SNAPSHOT')
+  })
+
+  it('does not resurrect a remembered iframe in a different main document', async () => {
+    const frames = [
+      { frameId: 0, parentFrameId: -1, documentId: 'top-doc', url: 'https://app.example/' },
+      { frameId: 636, parentFrameId: 0, documentId: 'child-doc', url: 'https://embed.example.net/' },
+    ]
+    mockChrome({
+      tab: { id: 65, url: 'https://app.example/' },
+      frames,
+      respond: (_message, frameId) => ({ ok: true, result: { text: frameId === 0 ? 'TOP SNAPSHOT' : 'IFRAME SNAPSHOT' } }),
+    })
+    await dispatchToolCall(CALL, 'auto', { maxItems: 10, maxChars: 2_000 })
+
+    frames.splice(0, frames.length, {
+      frameId: 0, parentFrameId: -1, documentId: 'top-doc-2', url: 'https://app.example/next',
+    })
+    const answer = await dispatchToolCall(CALL, 'auto', { maxItems: 10, maxChars: 2_000 })
+    expect((answer.result as { text: string }).text).not.toContain('iframe frame=636')
   })
 
   it('does not wait for or return navigation page content when reads are not automatic', async () => {

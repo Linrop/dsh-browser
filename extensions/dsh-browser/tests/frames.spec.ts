@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
-import { describe, expect, it } from 'vitest'
-import { allocateFrameBudgets, sortTabFrames, type TabFrame } from '../src/background/frames.ts'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import {
+  allocateFrameBudgets,
+  forgetTabFrames,
+  listTabFrames,
+  sortTabFrames,
+  type TabFrame,
+} from '../src/background/frames.ts'
 
 function frames(count: number): TabFrame[] {
   return Array.from({ length: count }, (_, frameId) => ({
@@ -56,5 +62,81 @@ describe('sortTabFrames', () => {
 
     expect(sortTabFrames(input).map((frame) => frame.frameId)).toEqual([0, 2, 4, 9])
     expect(input.map((frame) => frame.frameId)).toEqual([9, 4, 0, 2])
+  })
+})
+
+function stubFrameTree(initial: chrome.webNavigation.GetAllFrameResultDetails[]): {
+  set: (frames: chrome.webNavigation.GetAllFrameResultDetails[]) => void
+} {
+  let current = initial
+  vi.stubGlobal('chrome', {
+    webNavigation: { getAllFrames: vi.fn(async () => current) },
+  })
+  return { set: (frames) => { current = frames } }
+}
+
+function frame(frameId: number, documentId: string, url: string): chrome.webNavigation.GetAllFrameResultDetails {
+  return {
+    frameId,
+    parentFrameId: frameId === 0 ? -1 : 0,
+    documentId,
+    url,
+    processId: 1,
+    frameType: frameId === 0 ? 'outermost_frame' : 'sub_frame',
+    documentLifecycle: 'active',
+    errorOccurred: false,
+  } as chrome.webNavigation.GetAllFrameResultDetails
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+  forgetTabFrames(71)
+  forgetTabFrames(72)
+})
+
+describe('listTabFrames', () => {
+  it('re-adds the subframes Chrome omits for a restored document', async () => {
+    const tree = stubFrameTree([
+      frame(0, 'top-document', 'https://top.example/'),
+      frame(636, 'child-document', 'https://embed.example.net/'),
+    ])
+    expect((await listTabFrames(71, 'https://top.example/')).map((entry) => entry.frameId)).toEqual([0, 636])
+
+    // History restore: same main document id, subframe gone from the frame tree.
+    tree.set([frame(0, 'top-document', 'https://top.example/')])
+    const restored = await listTabFrames(71, 'https://top.example/')
+    expect(restored.map((entry) => entry.frameId)).toEqual([0, 636])
+    expect(restored[1]).toMatchObject({
+      frameId: 636,
+      parentFrameId: 0,
+      documentId: 'child-document',
+      recovered: true,
+    })
+  })
+
+  it('drops a stale frame entry that has no usable frame id', async () => {
+    stubFrameTree([
+      frame(0, 'top-document', 'https://top.example/'),
+      frame(636, 'child-document', 'https://embed.example.net/'),
+    ])
+    await listTabFrames(72, 'https://top.example/')
+
+    const stale = [
+      frame(0, 'top-document', 'https://top.example/'),
+      { ...frame(0, 'child-document', 'https://embed.example.net/'), frameId: undefined },
+    ] as unknown as chrome.webNavigation.GetAllFrameResultDetails[]
+    vi.stubGlobal('chrome', { webNavigation: { getAllFrames: vi.fn(async () => stale) } })
+    const frames = await listTabFrames(72, 'https://top.example/')
+    expect(frames.map((entry) => entry.frameId)).toEqual([0, 636])
+  })
+
+  it('forgets subframes once the main document is replaced', async () => {
+    const tree = stubFrameTree([
+      frame(0, 'top-document', 'https://top.example/'),
+      frame(636, 'child-document', 'https://embed.example.net/'),
+    ])
+    await listTabFrames(72, 'https://top.example/')
+    tree.set([frame(0, 'next-document', 'https://top.example/next')])
+    expect((await listTabFrames(72, 'https://top.example/next')).map((entry) => entry.frameId)).toEqual([0])
   })
 })

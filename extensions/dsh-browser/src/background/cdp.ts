@@ -26,6 +26,15 @@ export const DEBUGGER_PROTOCOL_VERSION = '1.3'
 /** Console messages retained per tab. */
 export const MAX_LOGS_PER_TAB = 10_000
 
+/**
+ * Console identities remembered per tab so a replayed history is not stored twice.
+ *
+ * Enabling `Log` or `Runtime` replays the tab's past console entries after a
+ * reattach. Keeping a bounded identity set makes that replay idempotent
+ * without growing with the buffer or the page's lifetime.
+ */
+export const MAX_CONSOLE_DEDUPE_KEYS = 5_000
+
 /** Network requests retained per tab. */
 export const MAX_REQUESTS_PER_TAB = 1_000
 
@@ -65,6 +74,16 @@ export class ScreenshotTooLargeError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'ScreenshotTooLargeError'
+  }
+}
+
+/** The browser input pipeline cannot dispatch native drag events for a tab. */
+export class NativeDragUnavailableError extends Error {
+  readonly code: ToolErrorCode = 'action-failed'
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'NativeDragUnavailableError'
   }
 }
 
@@ -126,16 +145,21 @@ function installDebuggerListeners(api: DebuggerApi): void {
     try {
       if (source.tabId === undefined) return
       const tabId = source.tabId
+      // A detach this module requested deletes the session (and any pending
+      // attachment) before calling `chrome.debugger.detach`, so empty slots
+      // identify our own detach. Chrome reports that as `canceled_by_user`
+      // too, and treating it as a dismissal would refuse later attachments on
+      // a healthy tab.
+      const selfInitiated = !sessions.has(tabId) && !pendingAttachments.has(tabId)
       sessions.delete(tabId)
       pendingAttachments.delete(tabId)
       clearIdleDetach(tabId)
-      if (reason === 'canceled_by_user') {
+      if (!selfInitiated && reason === 'canceled_by_user') {
         // The user clicked the infobar's cancel button. Stop offering to
         // attach for this document and let the next call use the page-side
-        // fallback instead of failing or throwing.
+        // fallback instead of failing or throwing. Telemetry buffers survive:
+        // they clear only on a domain change, tab close, or session end.
         userDeclinedTabs.add(tabId)
-        consoleBuffers.delete(tabId)
-        networkBuffers.delete(tabId)
       }
     } catch {
       // A detach notification must never surface as an uncaught error.
@@ -251,7 +275,13 @@ function scheduleIdleDetach(tabId: number): void {
   }, IDLE_DETACH_MS))
 }
 
-/** Detach one tab and forget its protocol state. */
+/**
+ * Detach one tab and forget its protocol session, keeping its buffers.
+ *
+ * Console and network telemetry outlive the attachment so a later reattach
+ * still reports what the page logged before the detach.
+ * @param tabId - tab to detach.
+ */
 export async function detachTab(tabId: number): Promise<void> {
   bumpAttachGeneration(tabId)
   sessions.delete(tabId)
@@ -266,7 +296,7 @@ export async function detachTab(tabId: number): Promise<void> {
   }
 }
 
-/** Forget every buffer and session for a tab that closed or left this session. */
+/** Forget every buffer and session for a tab that closed or ended its session. */
 export function forgetTab(tabId: number): void {
   consoleBuffers.delete(tabId)
   networkBuffers.delete(tabId)
@@ -275,7 +305,13 @@ export function forgetTab(tabId: number): void {
   void detachTab(tabId)
 }
 
-/** Detach a tab whose last ownership claim was released while it stays open. */
+/**
+ * Detach a tab whose last ownership claim was released while it stays open.
+ *
+ * The page, not the claim, owns its console and network history, so the
+ * buffers stay readable if the tab is claimed again.
+ * @param tabId - released tab.
+ */
 export function releaseTab(tabId: number): void {
   void detachTab(tabId)
 }
@@ -429,17 +465,24 @@ export async function clickPointer(
 
 /**
  * Drag between two viewport points with real press, interpolated moves, and release.
+ *
+ * A native HTML5 drag-and-drop target needs `Input.dispatchDragEvent` after
+ * the press, because Chrome never starts a native drag from
+ * `Input.dispatchMouseEvent` alone. Plain mouse events stay the default for
+ * canvas and custom pointer drags, which reject drag events.
  * @param tabId - target tab.
  * @param from - start point in viewport CSS pixels.
  * @param to - end point in viewport CSS pixels.
- * @param modifiers - protocol modifier bit mask.
+ * @param options - modifier bit mask and whether the target needs native DnD.
+ * @returns which pipeline produced the drag.
  */
 export async function dragPointer(
   tabId: number,
   from: { x: number; y: number },
   to: { x: number; y: number },
-  modifiers = 0,
-): Promise<void> {
+  options: DragPointerOptions = {},
+): Promise<DragPointerMode> {
+  const modifiers = options.modifiers ?? 0
   await ensureAttached(tabId)
   await dispatchMouseEvent(tabId, {
     type: 'mouseMoved',
@@ -458,6 +501,40 @@ export async function dragPointer(
     clickCount: 1,
     modifiers,
   })
+  if (options.nativeDrag === true) {
+    try {
+      await dispatchNativeDrag(tabId, from, to, modifiers)
+    } catch (error: unknown) {
+      // Release the pressed button before handing the drag to the page-side
+      // synthesized path, so the page is not left mid-press.
+      try {
+        await dispatchMouseEvent(tabId, {
+          type: 'mouseReleased',
+          x: to.x,
+          y: to.y,
+          button: 'left',
+          buttons: 0,
+          clickCount: 1,
+          modifiers,
+        })
+      } catch {
+        // The detach or target loss that broke the drag also breaks release.
+      }
+      throw new NativeDragUnavailableError(
+        `The browser refused native drag events for this target: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+    await dispatchMouseEvent(tabId, {
+      type: 'mouseReleased',
+      x: to.x,
+      y: to.y,
+      button: 'left',
+      buttons: 0,
+      clickCount: 1,
+      modifiers,
+    })
+    return 'native'
+  }
   for (let step = 1; step <= CDP_DRAG_STEPS; step += 1) {
     const fraction = step / CDP_DRAG_STEPS
     await dispatchMouseEvent(tabId, {
@@ -479,6 +556,75 @@ export async function dragPointer(
     clickCount: 1,
     modifiers,
   })
+  return 'mouse'
+}
+
+/** Options for one real drag. */
+export interface DragPointerOptions {
+  /** Protocol modifier bit mask. */
+  modifiers?: number
+  /** Dispatch native drag events instead of simulated mouse moves. */
+  nativeDrag?: boolean
+}
+
+/** Which input pipeline produced a drag. */
+export type DragPointerMode = 'mouse' | 'native'
+
+/** MIME type carried by a dispatched native drag. */
+const NATIVE_DRAG_MIME = 'text/plain'
+
+/** Payload carried by a dispatched native drag; pages read it from `getData`. */
+const NATIVE_DRAG_DATA = 'dsh-drag'
+
+/** Drag data every dispatched drag event of one gesture shares. */
+function nativeDragData(): Record<string, unknown> {
+  return {
+    items: [{ mimeType: NATIVE_DRAG_MIME, data: NATIVE_DRAG_DATA }],
+    // `1` is the protocol's copy operation.
+    dragOperationsMask: 1,
+  }
+}
+
+/** Dispatch one drag event of a native drag gesture. */
+async function dispatchDragEvent(
+  tabId: number,
+  type: 'dragEnter' | 'dragOver' | 'drop',
+  point: { x: number; y: number },
+  modifiers: number,
+): Promise<void> {
+  await send(tabId, 'Input.dispatchDragEvent', {
+    type,
+    x: point.x,
+    y: point.y,
+    modifiers,
+    data: nativeDragData(),
+  })
+}
+
+/**
+ * Dispatch the native drag event sequence between two points.
+ *
+ * @param tabId - target tab.
+ * @param from - start point in viewport CSS pixels.
+ * @param to - end point in viewport CSS pixels.
+ * @param modifiers - protocol modifier bit mask.
+ */
+async function dispatchNativeDrag(
+  tabId: number,
+  from: { x: number; y: number },
+  to: { x: number; y: number },
+  modifiers: number,
+): Promise<void> {
+  await dispatchDragEvent(tabId, 'dragEnter', from, modifiers)
+  for (let step = 1; step <= CDP_DRAG_STEPS; step += 1) {
+    const fraction = step / CDP_DRAG_STEPS
+    await dispatchDragEvent(tabId, 'dragOver', {
+      x: Math.round(from.x + (to.x - from.x) * fraction),
+      y: Math.round(from.y + (to.y - from.y) * fraction),
+    }, modifiers)
+    if (step < CDP_DRAG_STEPS) await new Promise((resolve) => setTimeout(resolve, DRAG_STEP_DELAY_MS))
+  }
+  await dispatchDragEvent(tabId, 'drop', to, modifiers)
 }
 
 // ---- Console and network telemetry ----
@@ -492,6 +638,15 @@ export interface CapturedConsoleMessage {
   column?: number
   timestamp: number
 }
+
+/**
+ * A console entry before the buffer assigns a display timestamp.
+ *
+ * The protocol timestamp stays optional here: a source that never reports one
+ * must still dedupe by type, text, and URL instead of a wall-clock default
+ * that changes on every replay.
+ */
+export type CapturedConsoleInput = Omit<CapturedConsoleMessage, 'timestamp'> & { timestamp?: number }
 
 /** One network request kept for `browser_network`. */
 export interface CapturedNetworkRequest {
@@ -513,6 +668,8 @@ export interface CapturedNetworkRequest {
 interface ConsoleBuffer {
   domain?: string
   messages: CapturedConsoleMessage[]
+  /** Identities already buffered, oldest first, for replay deduplication. */
+  keys: Set<string>
 }
 
 interface NetworkBuffer {
@@ -535,7 +692,7 @@ function hostOf(url: string | undefined): string | undefined {
 function consoleBufferFor(tabId: number): ConsoleBuffer {
   let buffer = consoleBuffers.get(tabId)
   if (buffer === undefined) {
-    buffer = { messages: [] }
+    buffer = { messages: [], keys: new Set() }
     consoleBuffers.set(tabId, buffer)
   }
   return buffer
@@ -571,6 +728,7 @@ export function noteTabNavigation(tabId: number, url: string | undefined): void 
     if (consoleBuffer.domain === undefined) consoleBuffer.domain = domain
     else if (consoleBuffer.domain !== domain) {
       consoleBuffer.messages.length = 0
+      consoleBuffer.keys.clear()
       consoleBuffer.domain = domain
     }
   }
@@ -602,16 +760,64 @@ export function seedTelemetryDomain(tabId: number, pageUrl: string | undefined):
   if (networkBuffer.domain === undefined) networkBuffer.domain = domain
 }
 
-function pushConsole(tabId: number, message: CapturedConsoleMessage): void {
+/**
+ * Stable identity of one console entry.
+ *
+ * Timestamp, URL, line, column, and text together distinguish a replay from a
+ * later genuine occurrence: Chrome replays `Log` and `Runtime` history with
+ * the original timestamp, while a new occurrence carries a new one. Without a
+ * timestamp the identity falls back to type, text, and URL.
+ * @param message - entry to identify.
+ * @returns a deterministic key.
+ */
+function consoleEntryKey(message: CapturedConsoleInput): string {
+  if (message.timestamp === undefined) {
+    return JSON.stringify([message.type, message.text, message.url ?? null])
+  }
+  return JSON.stringify([
+    message.type,
+    message.timestamp,
+    message.url ?? null,
+    message.line ?? null,
+    message.column ?? null,
+    message.text,
+  ])
+}
+
+/**
+ * Append one console entry unless its identity is already buffered.
+ *
+ * Exported for tests: a source that replays its history must not grow the
+ * buffer, and the identity set stays bounded independently of the buffer.
+ * @param tabId - tab the entry belongs to.
+ * @param message - console entry, with no timestamp when the source omits one.
+ * @param dedupeLimit - identities to remember, oldest evicted first.
+ * @returns true when the entry was buffered, false for a replayed duplicate.
+ */
+export function pushConsoleEntry(
+  tabId: number,
+  message: CapturedConsoleInput,
+  dedupeLimit = MAX_CONSOLE_DEDUPE_KEYS,
+): boolean {
   const buffer = consoleBufferFor(tabId)
+  const key = consoleEntryKey(message)
+  if (buffer.keys.has(key)) return false
   buffer.messages.push({
     ...message,
     text: redactModelText(message.text),
+    timestamp: message.timestamp ?? Date.now(),
     ...(message.url === undefined ? {} : { url: redactUrlForModel(message.url) }),
   })
+  buffer.keys.add(key)
+  while (buffer.keys.size > dedupeLimit) {
+    const oldest = buffer.keys.values().next()
+    if (oldest.done === true) break
+    buffer.keys.delete(oldest.value)
+  }
   if (buffer.messages.length > MAX_LOGS_PER_TAB) {
     buffer.messages.splice(0, buffer.messages.length - MAX_LOGS_PER_TAB)
   }
+  return true
 }
 
 function pushNetwork(tabId: number, requestId: string, request: CapturedNetworkRequest): void {
@@ -719,25 +925,25 @@ export function handleDebuggerEvent(tabId: number, method: string, params: Recor
       const args = Array.isArray(params.args) ? params.args as RemoteObjectLike[] : []
       const frames = callFramesOf(params)
       const first = frames[0]
-      pushConsole(tabId, {
+      pushConsoleEntry(tabId, {
         type: typeof params.type === 'string' ? params.type : 'log',
         text: args.map((arg) => remoteObjectText(arg)).join(' ').slice(0, MAX_CONSOLE_TEXT),
         ...(first?.url === undefined ? {} : { url: first.url }),
         ...(first?.lineNumber === undefined ? {} : { line: first.lineNumber + 1 }),
         ...(first?.columnNumber === undefined ? {} : { column: first.columnNumber + 1 }),
-        timestamp: typeof params.timestamp === 'number' ? params.timestamp : Date.now(),
+        ...(typeof params.timestamp === 'number' ? { timestamp: params.timestamp } : {}),
       })
       return
     }
     case 'Runtime.exceptionThrown': {
       const exception = exceptionText(params)
-      pushConsole(tabId, {
+      pushConsoleEntry(tabId, {
         type: 'exception',
         text: exception.text,
         ...(exception.url === undefined ? {} : { url: exception.url }),
         ...(exception.line === undefined ? {} : { line: exception.line }),
         ...(exception.column === undefined ? {} : { column: exception.column }),
-        timestamp: typeof params.timestamp === 'number' ? params.timestamp : Date.now(),
+        ...(typeof params.timestamp === 'number' ? { timestamp: params.timestamp } : {}),
       })
       return
     }
@@ -745,12 +951,12 @@ export function handleDebuggerEvent(tabId: number, method: string, params: Recor
       const rawEntry = params.entry
       if (typeof rawEntry !== 'object' || rawEntry === null) return
       const entry = rawEntry as Record<string, unknown>
-      pushConsole(tabId, {
+      pushConsoleEntry(tabId, {
         type: logLevelType(entry.level),
         text: (typeof entry.text === 'string' ? entry.text : '').slice(0, MAX_CONSOLE_TEXT),
         ...(typeof entry.url === 'string' ? { url: entry.url } : {}),
         ...(typeof entry.lineNumber === 'number' ? { line: entry.lineNumber } : {}),
-        timestamp: typeof entry.timestamp === 'number' ? entry.timestamp : Date.now(),
+        ...(typeof entry.timestamp === 'number' ? { timestamp: entry.timestamp } : {}),
       })
       return
     }
@@ -828,7 +1034,7 @@ export function handleDebuggerEvent(tabId: number, method: string, params: Recor
 /** Record a console/network entry produced by the MAIN-world fallback hook. */
 export function recordInstrumentEntry(tabId: number, entry: InstrumentEntry): void {
   if (entry.kind === 'console') {
-    pushConsole(tabId, {
+    pushConsoleEntry(tabId, {
       type: entry.type,
       text: entry.text.slice(0, MAX_CONSOLE_TEXT),
       ...(entry.url === '' ? {} : { url: entry.url }),

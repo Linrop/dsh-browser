@@ -100,6 +100,31 @@ describe('browser_pointer_rect internal action', () => {
     expect(JSON.parse(drag.text)).toMatchObject({
       from: { x: 100, y: 20, visible: true },
       to: { x: 100, y: 20, visible: true },
+      nativeDrag: false,
     })
+  })
+
+  it('marks a draggable source as a native drag target', async () => {
+    document.body.innerHTML = '<div id="from" draggable="true">card</div><div id="to">drop zone</div>'
+    const from = document.querySelector('#from') as HTMLElement
+    const to = document.querySelector('#to') as HTMLElement
+    const ids = {
+      elementByIndex: vi.fn((index: number) => (index === 0 ? from : to)),
+    } as unknown as ElementIds
+
+    const drag = await runAction('browser_pointer_rect', { from_index: 0, to_index: 1 }, { ids, budget: BUDGET })
+    expect(JSON.parse(drag.text)).toMatchObject({ nativeDrag: true })
+  })
+
+  it('marks an inline drop handler as a native drag target', async () => {
+    document.body.innerHTML = '<div id="from">card</div><div id="to" ondragover="return false" ondrop="return false">drop zone</div>'
+    const from = document.querySelector('#from') as HTMLElement
+    const to = document.querySelector('#to') as HTMLElement
+    const ids = {
+      elementByIndex: vi.fn((index: number) => (index === 0 ? from : to)),
+    } as unknown as ElementIds
+
+    const drag = await runAction('browser_pointer_rect', { from_index: 0, to_index: 1 }, { ids, budget: BUDGET })
+    expect(JSON.parse(drag.text)).toMatchObject({ nativeDrag: true })
   })
 })
