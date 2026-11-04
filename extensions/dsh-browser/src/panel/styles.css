@@ -1523,7 +1523,10 @@ textarea:focus-visible {
 }
 
 .error {
+  display: flex;
   flex: 0 0 auto;
+  align-items: flex-start;
+  gap: 8px;
   margin: 0 14px 8px;
   padding: 9px 11px;
   border: 1px solid var(--danger-border);
@@ -1533,6 +1536,37 @@ textarea:focus-visible {
   font-size: calc(11.5px * var(--ui-scale));
   line-height: 1.45;
   overflow-wrap: anywhere;
+}
+
+.error-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.error-dismiss {
+  display: grid;
+  flex: 0 0 auto;
+  padding: 2px;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.7;
+}
+
+.error-dismiss svg {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-width: 1.6;
+}
+
+.error-dismiss:hover {
+  opacity: 1;
 }
 
 .composer {
@@ -1864,6 +1898,78 @@ textarea:focus-visible {
   gap: 8px;
 }
 
+.composer-actions-end {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.voice-input-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.voice-input-timer {
+  color: var(--danger);
+  font-size: calc(11px * var(--ui-scale));
+  font-variant-numeric: tabular-nums;
+}
+
+.composer-actions button.voice-input-button {
+  width: 32px;
+  height: 32px;
+  background: var(--canvas-deep);
+  color: var(--muted);
+  transform: none;
+}
+
+.composer-actions button.voice-input-button svg rect {
+  fill: currentColor;
+  stroke: none;
+}
+
+.composer-actions button.voice-input-button:hover:not(:disabled) {
+  background: var(--line);
+  color: var(--blue-ink);
+}
+
+.composer-actions button.voice-input-button.is-requesting {
+  color: var(--blue-ink);
+  cursor: progress;
+}
+
+.composer-actions button.voice-input-button.is-recording {
+  background: var(--danger);
+  color: var(--on-accent);
+  animation: voice-input-pulse 1.4s ease-in-out infinite;
+}
+
+.voice-input-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: voice-input-spin 700ms linear infinite;
+}
+
+@keyframes voice-input-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--danger) 45%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 7px color-mix(in srgb, var(--danger) 0%, transparent);
+  }
+}
+
+@keyframes voice-input-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .image-file-input {
   display: none;
 }
@@ -2030,6 +2136,19 @@ textarea:focus-visible {
 
 .composer-actions button.stop-button:disabled {
   opacity: 1;
+  cursor: progress;
+}
+
+/* The transcription state is disabled but still readable: a spinning glyph
+   signals work in flight instead of the ordinary dimmed unavailable look. */
+.composer-actions button.voice-input-button:disabled {
+  background: var(--canvas-deep);
+  color: var(--faint);
+}
+
+.composer-actions button.voice-input-button.is-transcribing {
+  opacity: 1;
+  color: var(--blue-ink);
   cursor: progress;
 }
 

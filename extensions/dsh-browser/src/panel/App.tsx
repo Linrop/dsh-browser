@@ -7,7 +7,7 @@
  * @module
  */
 
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { BRIDGE_SESSION_PURGE_METHOD } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
 import type { ServerFrame } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
 import type { BridgeState } from '../background/bridge.ts'
@@ -23,6 +23,8 @@ import { PANEL_COPY, type PanelCopy } from './strings.ts'
 import type { LiveViewFrame, LiveViewState } from '../background/live-view.ts'
 import { isNewerLiveFrame, LiveViewPanel, LiveViewToggle } from './LiveView.tsx'
 import { PlusMenu } from './PlusMenu.tsx'
+import { VoiceInputButton } from './VoiceInputButton.tsx'
+import { mergeTranscript } from './voice-input.ts'
 import { addQueuedEcho, pruneQueuedEchoes, type QueuedEcho } from './queued-echo.ts'
 import { QuestionCard } from './QuestionCard.tsx'
 import { MessageImages } from './MessageImages.tsx'
@@ -455,7 +457,14 @@ export function App(): React.JSX.Element {
   const [stopping, setStopping] = useState(false)
   const [approvalQueue, setApprovalQueue] = useState<ApprovalRequest[]>([])
   const [tabAffinity, setTabAffinity] = useState<TabAffinityState | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [errorText, setErrorText] = useState<string | null>(null)
+  // The raw detail behind one error row (currently voice capture/transcription),
+  // kept for the row's tooltip instead of leaking into the localized message.
+  const [errorDetail, setErrorDetail] = useState<string | null>(null)
+  const setError = useCallback((message: string | null, detail: string | null = null): void => {
+    setErrorText(message)
+    setErrorDetail(message === null ? null : detail)
+  }, [])
   const [showSessionPicker, setShowSessionPicker] = useState(false)
   const [loadingSessions, setLoadingSessions] = useState(false)
   const [sessionChanging, setSessionChanging] = useState(false)
@@ -475,6 +484,7 @@ export function App(): React.JSX.Element {
   const addingImagesRef = useRef(false)
   const sendingRef = useRef(false)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const imageProjectionRef = useRef<{
     sessionId: string | null
     seq: number
@@ -527,6 +537,21 @@ export function App(): React.JSX.Element {
     if (element === null) return
     stickConversationToBottom()
     element.scrollTo({ top: element.scrollHeight, behavior })
+  }
+  /**
+   * Append recognized speech to the current draft and leave the caret at the
+   * end, without sending. The draft state stays the only owner of the text.
+   */
+  function appendTranscript(text: string): void {
+    setDraft((current) => ({ ...current, text: mergeTranscript(current.text, text) }))
+    setError(null)
+    requestAnimationFrame(() => {
+      const element = textareaRef.current
+      if (element === null) return
+      element.focus()
+      const end = element.value.length
+      element.setSelectionRange(end, end)
+    })
   }
   const question = questions[0] ?? null
   const questionSubmitting = question !== null && hasPendingQuestion(questionSubmissions, question)
@@ -716,7 +741,7 @@ export function App(): React.JSX.Element {
     const observer = new ResizeObserver(() => { syncScrollBottom() })
     observer.observe(element)
     return () => observer.disconnect()
-  }, [question, error, showSessionPicker, draftImages.length, selection])
+  }, [question, errorText, showSessionPicker, draftImages.length, selection])
 
   useEffect(() => {
     if (!showModelPicker) return
@@ -1672,7 +1697,22 @@ export function App(): React.JSX.Element {
           onDismiss={() => { void dismissQuestion(question) }}
         />
       )}
-      {error !== null && <div className="error">{error}</div>}
+      {errorText !== null && (
+        <div className="error" role="alert" title={errorDetail ?? undefined}>
+          <span className="error-text">{errorText}</span>
+          <button
+            type="button"
+            className="error-dismiss"
+            aria-label={copy.app.dismissError}
+            title={copy.app.dismissError}
+            onClick={() => setError(null)}
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M4 4l8 8M12 4l-8 8" />
+            </svg>
+          </button>
+        </div>
+      )}
       <footer className="composer">
         <div className="composer-box">
           {selection !== null && (
@@ -1706,6 +1746,7 @@ export function App(): React.JSX.Element {
             </div>
           )}
           <textarea
+            ref={textareaRef}
             value={input}
             onChange={(e) => {
               if (!sendingRef.current) setDraft((current) => ({ ...current, text: e.target.value }))
@@ -1757,22 +1798,31 @@ export function App(): React.JSX.Element {
                 onPickImages={() => fileInputRef.current?.click()}
               />
             </span>
-            {working ? (
-              <button
-                className="stop-button"
-                onClick={() => { void stopTurn() }}
-                disabled={!sessionReady || stopping}
-                aria-label={stopping ? copy.app.stoppingTurn : copy.app.stopTurn}
-                title={stopping ? copy.app.stoppingTurn : copy.app.stopTurn}
-              >
-                <span className="stop-glyph" aria-hidden="true" />
-              </button>
-            ) : (
-              <button onClick={() => void send()}
-                disabled={!sessionReady || busy || addingImages
-                  || (input.trim() === '' && draftImages.length === 0 && selection === null)}
-                aria-label={copy.app.sendMessage}><SendIcon /></button>
-            )}
+            <span className="composer-actions-end">
+              <VoiceInputButton
+                api={api}
+                copy={copy.app.voice}
+                disabled={!sessionReady || busy || addingImages}
+                onTranscript={appendTranscript}
+                onError={(message, detail) => setError(message, detail ?? null)}
+              />
+              {working ? (
+                <button
+                  className="stop-button"
+                  onClick={() => { void stopTurn() }}
+                  disabled={!sessionReady || stopping}
+                  aria-label={stopping ? copy.app.stoppingTurn : copy.app.stopTurn}
+                  title={stopping ? copy.app.stoppingTurn : copy.app.stopTurn}
+                >
+                  <span className="stop-glyph" aria-hidden="true" />
+                </button>
+              ) : (
+                <button onClick={() => void send()}
+                  disabled={!sessionReady || busy || addingImages
+                    || (input.trim() === '' && draftImages.length === 0 && selection === null)}
+                  aria-label={copy.app.sendMessage}><SendIcon /></button>
+              )}
+            </span>
           </div>
         </div>
         {state === 'connected' ? (

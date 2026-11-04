@@ -219,6 +219,7 @@ export interface PanelCopy {
     selectionTruncated: string
     removeSelection: string
     scrollToBottom: string
+    dismissError: string
     record: string
     recordStop: string
     recordingActive: string
@@ -235,6 +236,24 @@ export interface PanelCopy {
       unavailable: string
       unavailableWithReason: (reason: string) => string
       reasons: Record<LiveViewUnavailableCode, string>
+    }
+    voice: {
+      start: string
+      stopAndTranscribe: string
+      cancel: string
+      requesting: string
+      recording: (duration: string) => string
+      transcribing: string
+      unavailable: string
+      errors: {
+        permission: string
+        deviceMissing: string
+        unsupported: string
+        unavailable: string
+        tooLarge: string
+        transcribe: string
+        empty: string
+      }
     }
   }
 }
@@ -477,6 +496,7 @@ const EN: PanelCopy = {
     selectionTruncated: '(truncated)',
     removeSelection: 'Remove the selected text',
     scrollToBottom: 'Scroll to latest',
+    dismissError: 'Dismiss the error',
     record: 'Record this tab as a GIF',
     recordStop: 'Stop and download the recording',
     recordingActive: 'Recording',
@@ -501,6 +521,24 @@ const EN: PanelCopy = {
         'own-page': 'this is the panel\'s own page, not the page being operated',
         'attach-failed': 'the debugger could not attach',
         'debugger-detached': 'the browser detached the debugger',
+      },
+    },
+    voice: {
+      start: 'Start voice input',
+      stopAndTranscribe: 'Stop and transcribe',
+      cancel: 'Cancel voice input',
+      requesting: 'Waiting for the microphone…',
+      recording: (duration) => `Recording ${duration} · click to transcribe`,
+      transcribing: 'Transcribing…',
+      unavailable: 'Voice input is unavailable',
+      errors: {
+        permission: 'Microphone access was denied. Allow it for this extension and try again.',
+        deviceMissing: 'No microphone is available. Connect one and try again.',
+        unsupported: 'This browser cannot record microphone audio for transcription.',
+        unavailable: 'The dsh host has no speech recognizer configured.',
+        tooLarge: 'The recording is larger than the host accepts. Try a shorter one.',
+        transcribe: 'Speech transcription failed. Try again.',
+        empty: 'No speech was recognized. Try again and speak clearly.',
       },
     },
   },
@@ -744,6 +782,7 @@ const ZH: PanelCopy = {
     selectionTruncated: '（已截断）',
     removeSelection: '移除选中内容',
     scrollToBottom: '回到最新消息',
+    dismissError: '关闭错误提示',
     record: '录制当前标签页并导出 GIF',
     recordStop: '停止录制并下载',
     recordingActive: '录制中',
@@ -768,6 +807,24 @@ const ZH: PanelCopy = {
         'own-page': '这是面板自己的页面，不是被操作的那个页面',
         'attach-failed': '调试器无法附加',
         'debugger-detached': '浏览器已断开调试器',
+      },
+    },
+    voice: {
+      start: '开始语音输入',
+      stopAndTranscribe: '结束录音并转写',
+      cancel: '取消语音输入',
+      requesting: '正在等待麦克风…',
+      recording: (duration) => `录音中 ${duration} · 再点一次转写`,
+      transcribing: '正在转写…',
+      unavailable: '语音输入不可用',
+      errors: {
+        permission: '麦克风权限被拒绝。请为本扩展允许麦克风访问后重试。',
+        deviceMissing: '没有可用的麦克风。请连接麦克风后重试。',
+        unsupported: '此浏览器无法录制麦克风音频用于转写。',
+        unavailable: 'dsh 宿主未配置语音识别器。',
+        tooLarge: '录音超过宿主允许的大小。请缩短录音后重试。',
+        transcribe: '语音转写失败，请重试。',
+        empty: '未识别到语音内容。请重试并清晰朗读。',
       },
     },
   },

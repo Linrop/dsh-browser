@@ -106,7 +106,7 @@ describe('attaching a page selection in the composer', () => {
       setter.call(composer, 'summarize this')
       composer.dispatchEvent(new Event('input', { bubbles: true }))
     })
-    await act(async () => { document.querySelector<HTMLButtonElement>('.composer-actions > button')!.click() })
+    await act(async () => { document.querySelector<HTMLButtonElement>('.composer-actions-end > button')!.click() })
 
     const prompt = rpc.mock.calls.find(([method]) => method === 'session.prompt')?.[1] as {
       content: { type: string; text: string }[]
@@ -124,7 +124,7 @@ describe('attaching a page selection in the composer', () => {
     await startPanel()
     await act(async () => { onSelection?.(selection) })
 
-    const send = document.querySelector<HTMLButtonElement>('.composer-actions > button')!
+    const send = document.querySelector<HTMLButtonElement>('.composer-actions-end > button')!
     expect(send.disabled).toBe(false)
     await act(async () => { send.click() })
 
@@ -140,7 +140,7 @@ describe('attaching a page selection in the composer', () => {
 
     expect(document.querySelector('.composer-box .page-selection')).toBeNull()
     expect(panelApi.clearSelection).toHaveBeenCalled()
-    expect(document.querySelector<HTMLButtonElement>('.composer-actions > button')?.disabled).toBe(true)
+    expect(document.querySelector<HTMLButtonElement>('.composer-actions-end > button')?.disabled).toBe(true)
   })
 
   it('restores the quote when the prompt is rejected', async () => {
@@ -151,7 +151,7 @@ describe('attaching a page selection in the composer', () => {
       return {}
     })
 
-    await act(async () => { document.querySelector<HTMLButtonElement>('.composer-actions > button')!.click() })
+    await act(async () => { document.querySelector<HTMLButtonElement>('.composer-actions-end > button')!.click() })
 
     await vi.waitFor(() => {
       expect(document.querySelector('.composer-box .page-selection-quote')?.textContent).toContain(selection.text)
@@ -172,7 +172,7 @@ describe('attaching a page selection in the composer', () => {
       return {}
     })
 
-    await act(async () => { document.querySelector<HTMLButtonElement>('.composer-actions > button')!.click() })
+    await act(async () => { document.querySelector<HTMLButtonElement>('.composer-actions-end > button')!.click() })
     await vi.waitFor(() => { expect(acceptPrompt).toBeDefined() })
     const newer = { ...selection, text: 'newer highlight', capturedAt: 2_000 }
     await act(async () => { onSelection?.(newer) })
