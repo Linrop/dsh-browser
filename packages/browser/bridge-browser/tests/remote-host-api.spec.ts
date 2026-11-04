@@ -52,6 +52,36 @@ function harness(options: {
   return { api: createRemoteHostApi(gateway, connection), invoke, open, fetch, requestBodies, peer }
 }
 
+describe('speech RPCs', () => {
+  it('reads the recognition catalog without a request payload', async () => {
+    const { api, invoke } = harness({ invoke: async () => ({ providers: [], maxAudioBytes: 1024 }) })
+    const result = await api.call({ rpcId: 'r1', method: 'speech.catalog', payload: {}, signal: new AbortController().signal })
+    expect(result).toEqual({ ok: true, value: { providers: [], maxAudioBytes: 1024 } })
+    expect(invoke).toHaveBeenCalledWith(expect.objectContaining({ namespace: 'speech', method: 'catalog', args: {} }))
+  })
+
+  it('forwards one transcription request verbatim', async () => {
+    const { api, invoke } = harness({ invoke: async () => ({ text: 'hello' }) })
+    const payload = { request: { audioBase64: 'AAAA', provider: 'sensevoice-mlx', language: 'zh' } }
+    const result = await api.call({ rpcId: 'r2', method: 'speech.transcribe', payload, signal: new AbortController().signal })
+    expect(result).toEqual({ ok: true, value: { text: 'hello' } })
+    expect(invoke).toHaveBeenCalledWith(expect.objectContaining({ namespace: 'speech', method: 'transcribe', args: payload }))
+  })
+
+  it('surfaces a provider failure as an error result', async () => {
+    const { api } = harness({
+      invoke: async () => { throw Object.assign(new Error('no recognizer'), { code: 'unavailable' }) },
+    })
+    const result = await api.call({
+      rpcId: 'r3',
+      method: 'speech.transcribe',
+      payload: { request: { audioBase64: 'AAAA' } },
+      signal: new AbortController().signal,
+    })
+    expect(result).toMatchObject({ ok: false, error: { code: 'unavailable', message: 'no recognizer' } })
+  })
+})
+
 describe('dsh 0.2 Remote Host adapter', () => {
   it.each([
     { next: { provider: 'session-provider', model: 'saved-model', reasoningEffort: 'high' }, routable: true },

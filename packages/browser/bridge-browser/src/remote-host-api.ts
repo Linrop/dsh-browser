@@ -739,6 +739,10 @@ function invokeTarget(call: HostRpcCall): InvokeTarget | { readonly error: HostR
         adapt: value => ({ models: value }),
       }
     }
+    case 'speech.catalog':
+      return { namespace: 'speech', method: 'catalog', args: {} }
+    case 'speech.transcribe':
+      return { namespace: 'speech', method: 'transcribe', args: call.payload }
     default:
       return {
         error: {
