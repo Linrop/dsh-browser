@@ -44,7 +44,7 @@ describe('panel layout styles', () => {
     const textarea = ruleBody(styles, '.composer textarea')
     const actions = ruleBody(styles, '.composer-actions')
     const control = ruleBody(styles, '.composer-actions button')
-    const attachment = ruleBody(styles, '.composer-actions button.attachment-button')
+    const attachment = ruleBody(styles, '.composer-actions button.plus-menu-trigger')
     const model = ruleBody(styles, '.composer-model-trigger')
 
     expect(wrapper).toMatch(/padding:\s*0 8px 4px;/)
@@ -54,7 +54,7 @@ describe('panel layout styles', () => {
     expect(card).toMatch(/border-radius:\s*20px;/)
     expect(card).toMatch(/gap:\s*12px;/)
     expect(card).toMatch(/padding-top:\s*8px;/)
-    expect(card).toMatch(/inset 0 0 0 1px rgba\(0, 0, 0, 0\.08\)/)
+    expect(card).toMatch(/inset 0 0 0 1px var\(--inset-line\)/)
 
     expect(textarea).toMatch(/padding:\s*4px 8px 0 14px;/)
     expect(textarea).toMatch(/min-height:\s*36px;/)
@@ -71,9 +71,11 @@ describe('panel layout styles', () => {
     expect(control).toMatch(/border-radius:\s*999px;/)
     expect(control).toMatch(/background:\s*var\(--blue\);/)
 
-    expect(attachment).toMatch(/width:\s*28px;/)
-    expect(attachment).toMatch(/height:\s*28px;/)
+    expect(attachment).toMatch(/width:\s*32px;/)
+    expect(attachment).toMatch(/height:\s*32px;/)
     expect(attachment).toMatch(/border-radius:\s*999px;/)
+    expect(attachment).toMatch(/background:\s*var\(--canvas-deep\);/)
+    expect(styles).toMatch(/\.composer-actions button\.plus-menu-trigger\[aria-expanded="true"\]/)
 
     expect(model).toMatch(/height:\s*28px;/)
     expect(model).toMatch(/border:\s*0;/)
@@ -86,5 +88,58 @@ describe('panel layout styles', () => {
   it('renders no composer help line', () => {
     const app = readFileSync(`${process.cwd()}/src/panel/App.tsx`, 'utf8')
     expect(app).not.toContain('copy.app.composerHelp')
+  })
+})
+
+describe('panel dark scheme', () => {
+  const styles = readFileSync(`${process.cwd()}/src/panel/styles.css`, 'utf8')
+
+  /** Reads the balanced block that follows the dark media query. */
+  function darkBlock(stylesheet: string): string | undefined {
+    const marker = '@media (prefers-color-scheme: dark)'
+    const start = stylesheet.indexOf(marker)
+    if (start === -1) return undefined
+    const open = stylesheet.indexOf('{', start)
+    if (open === -1) return undefined
+    let depth = 0
+    for (let index = open; index < stylesheet.length; index += 1) {
+      if (stylesheet[index] === '{') depth += 1
+      else if (stylesheet[index] === '}') {
+        depth -= 1
+        if (depth === 0) return stylesheet.slice(open + 1, index)
+      }
+    }
+    return undefined
+  }
+
+  it('follows the system theme instead of requiring a manual switch', () => {
+    const block = darkBlock(styles)
+    expect(block).toBeDefined()
+    expect(block).toMatch(/color-scheme:\s*dark;/)
+  })
+
+  it('overrides every surface, text, line, and accent token in the dark block', () => {
+    const block = darkBlock(styles) ?? ''
+    for (const token of [
+      '--canvas', '--canvas-deep', '--surface', '--ink', '--ink-strong', '--muted',
+      '--faint', '--line', '--line-strong', '--blue', '--blue-hover', '--blue-ink',
+      '--blue-soft', '--blue-wash', '--navy', '--danger', '--danger-soft',
+      '--danger-border', '--warning', '--security', '--security-soft',
+      '--security-border', '--shadow', '--focus-ring',
+    ]) {
+      expect(block).toMatch(new RegExp(`${token}:\\s*[^;]+;`))
+    }
+    expect(block).toMatch(/--blue-ink:\s*#7b8fff;/)
+  })
+
+  it('keeps light surfaces out of the dark block', () => {
+    const block = darkBlock(styles) ?? ''
+    expect(block).not.toMatch(/background(?:-color)?\s*:[^;]*#(?:fff|ffffff)\b/i)
+  })
+
+  it('routes translucent chrome through tokens so it follows the scheme', () => {
+    expect(ruleBody(styles, '.topbar')).toMatch(/background:\s*var\(--surface-glass-strong\);/)
+    expect(ruleBody(styles, '.tool-activity')).toMatch(/background:\s*var\(--surface-glass\);/)
+    expect(styles).toMatch(/scrollbar-color:\s*var\(--scrollbar-thumb\) transparent;/)
   })
 })

@@ -190,6 +190,11 @@ export interface PanelCopy {
     stopTurn: string
     stoppingTurn: string
     addImages: string
+    attach: string
+    attachMenu: string
+    pasteOrDropHint: string
+    queued: string
+    queuedHint: string
     imageUnavailable: string
     removeImage: (name: string) => string
     image: string
@@ -443,6 +448,11 @@ const EN: PanelCopy = {
     stopTurn: 'Stop generating',
     stoppingTurn: 'Stopping…',
     addImages: 'Add images',
+    attach: 'Add to message',
+    attachMenu: 'Add to message',
+    pasteOrDropHint: 'Tip: you can paste or drop images straight into the composer.',
+    queued: 'Queued',
+    queuedHint: 'Sends when the current turn finishes.',
     imageUnavailable: 'This dsh host does not advertise image input',
     removeImage: (name) => `Remove ${name}`,
     image: 'Image',
@@ -705,6 +715,11 @@ const ZH: PanelCopy = {
     stopTurn: '停止生成',
     stoppingTurn: '正在停止…',
     addImages: '添加图片',
+    attach: '添加到消息',
+    attachMenu: '添加到消息',
+    pasteOrDropHint: '提示：可直接粘贴或拖入图片。',
+    queued: '排队中',
+    queuedHint: '当前回合结束后自动发送。',
     imageUnavailable: '当前 dsh 宿主未声明图片输入能力',
     removeImage: (name) => `移除 ${name}`,
     image: '图片',

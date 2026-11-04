@@ -22,6 +22,8 @@ import { getUiLocale } from '../i18n.ts'
 import { PANEL_COPY, type PanelCopy } from './strings.ts'
 import type { LiveViewFrame, LiveViewState } from '../background/live-view.ts'
 import { isNewerLiveFrame, LiveViewPanel, LiveViewToggle } from './LiveView.tsx'
+import { PlusMenu } from './PlusMenu.tsx'
+import { addQueuedEcho, pruneQueuedEchoes, type QueuedEcho } from './queued-echo.ts'
 import { QuestionCard } from './QuestionCard.tsx'
 import { MessageImages } from './MessageImages.tsx'
 import type { QuestionAnswer } from './questions.ts'
@@ -126,14 +128,6 @@ function SendIcon(): React.JSX.Element {
   return (
     <svg viewBox="0 0 20 20" aria-hidden="true">
       <path d="M10 15.5v-11M5.5 9 10 4.5 14.5 9" />
-    </svg>
-  )
-}
-
-function AttachmentIcon(): React.JSX.Element {
-  return (
-    <svg viewBox="0 0 20 20" aria-hidden="true">
-      <path d="m7.25 10.75 4.9-4.9a2.3 2.3 0 0 1 3.25 3.25l-6.2 6.2a3.55 3.55 0 1 1-5.02-5.02l6.2-6.2" />
     </svg>
   )
 }
@@ -444,6 +438,11 @@ export function App(): React.JSX.Element {
   const [state, setState] = useState<BridgeState>('stopped')
   const [settings, setSettings] = useState<PanelSettings | null>(null)
   const [rows, setRows] = useState<Row[]>([])
+  // Prompts the host queued behind a running turn, shown until their durable row lands.
+  const [queuedEchoes, setQueuedEchoes] = useState<QueuedEcho[]>([])
+  useEffect(() => {
+    setQueuedEchoes((current) => pruneQueuedEchoes(current, rows))
+  }, [rows])
   const [streamRow, setStreamRow] = useState<Row | null>(null)
   const [draft, setDraft] = useState<ComposerDraft<DraftImage>>(() => emptyComposerDraft())
   const input = draft.text
@@ -1368,6 +1367,10 @@ export function App(): React.JSX.Element {
     if ((text === '' && submittedImages.length === 0 && submittedSelection === null)
       || busy || addingImagesRef.current || sendingRef.current || sessionChangingRef.current || id === null) return
     sendingRef.current = true
+    // A prompt submitted while a turn runs is queued by the host and emits no row
+    // until that turn ends, so echo it locally to keep it visible.
+    const echoedWhileBusy = working
+    const echoSinceSeq = rows.length === 0 ? 0 : rows[rows.length - 1]?.seq ?? 0
     const submittedDraft: ComposerDraft<DraftImage> = { text, images: submittedImages }
     if (textOverride === undefined) {
       setDraft(emptyComposerDraft())
@@ -1387,6 +1390,13 @@ export function App(): React.JSX.Element {
         ),
         ...(clientTimeZone === undefined ? {} : { clientTimeZone }),
       })
+      if (echoedWhileBusy && text !== '') {
+        setQueuedEchoes((current) => addQueuedEcho(current, {
+          key: crypto.randomUUID(),
+          text,
+          sinceSeq: echoSinceSeq,
+        }))
+      }
       // Deferred sessions materialize on the first prompt; refresh so chips appear.
       void refreshSessionModels(id)
       if (submittedSelection !== null) {
@@ -1618,6 +1628,14 @@ export function App(): React.JSX.Element {
               : <MessageBody row={row} sessionId={sessionRef.current ?? ''} api={api} copy={copy} />}
           </div>
         ))}
+        {queuedEchoes.map((echo) => (
+          <div key={echo.key} className="row user queued">
+            <div className="body message-body md">
+              <span className="queued-badge" title={copy.app.queuedHint}>{copy.app.queued}</span>
+              <div className="md" dangerouslySetInnerHTML={{ __html: renderMarkdown(echo.text) }} />
+            </div>
+          </div>
+        ))}
         {streamRow !== null && (
           <div className="row assistant" aria-live="polite">
             <span className="assistant-avatar"><img src={whaleUrl} alt={copy.app.assistant} /></span>
@@ -1725,15 +1743,19 @@ export function App(): React.JSX.Element {
                   void addImageFiles(files)
                 }}
               />
-              <button
-                type="button"
-                className="attachment-button"
-                disabled={!sessionReady || busy || addingImages || imageLimits === null
-                  || draftImages.length >= imageLimits.maxImagesPerMessage}
-                aria-label={copy.app.addImages}
-                title={imageLimits === null ? copy.app.imageUnavailable : copy.app.addImages}
-                onClick={() => fileInputRef.current?.click()}
-              ><AttachmentIcon /></button>
+              <PlusMenu
+                label={copy.app.attach}
+                menuLabel={copy.app.attachMenu}
+                addImagesLabel={copy.app.addImages}
+                imageUnavailable={imageLimits === null
+                  ? copy.app.imageUnavailable
+                  : draftImages.length >= imageLimits.maxImagesPerMessage
+                    ? copy.app.imageTooMany(imageLimits.maxImagesPerMessage)
+                    : null}
+                hint={copy.app.pasteOrDropHint}
+                disabled={!sessionReady || busy || addingImages}
+                onPickImages={() => fileInputRef.current?.click()}
+              />
             </span>
             {working ? (
               <button
