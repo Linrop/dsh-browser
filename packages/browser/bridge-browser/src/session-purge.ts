@@ -49,6 +49,12 @@ export interface SessionPurgeDeps {
   acquireOwnership(sessionId: string): Promise<{ close(): Promise<void> }>
   /** Archive while the durable session still exists and exclusive ownership is held. */
   archiveSession(sessionId: string): Promise<void>
+  /**
+   * Optional post-success hook, run once after data removal and ownership
+   * release both succeed (for example, a workspace artifact sweep). It never
+   * changes the purge outcome: its failure is contained.
+   */
+  onPurged?(): void | Promise<void>
 }
 
 /**
@@ -151,4 +157,12 @@ export async function purgeSessionFiles(deps: SessionPurgeDeps, sessionId: strin
     }
   }
   if (failure !== undefined) throw failure
+  if (deps.onPurged !== undefined) {
+    try {
+      await deps.onPurged()
+    } catch {
+      // Post-success cleanup is advisory: the session data is already gone, so
+      // a hook failure must not turn a completed purge into an error.
+    }
+  }
 }

@@ -18,14 +18,14 @@ function abortWait(signal: AbortSignal): Promise<void> {
 function harness(options: {
   invoke?: TypertGatewayLike['invoke']
   open?: TypertGatewayLike['wireStream']['open']
-  fetch?: (request: Request) => Promise<Response>
+  fetch?: (request: Request, peer?: unknown) => Promise<Response>
 } = {}) {
   const invoke = vi.fn(options.invoke ?? (async () => ({ accepted: true })))
   const open = vi.fn(options.open ?? (async (_endpoint, _payload, _uplink, _peer, signal) => ({
     async *[Symbol.asyncIterator]() { await abortWait(signal) },
   })))
   const requestBodies: unknown[] = []
-  const fetch = vi.fn(options.fetch ?? (async (request: Request) => {
+  const fetch = vi.fn(options.fetch ?? (async (request: Request, _peer?: unknown) => {
     const body = await request.clone().json() as { rpcId: string }
     requestBodies.push(body)
     return Response.json({ type: 'server-response', rpcId: body.rpcId, result: { ok: true } })
@@ -44,10 +44,12 @@ function harness(options: {
       },
     },
   }
+  const peer = { principal: { kind: 'owner' }, signal: new AbortController().signal }
   const connection: HostConnectionLike = {
     createSharedFetchHandler: () => ({ fetch }),
+    createPeer: () => peer,
   }
-  return { api: createRemoteHostApi(gateway, connection), invoke, open, fetch, requestBodies }
+  return { api: createRemoteHostApi(gateway, connection), invoke, open, fetch, requestBodies, peer }
 }
 
 describe('dsh 0.2 Remote Host adapter', () => {
@@ -85,19 +87,22 @@ describe('dsh 0.2 Remote Host adapter', () => {
   })
 
   it('passes the signal in the fifth argument for DSH Desktop 2.x streams', async () => {
+    const observedPeers: unknown[] = []
     const open = vi.fn(async (_endpoint: string, _payload: unknown, uplink: AsyncIterable<unknown>, peer: unknown, signal: AbortSignal) => {
       expect(typeof uplink[Symbol.asyncIterator]).toBe('function')
-      expect(peer).toBeUndefined()
+      observedPeers.push(peer)
       expect(signal).toBeInstanceOf(AbortSignal)
       return { async *[Symbol.asyncIterator]() { yield { type: 'ready', clientId: 'test', host: {} }; await abortWait(signal) } }
     })
-    const { api } = harness({ open })
+    const { api, peer } = harness({ open })
     const controller = new AbortController()
     const iterator = api.events(controller.signal)[Symbol.asyncIterator]()
     const pending = iterator.next()
     await vi.waitFor(() => expect(open).toHaveBeenCalled())
     controller.abort()
     await pending.catch(() => undefined)
+    expect(observedPeers[0]).toBe(peer)
+    expect(open.mock.calls[0]?.[3]).toBe(peer)
     expect(open.mock.calls[0]?.[4]).toBeInstanceOf(AbortSignal)
   })
   it('preserves V3 durable streams and orders reconnect baselines before transient frames without advancing the durable cursor', async () => {
@@ -226,8 +231,32 @@ describe('dsh 0.2 Remote Host adapter', () => {
     }))
   })
 
+  it('passes the Host peer from connection.createPeer to every gateway invoke', async () => {
+    const { api, invoke, peer } = harness({
+      invoke: async ({ method }) => {
+        if (method === 'modelCatalog') {
+          return {
+            default: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
+            routableProviders: ['deepseek-official'],
+            groups: [],
+            failures: [],
+          }
+        }
+        return { accepted: true }
+      },
+    })
+
+    await api.call(call('session.list', {}))
+    await api.call(call('session.models', {}))
+
+    expect(invoke).toHaveBeenCalledTimes(2)
+    for (const [request] of invoke.mock.calls) {
+      expect(request.peer).toBe(peer)
+    }
+  })
+
   it('uses a session/follow snapshot for history and keeps that iterator for live events', async () => {
-    const { api, open } = harness({
+    const { api, open, peer } = harness({
       open: async (endpoint, _payload, _uplink, _peer, signal) => {
         if (endpoint === '$events') {
           return {
@@ -269,7 +298,7 @@ describe('dsh 0.2 Remote Host adapter', () => {
     const abort = new AbortController()
     const events = api.events(abort.signal)[Symbol.asyncIterator]()
     const live = events.next()
-    await vi.waitFor(() => { expect(open).toHaveBeenCalledWith('$events', { args: {} }, expect.anything(), undefined, expect.any(AbortSignal)) })
+    await vi.waitFor(() => { expect(open).toHaveBeenCalledWith('$events', { args: {} }, expect.anything(), peer, expect.any(AbortSignal)) })
 
     await expect(api.call(call('session.history', {
       sessionId: 'session-1',
@@ -321,13 +350,13 @@ describe('dsh 0.2 Remote Host adapter', () => {
           assistantStream: true,
         },
       },
-    }, expect.anything(), undefined, expect.any(AbortSignal))
+    }, expect.anything(), peer, expect.any(AbortSignal))
     abort.abort()
     await events.return?.()
   })
 
   it('forwards tail-page size through a one-shot session/follow snapshot', async () => {
-    const { api, open } = harness({
+    const { api, open, peer } = harness({
       open: async (endpoint) => {
         if (endpoint !== 'session/follow') throw new Error(endpoint)
         return {
@@ -353,7 +382,7 @@ describe('dsh 0.2 Remote Host adapter', () => {
           assistantStream: true,
         },
       },
-    }, expect.anything(), undefined, expect.any(AbortSignal))
+    }, expect.anything(), peer, expect.any(AbortSignal))
   })
 
   it('rejects invalid history pagination before calling the Host', async () => {
@@ -378,7 +407,7 @@ describe('dsh 0.2 Remote Host adapter', () => {
   })
 
   it('pages older history with a Host-legal throughSeq, never MAX_SAFE_INTEGER', async () => {
-    const { api, invoke, open } = harness({
+    const { api, invoke, open, peer } = harness({
       invoke: async ({ namespace, method, args }) => {
         if (`${namespace}/${method}` !== 'session/page') throw new Error(`${namespace}/${method}`)
         expect(args).toEqual({
@@ -419,7 +448,7 @@ describe('dsh 0.2 Remote Host adapter', () => {
     })
     expect(open).toHaveBeenCalledWith('session/follow', {
       args: { request: { address: { kind: 'session', sessionId: 'session-1' }, assistantStream: true } },
-    }, expect.anything(), undefined, expect.any(AbortSignal))
+    }, expect.anything(), peer, expect.any(AbortSignal))
     expect(invoke).toHaveBeenCalledOnce()
     const pageArgs = invoke.mock.calls[0]?.[0]?.args as { request: { throughSeq: number } }
     expect(pageArgs.request.throughSeq).toBe(42)
@@ -563,7 +592,7 @@ describe('dsh 0.2 Remote Host adapter', () => {
   })
 
   it('reads workspace.list from the workspace/follow baseline', async () => {
-    const { api, open } = harness({
+    const { api, open, peer } = harness({
       open: async (endpoint) => ({
         async *[Symbol.asyncIterator]() {
           if (endpoint === 'workspace/follow') {
@@ -577,7 +606,7 @@ describe('dsh 0.2 Remote Host adapter', () => {
       ok: true,
       value: { items: [{ workspaceId: 'w1' }], archivedSessionIds: ['s1'] },
     })
-    expect(open).toHaveBeenCalledWith('workspace/follow', { args: {} }, expect.anything(), undefined, expect.any(AbortSignal))
+    expect(open).toHaveBeenCalledWith('workspace/follow', { args: {} }, expect.anything(), peer, expect.any(AbortSignal))
   })
 
   it('bridges user questions through $events/result and unwraps the extension answer', async () => {
@@ -779,5 +808,190 @@ describe('dsh 0.2 Remote Host adapter', () => {
     })
     abort.abort()
     await expect(pending).resolves.toEqual({ done: true, value: undefined })
+  })
+
+  it('forwards the Host peer when the extension answers a user question', async () => {
+    const { api, fetch, peer } = harness({
+      open: async (endpoint, _payload, _uplink, _peer, signal) => {
+        if (endpoint === 'session/follow') {
+          return {
+            async *[Symbol.asyncIterator]() {
+              yield { type: 'snapshot', cursor: -1, records: [], hasMore: false }
+              await abortWait(signal)
+            },
+          }
+        }
+        if (endpoint !== '$events') throw new Error(endpoint)
+        return {
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'ready', clientId: 'client-answer', host: { home: '/home/test' } }
+            yield {
+              type: 'waterfall',
+              event: 'user-questions/request',
+              eventId: 'question-answer',
+              agentId: 'session-1',
+              request: { questions: [{ id: 'db', question: 'Database?' }] },
+            }
+            await abortWait(signal)
+          },
+        }
+      },
+    })
+    await expect(api.call(call('session.prompt', {
+      sessionId: 'session-1',
+      mode: 'queue',
+      content: [],
+    }))).resolves.toEqual({ ok: true, value: { accepted: true } })
+
+    const abort = new AbortController()
+    const events = api.events(abort.signal)[Symbol.asyncIterator]()
+    await expect(events.next()).resolves.toMatchObject({
+      done: false,
+      value: { rpcId: 'question-answer', method: 'question/requested' },
+    })
+    await expect(api.respond('question-answer', {
+      ok: true,
+      value: {
+        sessionId: 'session-1',
+        answer: { answers: [{ id: 'db', selected: ['SQLite'] }] },
+      },
+    }, abort.signal)).resolves.toEqual({ accepted: true })
+
+    expect(fetch).toHaveBeenCalledOnce()
+    expect(fetch.mock.calls[0]?.[1]).toBe(peer)
+    const request = fetch.mock.calls[0]?.[0] as Request
+    expect(await request.clone().json()).toMatchObject({
+      type: 'client-request',
+      method: '$events/result',
+      payload: {
+        args: {
+          clientId: 'client-answer',
+          eventId: 'question-answer',
+          outcome: { kind: 'result', value: { answers: [{ id: 'db', selected: ['SQLite'] }] } },
+        },
+      },
+    })
+    abort.abort()
+    await events.return?.()
+  })
+
+  it('forwards the Host peer when the extension dismisses a user question', async () => {
+    const { api, fetch, peer } = harness({
+      open: async (endpoint, _payload, _uplink, _peer, signal) => {
+        if (endpoint === 'session/follow') {
+          return {
+            async *[Symbol.asyncIterator]() {
+              yield { type: 'snapshot', cursor: -1, records: [], hasMore: false }
+              await abortWait(signal)
+            },
+          }
+        }
+        if (endpoint !== '$events') throw new Error(endpoint)
+        return {
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'ready', clientId: 'client-dismiss', host: { home: '/home/test' } }
+            yield {
+              type: 'waterfall',
+              event: 'user-questions/request',
+              eventId: 'question-dismiss',
+              agentId: 'session-1',
+              request: { questions: [{ id: 'db', question: 'Database?' }] },
+            }
+            await abortWait(signal)
+          },
+        }
+      },
+    })
+    await expect(api.call(call('session.prompt', {
+      sessionId: 'session-1',
+      mode: 'queue',
+      content: [],
+    }))).resolves.toEqual({ ok: true, value: { accepted: true } })
+
+    const abort = new AbortController()
+    const events = api.events(abort.signal)[Symbol.asyncIterator]()
+    await expect(events.next()).resolves.toMatchObject({
+      done: false,
+      value: { rpcId: 'question-dismiss', method: 'question/requested' },
+    })
+    await expect(api.respond('question-dismiss', {
+      ok: false,
+      error: {
+        code: 'cancelled',
+        message: 'the user dismissed this question request',
+        details: {},
+      },
+    }, abort.signal)).resolves.toEqual({ accepted: true })
+
+    expect(fetch).toHaveBeenCalledOnce()
+    expect(fetch.mock.calls[0]?.[1]).toBe(peer)
+    const request = fetch.mock.calls[0]?.[0] as Request
+    const body = await request.clone().json() as {
+      payload: { args: { outcome: { kind: string; error: { code: string } } } }
+    }
+    expect(body.payload.args.outcome).toMatchObject({ kind: 'rejected' })
+    expect(body.payload.args.outcome.error.code).toBe('cancelled')
+    abort.abort()
+    await events.return?.()
+  })
+
+  it('forwards the Host peer when the extension yields an approval waterfall', async () => {
+    const { api, fetch, requestBodies, peer } = harness({
+      open: async (endpoint, _payload, _uplink, _peer, signal) => {
+        if (endpoint !== '$events') throw new Error(endpoint)
+        return {
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'ready', clientId: 'client-approval', host: { home: '/home/test' } }
+            yield {
+              type: 'waterfall',
+              event: 'approval/request',
+              eventId: 'approval-1',
+              agentId: 'session-1',
+              request: {},
+            }
+            await abortWait(signal)
+          },
+        }
+      },
+    })
+
+    const abort = new AbortController()
+    const events = api.events(abort.signal)[Symbol.asyncIterator]()
+    const pending = events.next()
+    await vi.waitFor(() => { expect(fetch.mock.calls.length).toBe(1) })
+    expect(requestBodies[0]).toMatchObject({
+      payload: { args: { eventId: 'approval-1', outcome: { kind: 'next' } } },
+    })
+    expect(fetch.mock.calls[0]?.[1]).toBe(peer)
+    abort.abort()
+    await expect(pending).resolves.toEqual({ done: true, value: undefined })
+  })
+
+  it('forwards the Host peer on every cancel and session mutation invoke', async () => {
+    const { api, invoke, peer } = harness()
+
+    await expect(api.call(call('session.cancel', { sessionId: 'session-1' }))).resolves.toMatchObject({ ok: true })
+    await expect(api.call(call('session.selectModel', {
+      sessionId: 'session-1',
+      provider: 'deepseek-official',
+      model: 'deepseek-v4-flash',
+    }))).resolves.toMatchObject({ ok: true })
+    await expect(api.call(call('session.attachment', {
+      sessionId: 'session-1',
+      name: 'notes.txt',
+      mimeType: 'text/plain',
+    }))).resolves.toMatchObject({ ok: true })
+    await expect(api.call(call('workspace.archiveSession', { sessionId: 'session-1' }))).resolves.toMatchObject({ ok: true })
+    await expect(api.call(call('session.create', { sessionId: 'session-1' }))).resolves.toMatchObject({ ok: true })
+    await expect(api.call(call('session.prompt', {
+      sessionId: 'session-1',
+      mode: 'queue',
+      content: [],
+    }))).resolves.toMatchObject({ ok: true })
+
+    expect(invoke).toHaveBeenCalledTimes(6)
+    for (const [request] of invoke.mock.calls) {
+      expect(request.peer).toBe(peer)
+    }
   })
 })

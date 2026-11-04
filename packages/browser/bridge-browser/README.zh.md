@@ -16,8 +16,21 @@ dsh 的**浏览器操作桥**：在宿主 webserver 上挂载一个 **token 认�
 | `maxInteractiveItems` | `number` | 60 | 单次快照交互清单条数上限。 |
 | `sessionWorkspacePath` | `string` | `~/.dsh/browser-sessions` | 扩展创建的会话所用的专用 Host Workspace。插件会在首次调用未显式指定工作区的 `session.create` 时创建并幂等注册该目录；会话的 cwd 随之变为此路径，因此 GUI 会显示 `browser-sessions` 工作区分组。设为 `""` 可让会话继续显示在“未分组”中。 |
 | `deferSessionCreate` | `boolean` | `true` | 会话只在第一条消息时才真正创建：`session.create` 先返回一个内存暂定 ID（不落库），历史读取为空，第一次 `session.prompt` 才创建真实会话（同一 ID、回放原始创建参数）。只打开面板不说话，会在会话库/GUI 里不留任何痕迹。 |
+| `artifactMaxBytes` | `number` | 2147483648 | 产物清扫在会话工作区里保留的字节上限。 |
+| `artifactMaxFiles` | `number` | 2000 | 产物清扫在会话工作区里保留的文件数上限。 |
+| `artifactTtlMs` | `number` | 604800000 | 超过该年龄的产物无条件淘汰，不受另外两个预算影响。 |
+| `artifactSweepIntervalMs` | `number` | 600000 | 两次产物清扫之间的间隔。 |
+| `artifactRoot` | `string` | `""` | 清扫根。为空时退回 `sessionWorkspacePath`。删除边界优先取 `DSH_BROWSER_SESSION_WORKSPACE`，缺省即该根自身，因此把它设成 `~/Desktop` 时它自己就是边界、只剩 `$HOME`、文件系统根、Git 三道闸；请有意设置。两者都没有边界时一个文件也不删。 |
 
 工作区分组采用尽力而为方式。如果组合没有 workspace 域、目录创建失败，或 `workspace.create` 拒绝该路径，插件会记录一条警告，并在不注入工作区的情况下发送所有会话创建请求，因此浏览器聊天仍可使用。
+
+## 产物预算
+
+会话工作区是缓存区，不是交付物目录。扩展写进去的截图、页面转储和另存的 HTML 会在启动时、每个 `artifactSweepIntervalMs`（默认 10 分钟）以及会话清除之后各清扫一次，因此长时间 QA 不会把磁盘写满。交付物请放项目目录；只留在工作区里的文件随时可能被淘汰。
+
+保留策略有三个互相独立的限制，都通过上面四个键配置：总字节不超过 `artifactMaxBytes`、文件数不超过 `artifactMaxFiles`、且没有文件早于 `artifactTtlMs`。淘汰按修改时间从旧到新进行，直到三个条件同时满足；每条清扫日志都会写明 `root=<path>` 与 `skippedGit` 计数。只有图片受管理（大小写不敏感）：`.png`、`.jpg`、`.jpeg`、`.webp`、`.bmp`、`.ppm`、`.gif`；HTML 与页面转储一律不删，因为它们经常就是交付物。符号链接既不跟随也不删除，工作区里的其他文件一律不管。
+
+删除之前，清扫会解析真实路径并要求边界来自 `DSH_BROWSER_SESSION_WORKSPACE`（优先）或非空的 `artifactRoot`；两者都没有时一个文件也不删，并按根只记一条 `no artifact boundary configured` 日志。清扫根必须等于该边界或位于其下——当边界就是 `artifactRoot` 本身时，这个包含校验必然成立，所以该路径必须有意指定；此外 `$HOME`、文件系统根、以及本身就是 Git 仓库的根都会被拒绝。根内更深处的 `.git` 目录会被跳过（不进入、不触碰），并在首次发现时记一次 `skippedGit=1`，因此在 workspace 里 `git init` 不会让预算失效。可选环境变量 `DSH_BROWSER_ARTIFACT_MAX_BYTES`、`DSH_BROWSER_ARTIFACT_MAX_FILES`、`DSH_BROWSER_ARTIFACT_TTL_MS`、`DSH_BROWSER_ARTIFACT_SWEEP_INTERVAL_MS` 未设置或不是数字时回退到 schema 默认值。
 
 ## 使用
 
@@ -67,9 +80,19 @@ npx @deepseek-ai/dsh@0.2.0-rc.2 web
 | 工具 | 用途 |
 |---|---|
 | `browser_snapshot` | 结构化文本快照（标题/URL/正文/清单/表单）；`delta: true` 只返回变化。 |
-| `browser_click` / `browser_type` / `browser_press` | 按稳定编号操作清单元素。 |
+| `browser_click` / `browser_type` / `browser_press` | 按稳定编号操作清单元素。`browser_click` 另支持 `button`、`count`（双击/三击）与 `modifiers`（`ctrl+shift`），需要扩展 0.3.0。 |
+| `browser_select` / `browser_upload_file` | 选择 `<select>` 选项；把本地文件挂到文件输入框。`{ path }` 形式的条目只在会话工作区或该会话的 artifact 根内读取，内联 `{ name, base64 }` 条目单次上限 10 MB。 |
+| `browser_hover` / `browser_drag` | 按清单编号或视口坐标悬停、拖拽；扩展能附加调试器时发送真实输入事件，否则退化为合成 DOM 事件并在结果里说明。 |
+| `browser_find` | 用查询词对快照清单打分，返回最接近的编号。 |
+| `browser_evaluate` | 在用户批准后执行页面 JavaScript；结果会脱敏并限制长度。 |
+| `browser_screenshot` | 把受控标签页截图写入工作区文件，返回路径供 `read_image` 读取。 |
+| `browser_console` / `browser_network` | 读取受控标签页的 console 消息与网络请求缓冲。 |
+| `browser_batch` | 顺序执行最多 25 个工具调用，首个失败即停。 |
 | `browser_scroll` / `browser_navigate` / `browser_open_tab` / `browser_back` / `browser_forward` / `browser_reload` | 页面移动。 |
+| `browser_resize` | 调整承载受控标签页的窗口尺寸。 |
 | `browser_get_text` / `browser_wait` | 读区域文本 / 稳定检测。 |
+
+0.1.0 新增的工具需要扩展 0.3.0：对旧扩展调用时会返回明确的「请 reload 或更新扩展」结果，而不是原始 `Unknown action` 错误；原有 15 个工具行为保持不变。
 
 ## 模型体验
 
@@ -86,6 +109,10 @@ npx @deepseek-ai/dsh@0.2.0-rc.2 web
 ## 已知限制与后续工作
 
 - 仅一个活动扩展连接（第二个窗口顶替第一个）。
+- `browser_screenshot` 把文件写到 `<artifactRoot>/<sessionId>/screenshots/`；没有配置 artifact 根时工具会明确报告没有可用目录。图像以路径返回、不返回内联图片块，模型需用 `read_image` 读回。
+- `browser_console` 与 `browser_network` 只从首次在某个标签页调用时开始采集；缓冲只在内存、文档来源变化即清空、标签页关闭即丢弃。
+- `browser_evaluate` 与 `browser_upload_file` 属状态变更类工具，走扩展的审批流程；`browser_evaluate` 在页面主世界执行，受保护页面不可用。
+- `browser_hover`、`browser_drag` 以及带 `button`/`count`/`modifiers` 的 `browser_click`，在扩展对受控标签页持有调试会话时发送真实输入事件，否则退化为合成 DOM 事件并在结果中说明。
 - 可访问的跨源 iframe 会进入快照，并通过稳定的 `(frame, index)` 地址执行操作；受保护或已销毁的 frame 会标记为不可访问，不影响整页快照。
 - token 手动轮换（改 `~/.dsh/ext-bridge-token` 或配置 `token`），无过期。
 - Playwright 驱动的扩展 e2e 会在缺少可用的 Chromium 可执行文件或构建完成的扩展包时自行跳过。

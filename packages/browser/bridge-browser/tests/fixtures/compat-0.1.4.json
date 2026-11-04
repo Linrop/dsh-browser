@@ -1,0 +1,167 @@
+{
+  "version": "0.1.4",
+  "source": "Derived from the 0.1.4 src/protocol.ts TYPE DEFINITIONS recovered from the 2026-11-04 backup tarball; these are shape-derived fixtures, not frames recorded from a running 0.1.4 bundle.",
+  "caps": {
+    "textOnly": true,
+    "snapshotMaxChars": 32000,
+    "maxInteractiveItems": 60
+  },
+  "clientFrames": [
+    {
+      "t": "hello",
+      "token": "compat-0-1-4-token",
+      "caps": {
+        "textOnly": true,
+        "snapshotMaxChars": 32000,
+        "maxInteractiveItems": 60
+      }
+    },
+    {
+      "t": "rpc",
+      "id": "r1",
+      "method": "session.list",
+      "payload": {}
+    },
+    {
+      "t": "respond",
+      "id": "q1",
+      "rpcId": "r1",
+      "result": {
+        "ok": true,
+        "value": {
+          "accepted": true
+        }
+      }
+    },
+    {
+      "t": "tool.result",
+      "id": "t1",
+      "ok": true,
+      "result": {
+        "text": "page text"
+      }
+    },
+    {
+      "t": "tool.result",
+      "id": "t2",
+      "ok": false,
+      "error": {
+        "code": "action-failed",
+        "message": "boom"
+      }
+    },
+    {
+      "t": "pong"
+    }
+  ],
+  "hostFrames": [
+    {
+      "t": "hello.ok",
+      "caps": {
+        "textOnly": true,
+        "snapshotMaxChars": 32000,
+        "maxInteractiveItems": 60
+      }
+    },
+    {
+      "t": "rpc.result",
+      "id": "r1",
+      "ok": true,
+      "result": {
+        "type": "server-response",
+        "rpcId": "r1",
+        "result": {
+          "ok": true,
+          "value": {
+            "sessions": []
+          }
+        }
+      }
+    },
+    {
+      "t": "rpc.result",
+      "id": "r2",
+      "ok": false,
+      "error": {
+        "code": "internal",
+        "message": "failed"
+      }
+    },
+    {
+      "t": "respond.result",
+      "id": "q1",
+      "ok": true,
+      "result": {
+        "accepted": true
+      }
+    },
+    {
+      "t": "respond.result",
+      "id": "q2",
+      "ok": false,
+      "error": {
+        "code": "internal",
+        "message": "failed"
+      }
+    },
+    {
+      "t": "event",
+      "frame": {
+        "rpcId": "e1",
+        "method": "session/subscribed",
+        "payload": {
+          "type": "session/subscribed",
+          "sessionId": "s1",
+          "lastSeq": 0
+        }
+      }
+    },
+    {
+      "t": "tool.call",
+      "id": "c1",
+      "name": "browser_snapshot",
+      "args": {
+        "delta": false
+      },
+      "expiresAt": 1893456000000
+    },
+    {
+      "t": "tool.call",
+      "id": "c2",
+      "name": "browser_click",
+      "args": {
+        "index": 3
+      },
+      "expiresAt": 1893456000000,
+      "sessionId": "session-1"
+    },
+    {
+      "t": "tool.cancel",
+      "id": "c1"
+    },
+    {
+      "t": "ping"
+    },
+    {
+      "t": "error",
+      "code": "stream-failed",
+      "message": "event stream failed"
+    }
+  ],
+  "legacyToolErrorCodes": [
+    "no-active-tab",
+    "content-unavailable",
+    "action-failed",
+    "timeout",
+    "bridge-closed",
+    "bad-args",
+    "internal"
+  ],
+  "addedToolErrorCodes": [
+    "tab_outside",
+    "protected-page",
+    "js-result-not-serializable",
+    "debugger-unavailable",
+    "send_failed"
+  ]
+}

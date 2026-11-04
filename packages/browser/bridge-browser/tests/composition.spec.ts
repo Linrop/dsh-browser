@@ -109,6 +109,7 @@ const RemoteApiHost = {
           })
         },
       }),
+      createPeer: () => ({ principal: { kind: 'owner' }, signal: new AbortController().signal }),
     }
     ctx.provide('typertGateway' as never, gateway as never)
     ctx.provide('connection' as never, connection as never)
