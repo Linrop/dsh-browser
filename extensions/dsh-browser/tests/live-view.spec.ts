@@ -29,6 +29,7 @@ function harness(overrides: Partial<LiveViewDeps> = {}): {
   const ack = vi.fn(async () => { events.push('ack') })
   const deps: LiveViewDeps = {
     isDebuggerAvailable: () => true,
+    isOwnPage: async () => false,
     isTabActive: async () => true,
     startScreencast: start,
     stopScreencast: stop,
@@ -96,6 +97,14 @@ describe('live view lifecycle', () => {
     await h.controller.setTarget(7)
     expect(h.start).not.toHaveBeenCalled()
     expect(h.states.at(-1)).toEqual({ status: 'unavailable', code: 'no-debugger', tabId: 7 })
+  })
+
+  it('refuses to stream the panel\'s own page, which would show the panel in the panel', async () => {
+    const h = harness({ isOwnPage: async () => true })
+    await h.controller.setWatching(true)
+    await h.controller.setTarget(7)
+    expect(h.start).not.toHaveBeenCalled()
+    expect(h.states.at(-1)).toMatchObject({ status: 'unavailable', code: 'own-page', tabId: 7 })
   })
 
   it('reports a background tab as unavailable instead of pretending to stream', async () => {

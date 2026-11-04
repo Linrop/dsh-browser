@@ -26,6 +26,7 @@ export type LiveViewUnavailableCode =
   | 'no-controlled-tab'
   | 'no-debugger'
   | 'tab-not-active'
+  | 'own-page'
   | 'attach-failed'
   | 'debugger-detached'
 
@@ -57,6 +58,8 @@ export interface LiveViewFrame {
 export interface LiveViewDeps {
   /** Whether this browser build exposes `chrome.debugger`. */
   isDebuggerAvailable(): boolean
+  /** Whether the tab shows one of this extension's own pages. */
+  isOwnPage(tabId: number): Promise<boolean>
   /** Whether the tab is the visible tab of its window. */
   isTabActive(tabId: number): Promise<boolean>
   /** Start the JPEG screencast and keep the debugger attached. */
@@ -223,6 +226,19 @@ export class LiveViewController {
     if (!this.deps.isDebuggerAvailable()) {
       await this.stopStream()
       this.publish({ status: 'unavailable', code: 'no-debugger', tabId })
+      return
+    }
+    // Showing the panel inside the panel is a feedback loop, not a preview.
+    let ownPage = false
+    try {
+      ownPage = await this.deps.isOwnPage(tabId)
+    } catch {
+      ownPage = false
+    }
+    if (generation !== this.generation) return
+    if (ownPage) {
+      await this.stopStream()
+      this.publish({ status: 'unavailable', code: 'own-page', tabId })
       return
     }
     let active = false

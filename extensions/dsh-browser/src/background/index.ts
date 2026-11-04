@@ -717,6 +717,14 @@ function broadcastLiveFrame(frame: LiveViewFrame): void {
 
 const liveView = new LiveViewController({
   isDebuggerAvailable,
+  isOwnPage: async (tabId: number): Promise<boolean> => {
+    try {
+      const tab = await chrome.tabs.get(tabId)
+      return (tab.url ?? '').startsWith(chrome.runtime.getURL(''))
+    } catch {
+      return false
+    }
+  },
   isTabActive: async (tabId: number): Promise<boolean> => {
     try {
       const tab = await chrome.tabs.get(tabId)
