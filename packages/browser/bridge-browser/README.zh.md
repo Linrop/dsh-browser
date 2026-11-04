@@ -84,8 +84,9 @@ npx @deepseek-ai/dsh@0.2.0-rc.2 web
 | `browser_select` / `browser_upload_file` | 选择 `<select>` 选项；把本地文件挂到文件输入框。`{ path }` 形式的条目只在会话工作区或该会话的 artifact 根内读取，内联 `{ name, base64 }` 条目单次上限 10 MB。 |
 | `browser_hover` / `browser_drag` | 按清单编号或视口坐标悬停、拖拽；扩展能附加调试器时发送真实输入事件，否则退化为合成 DOM 事件并在结果里说明。 |
 | `browser_find` | 用查询词对快照清单打分，返回最接近的编号。 |
+| `browser_list_tabs` / `browser_close` | 列出可访问标签页的稳定 ID、窗口/顺序、归属/受控状态与 `origin`（`created` 表示本会话打开，`adopted` 表示早已存在或被跟随）；不带 `tabId` 时，`browser_close` 关闭本会话打开的全部标签页并返回 id 列表，没有可关的也成功并返回空列表，点名不属于本会话的标签页会被拒绝。 |
 | `browser_evaluate` | 在用户批准后执行页面 JavaScript；结果会脱敏并限制长度。 |
-| `browser_screenshot` | 把受控标签页截图写入工作区文件，返回路径供 `read_image` 读取。 |
+| `browser_screenshot` | 把受控标签页截图写入工作区文件，返回路径供 `read_image` 读取。`scale` 只接受 1/2/3（带裁剪区时默认 2）；裁剪区取整到整视口像素，负原点、零尺寸、越出视口、单边超过 8192 px 或总像素超过 4,194,304 一律拒绝并回显真实视口与被拒矩形，不再静默夹取，返回的宽高取自该计划值。 |
 | `browser_console` / `browser_network` | 读取受控标签页的 console 消息与网络请求缓冲。 |
 | `browser_batch` | 顺序执行最多 25 个工具调用，首个失败即停。 |
 | `browser_scroll` / `browser_navigate` / `browser_open_tab` / `browser_back` / `browser_forward` / `browser_reload` | 页面移动。 |
@@ -99,7 +100,7 @@ npx @deepseek-ai/dsh@0.2.0-rc.2 web
 - **Token 影响**：一次 `browser_snapshot`（默认 32k 字符）对常见英文文本约为 8–10k token，具体取决于语言和分词器；delta 快照只需零头。系统提示段落引导模型按需快照而非囤积页面文本。
 - **KV 缓存影响**：无（快照不做服务端缓存）。
 - **延迟**：每次动作等待扩展在真实页面执行 + 稳定检测（通常 0.2–2s；导航最长 5s）。
-- **失败模式**：`bridge-closed`（扩展未连接）、`timeout`、`no-active-tab`、`content-unavailable`（页面需刷新）、`action-failed`（编号过期——模型应重新快照）。
+- **失败模式**：`bridge-closed`（扩展未连接）、`timeout`、`no-active-tab`、`content-unavailable`（页面需刷新）、`action-failed`（编号过期且按选择器重新定位也未成功——模型应重新快照；重新定位成功会在结果里说明，0 命中或多命中则回报选择器与命中计数）。
 
 ## 扩展点
 
@@ -109,10 +110,11 @@ npx @deepseek-ai/dsh@0.2.0-rc.2 web
 ## 已知限制与后续工作
 
 - 仅一个活动扩展连接（第二个窗口顶替第一个）。
-- `browser_screenshot` 把文件写到 `<artifactRoot>/<sessionId>/screenshots/`；没有配置 artifact 根时工具会明确报告没有可用目录。图像以路径返回、不返回内联图片块，模型需用 `read_image` 读回。
-- `browser_console` 与 `browser_network` 只从首次在某个标签页调用时开始采集；缓冲只在内存、文档来源变化即清空、标签页关闭即丢弃。
+- `browser_screenshot` 把文件写到 `<artifactRoot>/<sessionId>/screenshots/`；没有配置 artifact 根时工具会明确报告没有可用目录。图像以路径返回、不返回内联图片块，模型需用 `read_image` 读回。`scale` 只接受 1/2/3；小于 1 的取值（此前 0.1–1 区间）会作为非法参数报错。
+- `browser_console` 与 `browser_network` 只从首次在某个标签页调用时开始采集；缓冲只在内存，主框架文档被替换（刷新或跨文档导航）时清空，同一文档内的 hash、query 与 SPA 变化则保留，标签页关闭即丢弃。
 - `browser_evaluate` 与 `browser_upload_file` 属状态变更类工具，走扩展的审批流程；`browser_evaluate` 在页面主世界执行，受保护页面不可用。
 - `browser_hover`、`browser_drag` 以及带 `button`/`count`/`modifiers` 的 `browser_click`，在扩展对受控标签页持有调试会话时发送真实输入事件，否则退化为合成 DOM 事件并在结果中说明。
+- 侧栏可选的实时画面（默认关闭）把受控标签页的 `Page.startScreencast` JPEG 帧送到面板：帧先 ack 再处理，旧帧按序号丢弃，切换受控标签页或调试器断开即清图。后台标签页、无 debugger 与 Firefox 上的实际停帧时序尚未真机验证。
 - 可访问的跨源 iframe 会进入快照，并通过稳定的 `(frame, index)` 地址执行操作；受保护或已销毁的 frame 会标记为不可访问，不影响整页快照。
 - token 手动轮换（改 `~/.dsh/ext-bridge-token` 或配置 `token`），无过期。
 - Playwright 驱动的扩展 e2e 会在缺少可用的 Chromium 可执行文件或构建完成的扩展包时自行跳过。

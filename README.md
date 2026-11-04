@@ -55,9 +55,10 @@ The paired Playwright / extension duration ratio was **1.24** (95% CI **1.16–1
 | Press keys | `browser_press` | Keyboard events such as Enter, Tab, Escape, and arrow keys |
 | Scroll | `browser_scroll` | Viewport scrolling: up, down, top, and bottom |
 | Navigate | `browser_navigate` / `browser_open_tab` / `browser_back` / `browser_forward` / `browser_reload` | Navigation inside the controlled tab, or open a URL in a new tab and follow it (`active:false` keeps the current tab in front) |
-| List tabs | `browser_list_tabs` | List accessible tabs with stable IDs, titles, URLs, window/index metadata, and active/controlled state |
+| List tabs | `browser_list_tabs` | List accessible tabs with stable IDs, titles, URLs, window/index metadata, owned/controlled state, and `origin` (`created` when this session opened the tab, `adopted` when it did not) |
 | Follow tab | `browser_follow_tab` | Bind later browser tools to a tab returned by `browser_list_tabs` without activating it |
 | Close tab | `browser_close_tab` | Close a tab returned by `browser_list_tabs` |
+| Close session tabs | `browser_close` | Without `tabId`, close every tab this session opened and report their ids; when there are none it succeeds with an empty list, and a tab this session does not own is refused |
 | Read region | `browser_get_text` | Lazy-loaded or partial page text |
 | Wait for stability | `browser_wait` | Page-load and render-settle detection |
 | Choose an option | `browser_select` | Select by option value, label, or index; an unmatched value lists what is available |
@@ -66,7 +67,7 @@ The paired Playwright / extension duration ratio was **1.24** (95% CI **1.16–1
 | Hover and drag | `browser_hover` / `browser_drag` | By inventory index or viewport coordinates; real input events through a debugger session, synthesized DOM events otherwise |
 | Click variants | `browser_click` with `button` / `count` / `modifiers` | Right/middle click, double/triple click, and modifier chords |
 | Run page JavaScript | `browser_evaluate` | Requires approval; results are redacted and length-capped |
-| Screenshot | `browser_screenshot` | Whole viewport or a clipped region, written by the host as a file path |
+| Screenshot | `browser_screenshot` | Whole viewport or an integer clip in viewport pixels, written by the host as a file path; `scale` is 1, 2, or 3 and defaults to 2 with a region; a negative origin, a zero size, a clip outside the viewport, or a render over 8192 px per side or 4,194,304 pixels fails with the real viewport and the requested rectangle, and the returned dimensions come from that plan |
 | Console and network | `browser_console` / `browser_network` | Buffered per tab from the first call; credentials redacted, request bodies recorded as byte counts |
 | Resize the window | `browser_resize` | Resize the window holding the controlled tab |
 | Batch calls | `browser_batch` | Up to 25 sequential tool calls, stop at the first failure |

@@ -16,9 +16,10 @@ The **browser-operation end** of dsh: the model reads and operates the browser p
 | Keys | `browser_press` | Enter/Tab/Escape/arrows etc. |
 | Scroll | `browser_scroll` | Viewport scrolling (up/down/top/bottom) |
 | Navigate | `browser_navigate` / `browser_open_tab` / `browser_back` / `browser_forward` / `browser_reload` | Navigation inside the controlled tab, or open a URL in a new tab and follow it |
-| List tabs | `browser_list_tabs` | List accessible tabs with stable IDs, titles, URLs, and active/controlled state |
+| List tabs | `browser_list_tabs` | List accessible tabs with stable IDs, titles, URLs, owned/controlled state, and `origin` (`created` when this session opened the tab, `adopted` when it did not) |
 | Follow tab | `browser_follow_tab` | Bind later browser tools to a listed tab without activating it |
 | Close tab | `browser_close_tab` | Close a listed tab |
+| Close session tabs | `browser_close` | Close every tab this session opened when no tab is named; when there are none it succeeds with an empty list, and a tab this session does not own is refused |
 | Read region | `browser_get_text` | Lazy-loaded content / partial text |
 | Wait | `browser_wait` | Page load and render-settle detection |
 | Choose an option | `browser_select` | Select by option value, label, or index; an unmatched value lists the available options |
@@ -27,7 +28,8 @@ The **browser-operation end** of dsh: the model reads and operates the browser p
 | Hover / drag | `browser_hover` / `browser_drag` | Real input events through a debugger session on the controlled tab; synthesized DOM events when it cannot attach |
 | Click variants | `browser_click` with `button` / `count` / `modifiers` | Right/middle click, double/triple click, and modifier chords through a debugger session |
 | Run page JavaScript | `browser_evaluate` | Requires approval; results are redacted and length-capped |
-| Screenshot | `browser_screenshot` | Whole viewport or a clipped region, saved by the host as a file path |
+| Screenshot | `browser_screenshot` | Whole viewport or an integer clip in viewport pixels, saved by the host as a file path; `scale` is 1, 2, or 3 and defaults to 2 with a region; a negative origin, a zero size, a clip outside the viewport, or a render over 8192 px per side or 4,194,304 pixels fails with the real viewport and the requested rectangle, and the reported dimensions come from that plan |
+| Live view | side panel toggle | Optional JPEG view of the controlled tab, off by default: frames from a CDP screencast are acknowledged before handling, stale frames are dropped by sequence, and switching tabs or losing the debugger clears the image |
 | Console and network | `browser_console` / `browser_network` | Buffered per tab from the first call; headers and URL credentials redacted, request bodies recorded as byte counts only |
 | Resize the window | `browser_resize` | Resize the window holding the controlled tab |
 | Batch | `browser_batch` | Sequential tool calls with stop-on-first-error |
@@ -119,7 +121,7 @@ For extension-only development, load `extensions/dsh-browser/dist/` from `chrome
 
 - **Snapshot as the view**: the model's entire view of the page is structured text (title/URL/main/numbered elements/forms), budgeted at 32k chars by default (plugin-configurable, negotiated to the extension via `hello.ok`).
 - **Page text is untrusted input**: snapshots and targeted text reads are enclosed in a fresh nonce-bound trust marker and explicitly tell the model never to treat page-authored commands as instructions. This is defense in depth; extension-side action approval is the enforcement boundary.
-- **Stable numbering**: element numbers persist across snapshots (WeakMap + `data-dsh-el`), so the model can say "click 7"; a large page change explicitly reports "numbers reindexed".
+- **Stable numbering**: element numbers persist across snapshots (WeakMap + `data-dsh-el`), so the model can say "click 7"; a large page change explicitly reports "numbers reindexed". Each number also records a stable CSS selector, so an action on a re-rendered node re-locates it and says so in the result; zero or multiple matches fail with the selector and the match count.
 - **Delta mode**: `browser_snapshot({delta:true})` returns only changed element numbers, saving tokens.
 - **Privacy**: password/credit-card values always render as `••••` and never leave the page; accessible names never use a sensitive field's current value.
 - **Tab affinity**: prompt submission binds the active tab before the model starts working; a direct browser-tool call also performs the initial bind when needed. A manual tab/window switch pauses later tools and asks whether the assistant should stay on the original tab or follow the newly visible one. Staying permits explicit background operation without changing the user's visible tab; following resets page-reference state. A closed controlled tab fails closed until the user selects the current page, and a switch withdraws any open action approval.
@@ -145,6 +147,7 @@ Chrome uses `sidePanel`; Firefox uses `sidebar_action`. Both request `storage` (
 - Real input reaches a page only while its tab is active in a focused window. When it cannot, pointer tools synthesize DOM events instead, say so, and keep the requested button, click count and modifier semantics; browser-level defaults such as navigation and native context menus do not follow synthesized events.
 - Drag targets that declare native drag-and-drop semantics receive `Input.dispatchDragEvent` enter/over/drop events with a `text/plain` payload; targets without them keep the plain mouse-drag sequence, and a browser that refuses the drag protocol falls back to synthesized drag events.
 - Native drag-and-drop detection reads only what the isolated world can observe: a `draggable` attribute on the endpoint or an ancestor, and inline drag handlers on the element, document (`ondrop`), document element, or window. A page that registers drag/drop listeners exclusively with `addEventListener` cannot be detected and keeps the plain mouse-drag path, so its drop handlers may not run.
-- Console and network buffers survive an idle debugger detach: history is kept until the page's origin changes, the tab closes, or the session ends. Re-attaching replays Chrome's log history, and those replays are de-duplicated against what the buffer already holds.
-- The fallback screenshot path uses `captureVisibleTab`, so it can only capture the visible area of the active tab and ignores `scale`; the debugger path captures the controlled tab with clip and scale.
+- Console and network buffers survive an idle debugger detach: history is kept until the main-frame document is replaced (reload or cross-document navigation), the tab closes, or the session ends, while same-document hash, query, and SPA changes keep it. Re-attaching replays Chrome's log history, and those replays are de-duplicated against what the buffer already holds.
+- The fallback screenshot path uses `captureVisibleTab`, so it can only capture the visible area of the active tab and ignores `scale`; the debugger path captures the controlled tab with clip and scale. Supported scales are 1, 2, and 3 only; a `scale` below 1 (the earlier 0.1–1 range) is rejected as an invalid argument.
+- The live view's actual frame-stop timing on background tabs, without a debugger, and on Firefox has not been verified on real hardware; in those states the panel reports the reason instead of showing a stale frame.
 - `browser_console` and `browser_network` start recording at the first call on a tab. Without a debugger session they hook `console`, `fetch`, and `XMLHttpRequest` in the page world, which misses requests issued before the hook, document/resource requests, and service-worker traffic; the result says which path produced it.

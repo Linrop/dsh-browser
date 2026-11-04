@@ -84,8 +84,9 @@ Each `respond` carries a globally unique transport id as well as the host intera
 | `browser_select` / `browser_upload_file` | Choose a `<select>` option; attach local files to a file input. `{ path }` entries are read inside the session working directory or the session artifact root; inline `{ name, base64 }` entries are size-capped at 10 MB. |
 | `browser_hover` / `browser_drag` | Hover and drag by inventory index or viewport coordinates; real input events when the extension can attach to the tab, synthesized DOM events otherwise. |
 | `browser_find` | Score the snapshot inventory against a query and return the closest matching indices. |
+| `browser_list_tabs` / `browser_close` | List open tabs with stable ids, window/index metadata, owned/controlled state, and `origin` (`created` when this session opened the tab, `adopted` when it pre-existed or was followed); without `tabId`, `browser_close` closes every tab this session opened and reports the ids, succeeds with an empty list when there are none, and refuses a tab this session does not own. |
 | `browser_evaluate` | Run page JavaScript after the user approves it; results are redacted and length-capped. |
-| `browser_screenshot` | Capture the controlled tab into a workspace file and report its path for `read_image`. |
+| `browser_screenshot` | Capture the controlled tab into a workspace file and report its path for `read_image`. `scale` accepts only 1, 2, or 3, and defaults to 2 with a region. The clip is rounded to whole viewport pixels; a negative origin, zero size, a region outside the viewport, an edge over 8192 px, or more than 4,194,304 pixels is refused with the real viewport and the requested rectangle instead of being clamped, and the reported dimensions come from that plan. |
 | `browser_console` / `browser_network` | Read buffered console messages and network requests for the controlled tab. |
 | `browser_batch` | Run up to 25 tool calls sequentially and stop at the first failure. |
 | `browser_scroll` / `browser_navigate` / `browser_open_tab` / `browser_back` / `browser_forward` / `browser_reload` | Page movement. |
@@ -99,7 +100,7 @@ Tools added in 0.1.0 require extension 0.3.0. Against an older extension they fa
 - **Token effect**: one `browser_snapshot` (default 32k chars) costs roughly 8–10k tokens for typical English text; the exact count depends on language and tokenizer, and delta snapshots cost a fraction of that. The system-prompt section tells the model to snapshot on demand rather than hoard page text.
 - **KV-cache effect**: none beyond ordinary tool results; snapshots are not cached server-side.
 - **Latency**: each action awaits the extension's real-page execution plus settle detection (typically 0.2–2s; navigation up to 5s).
-- **Failure modes**: `bridge-closed` (extension not connected), `timeout`, `no-active-tab`, `content-unavailable` (page needs a refresh), `action-failed` (stale inventory index — the model should re-snapshot).
+- **Failure modes**: `bridge-closed` (extension not connected), `timeout`, `no-active-tab`, `content-unavailable` (page needs a refresh), `action-failed` (a stale inventory index after selector re-location also failed — the model should re-snapshot; a successful re-location says so in the result, and a zero- or multi-match failure reports the selector and the match count).
 
 ## Extension points
 
@@ -109,10 +110,11 @@ Tools added in 0.1.0 require extension 0.3.0. Against an older extension they fa
 ## Known Limitations and Deferred Work
 
 - One active extension connection (a second window replaces the first).
-- `browser_screenshot` writes files under `<artifactRoot>/<sessionId>/screenshots/`; without a configured artifact root the tool reports that no directory is available. Images are returned as a path, never as an inline image block, so the model reads them back with `read_image`.
-- `browser_console` and `browser_network` capture only from the moment they are first called on a tab; the buffers are memory-only, cleared when the document's origin changes, and dropped when the tab closes.
+- `browser_screenshot` writes files under `<artifactRoot>/<sessionId>/screenshots/`; without a configured artifact root the tool reports that no directory is available. Images are returned as a path, never as an inline image block, so the model reads them back with `read_image`. Accepted `scale` values are 1, 2, and 3; a `scale` below 1 (the earlier 0.1–1 range) is rejected as an invalid argument.
+- `browser_console` and `browser_network` capture only from the moment they are first called on a tab; the buffers are memory-only, cleared when the main-frame document is replaced (reload or cross-document navigation), kept across same-document hash, query, and SPA changes, and dropped when the tab closes.
 - `browser_evaluate` and `browser_upload_file` are state-changing tools and follow the extension's approval flow; `browser_evaluate` runs in the page world and cannot run on protected pages.
 - `browser_hover`, `browser_drag`, and `browser_click` with `button`/`count`/`modifiers` use real input events when the extension holds a debugger session on the controlled tab, and fall back to synthesized DOM events otherwise; the fallback result says so.
+- The side panel's opt-in live view (off by default) streams JPEG frames from a `Page.startScreencast` on the controlled tab; frames are acknowledged before handling, stale frames are dropped by sequence, and switching the controlled tab or losing the debugger clears the image. Its actual frame-stop timing on background tabs, without a debugger, and on Firefox has not been verified on real hardware.
 - Accessible cross-origin iframes are snapshotted and operated with stable `(frame, index)` addresses. Restricted or short-lived frames are reported as unavailable without failing the whole page snapshot. Every element-addressed tool accepts the optional `frame` from that address — snapshot, find, get_text, click, type, press, hover, select, drag, upload_file and wait — and defaults to the top page.
 - Token rotation is manual (edit `~/.dsh/ext-bridge-token` or set `token` in config); no expiry.
 - The Playwright-driven extension e2e self-skips without a usable Chromium executable or a built extension bundle.

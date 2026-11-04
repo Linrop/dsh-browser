@@ -55,9 +55,10 @@ Playwright / 扩展的配对耗时比为 **1.24**（95% CI **1.16–1.34**）：
 | 按键 | `browser_press` | 键盘事件（Enter/Tab/Escape/方向键…） |
 | 滚动 | `browser_scroll` | 视口滚动（up/down/top/bottom） |
 | 页面导航 | `browser_navigate` / `browser_open_tab` / `browser_back` / `browser_forward` / `browser_reload` | 受控标签页内导航，或新开标签页并跟随（`active:false` 时保持当前页在前台） |
-| 列出标签页 | `browser_list_tabs` | 列出可访问标签页的稳定 ID、标题、URL、窗口/顺序以及活动/受控状态 |
+| 列出标签页 | `browser_list_tabs` | 列出可访问标签页的稳定 ID、标题、URL、窗口/顺序、归属/受控状态，以及 `origin`（`created` 表示本会话打开的标签页，`adopted` 表示不是本会话打开的） |
 | 跟随标签页 | `browser_follow_tab` | 将后续浏览器工具绑定到 `browser_list_tabs` 返回的标签页，而不激活该标签页 |
 | 关闭标签页 | `browser_close_tab` | 关闭 `browser_list_tabs` 返回的标签页 |
+| 关闭本会话标签页 | `browser_close` | 不带 `tabId` 时关闭本会话打开的全部标签页并返回 id 列表；没有可关的标签页也算成功，返回空列表；点名不属于本会话的标签页直接报错 |
 | 读取区域 | `browser_get_text` | 懒加载内容 / 局部文本 |
 | 等待稳定 | `browser_wait` | 页面加载与渲染稳定检测 |
 | 选择选项 | `browser_select` | 按 value、label 或序号选择；未命中会列出可用选项 |
@@ -66,7 +67,7 @@ Playwright / 扩展的配对耗时比为 **1.24**（95% CI **1.16–1.34**）：
 | 悬停与拖拽 | `browser_hover` / `browser_drag` | 按编号或视口坐标；有调试会话时发送真实输入事件，否则退化为合成 DOM 事件 |
 | 点击变体 | 带 `button` / `count` / `modifiers` 的 `browser_click` | 右键/中键、双击/三击与修饰键组合 |
 | 执行页面 JS | `browser_evaluate` | 需审批；结果脱敏并限制长度 |
-| 截图 | `browser_screenshot` | 整视口或裁剪区域，由宿主落盘并返回路径 |
+| 截图 | `browser_screenshot` | 整视口或视口坐标系内的整数裁剪区，由宿主落盘并返回路径；`scale` 只接受 1/2/3，带裁剪区时默认为 2；负原点、零尺寸、裁剪区越出视口，或渲染后单边超过 8192 px、总像素超过 4,194,304 一律报错，错误里回显真实视口与被拒矩形，返回的宽高取自该计划值 |
 | console 与 network | `browser_console` / `browser_network` | 首次调用起按标签页缓冲；凭据脱敏，请求正文只记字节数 |
 | 调整窗口 | `browser_resize` | 调整承载受控标签页的窗口尺寸 |
 | 批量 | `browser_batch` | 最多 25 条顺序调用，首个失败即停 |

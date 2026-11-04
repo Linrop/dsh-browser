@@ -16,9 +16,10 @@ dsh 的**浏览器操作端**：让模型直接读取并操作你在浏览器里
 | 按键 | `browser_press` | Enter/Tab/Escape/方向键等 |
 | 滚动 | `browser_scroll` | 视口滚动（up/down/top/bottom） |
 | 导航 | `browser_navigate` / `browser_open_tab` / `browser_back` / `browser_forward` / `browser_reload` | 受控标签页内跳转，或新开标签页并跟随 |
-| 列出标签页 | `browser_list_tabs` | 列出可访问标签页的稳定 ID、标题、URL 和活动/受控状态 |
+| 列出标签页 | `browser_list_tabs` | 列出可访问标签页的稳定 ID、标题、URL、归属/受控状态，以及 `origin`（`created` 表示本会话打开，`adopted` 表示不是本会话打开的） |
 | 跟随标签页 | `browser_follow_tab` | 将后续浏览器工具绑定到已列出的标签页，而不激活该标签页 |
 | 关闭标签页 | `browser_close_tab` | 关闭已列出的标签页 |
+| 关闭本会话标签页 | `browser_close` | 不点名时关闭本会话打开的全部标签页；没有可关的也成功并返回空列表，点名不属于本会话的标签页会被拒绝 |
 | 读区域 | `browser_get_text` | 懒加载内容 / 局部文本 |
 | 等待 | `browser_wait` | 页面加载与渲染稳定检测 |
 | 选择选项 | `browser_select` | 按 value、label 或序号选择；未命中会列出可用选项 |
@@ -27,7 +28,8 @@ dsh 的**浏览器操作端**：让模型直接读取并操作你在浏览器里
 | 悬停 / 拖拽 | `browser_hover` / `browser_drag` | 对受控标签页持有调试会话时发送真实输入事件，附加失败时退化为合成 DOM 事件 |
 | 点击变体 | 带 `button` / `count` / `modifiers` 的 `browser_click` | 右键/中键、双击/三击与修饰键组合，走调试会话 |
 | 执行页面 JS | `browser_evaluate` | 需用户审批；结果脱敏并限制长度 |
-| 截图 | `browser_screenshot` | 整视口或裁剪区域，由宿主落盘并返回文件路径 |
+| 截图 | `browser_screenshot` | 整视口或视口坐标系内的整数裁剪区，由宿主落盘并返回文件路径；`scale` 只接受 1/2/3，带裁剪区时默认为 2；负原点、零尺寸、裁剪区越出视口，或渲染后单边超过 8192 px、总像素超过 4,194,304 一律报错，错误里回显真实视口与被拒矩形，返回的宽高取自该计划值 |
+| 实时画面 | 侧栏开关 | 可选显示受控标签页的 JPEG 实时画面，默认关闭：帧来自 CDP screencast，先 ack 再处理，旧帧按序号丢弃，切页或调试器断开即清图 |
 | console 与 network | `browser_console` / `browser_network` | 首次调用起按标签页缓冲；请求头与 URL 凭据脱敏，请求正文只记字节数 |
 | 调整窗口 | `browser_resize` | 调整承载受控标签页的窗口尺寸 |
 | 批量 | `browser_batch` | 顺序执行工具调用，首个失败即停 |
@@ -119,7 +121,7 @@ pnpm --filter dsh-browser-extension run test
 
 - **快照即视图**：模型对页面的全部认知 = 结构化文本（标题/URL/正文/编号元素/表单），默认预算 32k 字符（插件可配，经 `hello.ok` 协商给扩展）。
 - **页面文字是不可信输入**：快照和局部文本读取会放进带随机 nonce 的信任边界，并明确要求模型不得把网页中的命令当成指令。这只是纵深防御；扩展侧的操作审批才是强制安全边界。
-- **稳定编号**：元素编号跨快照保持（WeakMap + `data-dsh-el`），模型可以说"点 7 号"；页面大改时显式提示"编号已重排"。
+- **稳定编号**：元素编号跨快照保持（WeakMap + `data-dsh-el`），模型可以说"点 7 号"；页面大改时显式提示"编号已重排"。每个编号同时记录稳定的 CSS selector，页面重渲染后动作会按 selector 重新定位并在结果里说明；0 命中或多命中会带 selector 与命中计数报错。
 - **delta 模式**：`browser_snapshot({delta:true})` 只返回变化元素的编号，省 token。
 - **隐私**：密码/卡号字段的值永远以 `••••` 呈现，绝不回传；可访问名称从不使用敏感字段的当前值。
 - **标签页绑定**：提交提示时会在模型开始工作前绑定活动标签页；如果直接调用浏览器工具，也会在需要时完成首次绑定。手动切换标签页或窗口后，后续工具会暂停，并询问助手继续原页面还是跟随当前页。选择原页面后允许后台操作，但不会改变用户正在看的页面；选择跟随后会重置页面引用状态。受控页关闭后失败关闭，直到用户选择当前页；切页还会撤销尚未完成的操作审批。
@@ -146,6 +148,7 @@ Chrome 使用 `sidePanel`，Firefox 使用 `sidebar_action`。两者都申请 `s
 - 真实输入只在标签页位于前台且窗口聚焦时才会到达页面；不满足时指针工具改为合成 DOM 事件，在结果里说明原因，并保留请求的按键、连击次数与修饰键语义（浏览器级默认行为如导航与原生右键菜单不会发生）。
 - 带原生拖放语义的目标会收到 `Input.dispatchDragEvent` 的 enter/over/drop（带 `text/plain` 载荷）；没有该语义的目标仍用普通鼠标拖拽序列，浏览器拒绝该协议时回退合成拖拽事件。
 - 原生拖放识别只读取隔离世界可观测的信号：端点自身或祖先的 `draggable` 属性，以及元素、document（`ondrop`）、documentElement 或 window 上的内联拖放处理器。仅用 `addEventListener` 注册拖放监听的页面无法识别，会继续走普通鼠标拖拽路径，其 drop 处理器可能不会执行。
-- console/network 缓冲在调试会话空闲 detach 后仍然保留：直到页面来源变化、标签页关闭或会话结束才清空。重新 attach 时 Chrome 会重放日志历史，这些重放会与已有缓冲去重。
-- 降级截图走 `captureVisibleTab`，只能截当前活动标签页的可见区域，且忽略 `scale`；调试器路径才支持对受控标签页裁剪与缩放。
+- console/network 缓冲在调试会话空闲 detach 后仍然保留：直到主框架文档被替换（刷新或跨文档导航）、标签页关闭或会话结束才清空，同一文档内的 hash、query 与 SPA 变化则保留。重新 attach 时 Chrome 会重放日志历史，这些重放会与已有缓冲去重。
+- 降级截图走 `captureVisibleTab`，只能截当前活动标签页的可见区域，且忽略 `scale`；调试器路径才支持对受控标签页裁剪与缩放。支持的缩放只有 1/2/3；小于 1 的取值（此前 0.1–1 区间）会作为非法参数报错。
+- 实时画面在后台标签页、无 debugger 与 Firefox 上的实际停帧时序尚未真机验证；这些状态下侧栏会显示具体原因，而不是残留旧帧。
 - `browser_console` 与 `browser_network` 从首次在某个标签页调用时开始采集。没有调试会话时在页面主世界 hook `console`、`fetch` 与 `XMLHttpRequest`，会漏掉 hook 之前的请求、文档/资源请求与 Service Worker 流量；结果里会说明数据来自哪条路径。
