@@ -75,7 +75,11 @@ function mockChrome(options: StubOptions = {}) {
     setBadgeBackgroundColor: vi.fn(async () => undefined),
     setBadgeTextColor: vi.fn(async () => undefined),
   }
-  const tabGroups = { update: vi.fn(async () => undefined) }
+  const tabGroupsUpdate = vi.fn(async (_groupId: number, _props: unknown) => undefined)
+  const tabGroupsQuery = vi.fn(async (_filter: unknown): Promise<unknown[]> => [])
+  const tabGroups = { update: tabGroupsUpdate, query: tabGroupsQuery }
+  const tabsQuery = vi.fn(async (_query: unknown): Promise<unknown[]> => [tab])
+  const tabsGroup = vi.fn(async (_options: unknown): Promise<number> => 41)
   const sessionData: Record<string, unknown> = {}
   vi.stubGlobal('chrome', {
     action,
@@ -108,9 +112,9 @@ function mockChrome(options: StubOptions = {}) {
     tabGroups,
     tabs: {
       get: vi.fn(async () => tab),
-      query: vi.fn(async () => [tab]),
+      query: tabsQuery,
       remove: vi.fn(async () => undefined),
-      group: vi.fn(async () => 41),
+      group: tabsGroup,
       sendMessage: vi.fn(async () => ({ ok: true, result: { text: 'page' } })),
       onActivated: chromeEvent<[{ tabId: number; windowId: number }]>(),
       onUpdated: chromeEvent<[number, chrome.tabs.TabChangeInfo, chrome.tabs.Tab]>(),
@@ -135,7 +139,7 @@ function mockChrome(options: StubOptions = {}) {
       onRemoved: chromeEvent<[number]>(),
     },
   } as unknown as typeof chrome)
-  return { action, onConnect, sessionData, tabGroups, tabs: chrome.tabs }
+  return { action, onConnect, sessionData, tabGroups, tabGroupsQuery, tabGroupsUpdate, tabs: chrome.tabs, tabsGroup, tabsQuery }
 }
 
 /** Open a panel, connect the socket, and bind the session to the active tab. */
@@ -213,9 +217,58 @@ describe('visible work indicator', () => {
     })
     await vi.waitFor(() => { expect(socket.sent).toContainEqual(expect.objectContaining({ t: 'tool.result', id: 'call-2' })) })
 
-    expect(chromeMock.tabs.group).toHaveBeenCalledWith({ tabIds: [1] })
-    expect(chromeMock.tabGroups.update).toHaveBeenCalledWith(41, { title: 'DSH Browser', color: 'blue' })
+    expect(chromeMock.tabsGroup).toHaveBeenCalledWith({ tabIds: [1] })
+    expect(chromeMock.tabGroupsUpdate).toHaveBeenCalledWith(41, { title: 'DSH', color: 'blue' })
     expect(indicatorStates(chromeMock)).toEqual(['pulsing', 'static'])
+  })
+
+  it('joins the group this extension already owns instead of opening a second one', async () => {
+    const chromeMock = mockChrome({
+      settings: { trustedActionOrigins: ['https://app.example'], indicatorMode: 'badge-overlay' },
+    })
+    chromeMock.tabGroupsQuery.mockResolvedValue([{ id: 7, title: 'DSH', color: 'blue', windowId: 1 }])
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    await import('../src/background/index.ts')
+    const { socket, sessionId } = await connectWithSession(chromeMock)
+
+    socket.receive({
+      t: 'tool.call',
+      id: 'call-join',
+      name: 'browser_click',
+      args: { index: 1 },
+      expiresAt: Date.now() + 10_000,
+      sessionId,
+    })
+    await vi.waitFor(() => { expect(chromeMock.tabsGroup).toHaveBeenCalledWith({ tabIds: [1], groupId: 7 }) })
+    expect(chromeMock.tabGroupsUpdate).toHaveBeenCalledWith(7, { title: 'DSH', color: 'blue' })
+  })
+
+  it('folds a group left by the older title into the current one', async () => {
+    const chromeMock = mockChrome({
+      settings: { trustedActionOrigins: ['https://app.example'], indicatorMode: 'badge-overlay' },
+    })
+    const older = { id: 3, title: 'DSH Browser', color: 'blue', windowId: 1 }
+    const newer = { id: 7, title: 'DSH', color: 'blue', windowId: 1 }
+    chromeMock.tabGroupsQuery.mockImplementation(async (filter) => (
+      (filter as { title?: string }).title === 'DSH' ? [newer] : [older]
+    ))
+    chromeMock.tabsQuery.mockImplementation(async (query) => (
+      (query as { groupId?: number }).groupId === 7 ? [{ id: 9, windowId: 1 }] : [{ id: 1, windowId: 1 }]
+    ))
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    await import('../src/background/index.ts')
+    const { socket, sessionId } = await connectWithSession(chromeMock)
+
+    socket.receive({
+      t: 'tool.call',
+      id: 'call-merge',
+      name: 'browser_click',
+      args: { index: 1 },
+      expiresAt: Date.now() + 10_000,
+      sessionId,
+    })
+    await vi.waitFor(() => { expect(chromeMock.tabsGroup).toHaveBeenCalledWith({ tabIds: [9], groupId: 3 }) })
+    expect(chromeMock.tabGroupsUpdate).toHaveBeenCalledWith(3, { title: 'DSH', color: 'blue' })
   })
 
   it('keeps every surface silent when the indicator mode is off', async () => {
@@ -238,7 +291,7 @@ describe('visible work indicator', () => {
     await vi.waitFor(() => { expect(socket.sent).toContainEqual(expect.objectContaining({ t: 'tool.result', id: 'call-3' })) })
 
     expect(chromeMock.action.setBadgeText).not.toHaveBeenCalledWith({ text: '●' })
-    expect(chromeMock.tabs.group).not.toHaveBeenCalled()
+    expect(chromeMock.tabsGroup).not.toHaveBeenCalled()
     expect(indicatorStates(chromeMock)).toEqual([])
   })
 
@@ -267,7 +320,7 @@ describe('visible work indicator', () => {
 
     await vi.waitFor(() => { expect(indicatorStates(chromeMock)).toContain('off') })
     expect(chromeMock.action.setBadgeText).toHaveBeenLastCalledWith({ text: '' })
-    await vi.waitFor(() => { expect(chromeMock.tabGroups.update).toHaveBeenCalledWith(41, { title: '' }) })
+    await vi.waitFor(() => { expect(chromeMock.tabGroupsUpdate).toHaveBeenCalledWith(41, { title: '' }) })
   })
 
   it('never auto-approves a cross-origin navigation even when both origins are trusted', async () => {

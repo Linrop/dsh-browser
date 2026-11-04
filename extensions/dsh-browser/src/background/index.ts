@@ -755,11 +755,18 @@ function syncLiveView(): void {
 const WORK_BADGE_TEXT = '●'
 const WORK_BADGE_BACKGROUND = '#4d6bfe'
 const WORK_BADGE_FOREGROUND = '#ffffff'
-const TAB_GROUP_TITLE = 'DSH Browser'
+const TAB_GROUP_TITLE = 'DSH'
+/**
+ * Titles this extension has used. A group labelled by an older build still
+ * belongs to us, so a new tab joins it instead of starting a second group.
+ */
+const TAB_GROUP_TITLES: readonly string[] = [TAB_GROUP_TITLE, 'DSH Browser']
 /** Chrome's sentinel for "this tab is not in any group". */
 const TAB_GROUP_NONE = -1
 /** Groups this connection labelled; user-owned groups are never restyled. */
 const labelledTabGroups = new Set<number>()
+/** Windows whose groups already went through the one-time merge. */
+const mergedGroupWindows = new Set<number>()
 /** Tabs currently carrying a live dot, so a mode switch cannot leave one behind. */
 const dotTabs = new Set<number>()
 let badgeActive = false
@@ -794,6 +801,59 @@ function setWorkBadge(active: boolean): void {
 }
 
 /**
+ * Every group in one window that this extension created.
+ *
+ * Titles are the only durable marker Chrome keeps across service-worker
+ * restarts, so both the current title and the one older builds wrote count.
+ * @param windowId - window whose groups to read.
+ * @returns the matching groups, oldest first, or an empty list.
+ */
+async function ownGroups(windowId: number): Promise<chrome.tabGroups.TabGroup[]> {
+  const groups = chrome.tabGroups as typeof chrome.tabGroups | undefined
+  if (groups === undefined || typeof groups.query !== 'function') return []
+  const found: chrome.tabGroups.TabGroup[] = []
+  for (const title of TAB_GROUP_TITLES) {
+    try {
+      found.push(...await groups.query({ windowId, title }))
+    } catch {
+      // A build without tab-group queries simply skips grouping.
+    }
+  }
+  return found.sort((left, right) => left.id - right.id)
+}
+
+/**
+ * Fold groups left by earlier sessions into one, so the window shows a single
+ * label instead of one group per grouping call.
+ * @param windowId - window to consolidate.
+ */
+async function mergeOwnGroups(windowId: number): Promise<void> {
+  if (mergedGroupWindows.has(windowId)) return
+  mergedGroupWindows.add(windowId)
+  const groups = chrome.tabGroups as typeof chrome.tabGroups | undefined
+  if (groups === undefined || typeof groups.update !== 'function') return
+  const mine = await ownGroups(windowId)
+  const keeper = mine[0]
+  if (keeper === undefined) return
+  for (const group of mine.slice(1)) {
+    try {
+      const members = await chrome.tabs.query({ groupId: group.id })
+      const tabIds = members.flatMap((tab) => (tab.id === undefined ? [] : [tab.id]))
+      if (tabIds.length === 0) continue
+      await chrome.tabs.group({ tabIds, groupId: keeper.id })
+      labelledTabGroups.add(keeper.id)
+    } catch {
+      // A group that vanished mid-merge leaves the rest untouched.
+    }
+  }
+  try {
+    await groups.update(keeper.id, { title: TAB_GROUP_TITLE, color: 'blue' })
+  } catch {
+    // Chrome removed the keeper; nothing left to retitle.
+  }
+}
+
+/**
  * Put the worked tab in a `DSH Browser` group so the user can see what runs.
  *
  * A tab the user already grouped keeps its own group: silently retitling a
@@ -803,18 +863,24 @@ function setWorkBadge(active: boolean): void {
 async function labelWorkTabGroup(tabId: number): Promise<void> {
   if (settings.indicatorMode === 'off') return
   const tabs = chrome.tabs as typeof chrome.tabs & {
-    group?: (options: { tabIds: number[] }) => Promise<number>
+    group?: (options: { tabIds: number[]; groupId?: number }) => Promise<number>
   }
   const groups = chrome.tabGroups as typeof chrome.tabGroups | undefined
   if (tabs.group === undefined || groups === undefined || typeof groups.update !== 'function') return
   try {
     const tab = await chrome.tabs.get(tabId)
+    void mergeOwnGroups(tab.windowId)
     const current = typeof tab.groupId === 'number' ? tab.groupId : TAB_GROUP_NONE
     let groupId: number | undefined
     if (current >= 0) {
       if (labelledTabGroups.has(current)) groupId = current
     } else {
-      const created = await tabs.group({ tabIds: [tabId] })
+      // Join the group this extension already owns in the window; asking Chrome
+      // to group a lone tab would open a second group beside it.
+      const existing = (await ownGroups(tab.windowId))[0]
+      const created = existing === undefined
+        ? await tabs.group({ tabIds: [tabId] })
+        : await tabs.group({ tabIds: [tabId], groupId: existing.id })
       groupId = typeof created === 'number' ? created : undefined
     }
     if (groupId === undefined || groupId < 0) return
