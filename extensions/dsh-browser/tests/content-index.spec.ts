@@ -7,6 +7,10 @@ const FORWARDER_KEY = '__dshBrowserInstrumentForwarder__'
 
 afterEach(() => {
   Reflect.deleteProperty(navigator, 'userActivation')
+  // A debounced selection change outlives the test that dispatched it; if the
+  // timer fires after this file's environment is torn down it reads `document`
+  // from nothing and fails the suite as an unhandled error.
+  ;(globalThis as unknown as Record<string, { dispose?: () => void } | undefined>)[WATCHER_KEY]?.dispose?.()
   delete (globalThis as Record<string, unknown>)[LISTENER_KEY]
   delete (globalThis as Record<string, unknown>)[WATCHER_KEY]
   delete (globalThis as Record<string, unknown>)[FORWARDER_KEY]
