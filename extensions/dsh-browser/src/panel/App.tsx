@@ -96,6 +96,12 @@ import {
 } from './events.ts'
 
 
+/** Localized failure text for a catalogue RPC, keeping the raw detail visible. */
+function commandErrorMessage(headline: string, cause: unknown): string {
+  const detail = cause instanceof Error ? cause.message : String(cause)
+  return detail === '' ? headline : `${headline}: ${detail}`
+}
+
 /** Error text of a command execution that finished unsuccessfully, if any. */
 function commandResultText(execution: unknown): string | undefined {
   if (typeof execution !== 'object' || execution === null) return undefined
@@ -598,34 +604,48 @@ export function App(): React.JSX.Element {
       description: entry.description,
     }))
   const commandMenuOpen = commandRows.length > 0 && commandDismissedRef.current !== input
+  const plusCommands: CommandMenuRow[] = sessionReady && !busy
+    ? commandCatalog.map((entry) => ({
+      name: entry.name,
+      label: commandLabel(entry.name, locale),
+      description: entry.description,
+    }))
+    : []
 
-  // Fetch the catalogue once per session, as soon as a slash line is typed.
-  // It must not depend on the menu being open: rows need the catalogue, and the
-  // menu needs rows, so gating the fetch on the menu deadlocks the first open.
+  /**
+   * Loads the Host command catalogue for the current session once.
+   *
+   * Both the `/` menu and the plus menu ask for it, so it is a function rather
+   * than an effect body. A failure is surfaced instead of swallowed: an empty
+   * catalogue used to look identical to "this Host has no commands", which hid
+   * real RPC errors from the user.
+   */
+  const loadCommandCatalog = useCallback(async (): Promise<void> => {
+    const id = sessionRef.current
+    if (id === null || commandCatalogSession === id || commandLoadingRef.current === id) return
+    commandLoadingRef.current = id
+    try {
+      const value = await api.rpc<unknown>('commands.list', { sessionId: id })
+      setCommandCatalog(parseCommandCatalog(value))
+      setCommandCatalogSession(id)
+      setError(null)
+    } catch (cause: unknown) {
+      // Leave the catalogue uncached so the next open retries, and tell the user
+      // why the menu is empty rather than behaving as if there were no commands.
+      setCommandCatalog([])
+      setError(commandErrorMessage(copy.app.commandMenuFailed, cause))
+    } finally {
+      if (commandLoadingRef.current === id) commandLoadingRef.current = null
+    }
+  }, [api, commandCatalogSession, copy.app.commandMenuFailed, setError])
+
+  // The `/` menu needs the catalogue as soon as a slash line is typed. It must
+  // not depend on the menu being open: rows need the catalogue, and the menu
+  // needs rows, so gating the fetch on the menu deadlocks the first open.
   useEffect(() => {
     if (commandTyping === undefined || !sessionReady) return
-    const id = sessionRef.current
-    if (id === null || id === commandCatalogSession || commandLoadingRef.current === id) return
-    commandLoadingRef.current = id
-    let alive = true
-    void api.rpc<unknown>('commands.list', { sessionId: id })
-      .then((value) => {
-        if (!alive) return
-        setCommandCatalog(parseCommandCatalog(value))
-        setCommandCatalogSession(id)
-      })
-      .catch(() => {
-        // A Host without the commands remote, or a session whose agent is not
-        // materialized yet, leaves the composer as plain text. Leave the
-        // catalogue uncached so a later open retries after the first prompt.
-        if (!alive) return
-        setCommandCatalog([])
-      })
-      .finally(() => {
-        if (commandLoadingRef.current === id) commandLoadingRef.current = null
-      })
-    return () => { alive = false }
-  }, [api, commandTyping, sessionReady, commandCatalogSession])
+    void loadCommandCatalog()
+  }, [commandTyping, sessionReady, loadCommandCatalog])
 
   useEffect(() => {
     setCommandActive((current) => (current >= commandRows.length ? 0 : current))
@@ -1938,6 +1958,9 @@ export function App(): React.JSX.Element {
               <PlusMenu
                 label={copy.app.attach}
                 menuLabel={copy.app.attachMenu}
+                addHeading={copy.app.addMenuHeading}
+                commandHeading={copy.app.commandMenuHeading}
+                commands={plusCommands}
                 addImagesLabel={copy.app.addImages}
                 imageUnavailable={imageLimits === null
                   ? copy.app.imageUnavailable
@@ -1946,7 +1969,9 @@ export function App(): React.JSX.Element {
                     : null}
                 hint={copy.app.pasteOrDropHint}
                 disabled={!sessionReady || busy || addingImages}
+                onOpen={() => { void loadCommandCatalog() }}
                 onPickImages={() => fileInputRef.current?.click()}
+                onPickCommand={pickCommand}
               />
             </span>
             <span className="composer-actions-end">

@@ -6,6 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { PlusMenu, type PlusMenuProps } from '../src/panel/PlusMenu.tsx'
 
 const onPickImages = vi.fn()
+const onPickCommand = vi.fn()
+const onOpen = vi.fn()
 
 let root: Root
 let container: HTMLDivElement
@@ -14,10 +16,15 @@ function render(overrides: Partial<PlusMenuProps> = {}): void {
   const props: PlusMenuProps = {
     label: 'Add to message',
     menuLabel: 'Add to message',
+    addHeading: 'Add',
+    commandHeading: 'Commands',
+    commands: [],
     addImagesLabel: 'Add images',
     hint: 'Tip: you can paste or drop images straight into the composer.',
     imageUnavailable: null,
+    onOpen,
     onPickImages,
+    onPickCommand,
     ...overrides,
   }
   act(() => { root.render(createElement(PlusMenu, props)) })
@@ -129,5 +136,48 @@ describe('composer plus menu', () => {
   it('cannot be opened while the control is disabled', () => {
     render({ disabled: true })
     expect(trigger().disabled).toBe(true)
+  })
+})
+
+describe('composer plus menu command section', () => {
+  const commands = [
+    { name: 'goal', label: '目标', description: 'Set or view the goal' },
+    { name: 'compact', label: '压缩', description: 'Compact older history' },
+  ]
+
+  it('lists the Host commands under a section heading', () => {
+    render({ commands })
+    act(() => { trigger().click() })
+    const headings = [...container.querySelectorAll('.plus-menu-section')].map((node) => node.textContent)
+    expect(headings).toEqual(['Add', 'Commands'])
+    const rows = [...container.querySelectorAll('.plus-menu-command')]
+    expect(rows).toHaveLength(2)
+    expect(rows[0]?.textContent).toContain('目标')
+    expect(rows[0]?.textContent).toContain('goal')
+    expect(rows[0]?.textContent).toContain('Set or view the goal')
+  })
+
+  it('completes the composer with the picked command and closes', () => {
+    render({ commands })
+    act(() => { trigger().click() })
+    act(() => { container.querySelectorAll<HTMLButtonElement>('.plus-menu-command')[1]?.click() })
+    expect(onPickCommand).toHaveBeenCalledWith(commands[1])
+    expect(menu()).toBeNull()
+  })
+
+  it('asks for the catalogue when the menu opens, by click or keyboard', () => {
+    render({ commands })
+    act(() => { trigger().click() })
+    act(() => { trigger().click() })
+    expect(onOpen).toHaveBeenCalledTimes(1)
+    press(trigger(), 'ArrowDown')
+    expect(onOpen).toHaveBeenCalledTimes(2)
+  })
+
+  it('omits the command section when the Host offers none', () => {
+    render()
+    act(() => { trigger().click() })
+    const headings = [...container.querySelectorAll('.plus-menu-section')].map((node) => node.textContent)
+    expect(headings).toEqual(['Add'])
   })
 })

@@ -1,15 +1,22 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import type { CommandMenuRow } from './CommandMenu.tsx'
 
 /**
  * Composer "add" entry: a round plus button that opens an upward menu, matching
- * the DSH Web GUI composer. Image insertion stays the only actionable item;
- * the paste/drop hint is a non-interactive note row.
+ * the DSH Web GUI composer. It carries two sections, as that menu does: the
+ * attachment action and the Host's command catalogue.
  */
 export interface PlusMenuProps {
   /** Accessible name of the trigger. */
   label: string
   /** Accessible name of the popup menu. */
   menuLabel: string
+  /** Section heading above the attachment action. */
+  addHeading: string
+  /** Section heading above the command rows. */
+  commandHeading: string
+  /** Command rows to offer; empty when the Host has none or none are loaded. */
+  commands: CommandMenuRow[]
   /** Menu item label that starts the image picker. */
   addImagesLabel: string
   /** Why image insertion is unavailable; disables the item and shows a tooltip. */
@@ -18,7 +25,11 @@ export interface PlusMenuProps {
   hint: string
   /** Disables the whole control, e.g. while a turn is running. */
   disabled?: boolean
+  /** Called when the menu opens, so the caller can load the catalogue. */
+  onOpen?: () => void
   onPickImages: () => void
+  /** Completes the composer with one command, exactly like picking it from `/`. */
+  onPickCommand: (row: CommandMenuRow) => void
 }
 
 interface MenuPosition {
@@ -47,11 +58,16 @@ function menuPosition(trigger: HTMLButtonElement | null): MenuPosition {
 export function PlusMenu({
   label,
   menuLabel,
+  addHeading,
+  commandHeading,
+  commands,
   addImagesLabel,
   imageUnavailable,
   hint,
   disabled = false,
+  onOpen,
   onPickImages,
+  onPickCommand,
 }: PlusMenuProps): React.JSX.Element {
   const [open, setOpen] = useState(false)
   const [position, setPosition] = useState<MenuPosition>({ left: 8, bottom: 8 })
@@ -104,6 +120,7 @@ export function PlusMenu({
 
   function openMenu(): void {
     setOpen(true)
+    onOpen?.()
   }
 
   function onTriggerKeyDown(event: React.KeyboardEvent<HTMLButtonElement>): void {
@@ -148,7 +165,12 @@ export function PlusMenu({
         aria-haspopup="menu"
         aria-expanded={open}
         disabled={disabled}
-        onClick={() => { setOpen((current) => !current) }}
+        onClick={() => {
+          setOpen((current) => {
+            if (!current) onOpen?.()
+            return !current
+          })
+        }}
         onKeyDown={onTriggerKeyDown}
       >
         <PlusGlyph />
@@ -163,6 +185,7 @@ export function PlusMenu({
           style={{ left: `${position.left}px`, bottom: `${position.bottom}px` }}
           onKeyDown={onMenuKeyDown}
         >
+          <div className="plus-menu-section" role="presentation">{addHeading}</div>
           <button
             type="button"
             role="menuitem"
@@ -178,6 +201,27 @@ export function PlusMenu({
           </button>
           {imageDisabled && (
             <div className="plus-menu-reason" role="note">{imageUnavailable}</div>
+          )}
+          {commands.length > 0 && (
+            <>
+              <div className="plus-menu-section" role="presentation">{commandHeading}</div>
+              {commands.map((row) => (
+                <button
+                  key={row.name}
+                  type="button"
+                  role="menuitem"
+                  className="plus-menu-item plus-menu-command"
+                  onClick={() => {
+                    setOpen(false)
+                    onPickCommand(row)
+                  }}
+                >
+                  <span className="plus-menu-command-label">{row.label}</span>
+                  <span className="plus-menu-command-name">{row.name}</span>
+                  <span className="plus-menu-command-description">{row.description}</span>
+                </button>
+              ))}
+            </>
           )}
           <div className="plus-menu-hint" role="note">{hint}</div>
         </div>

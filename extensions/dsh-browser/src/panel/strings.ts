@@ -195,6 +195,8 @@ export interface PanelCopy {
     pasteOrDropHint: string
     commandMenuHeading: string
     commandMenuLabel: string
+    commandMenuFailed: string
+    addMenuHeading: string
     queued: string
     queuedHint: string
     imageUnavailable: string
@@ -474,6 +476,8 @@ const EN: PanelCopy = {
     pasteOrDropHint: 'Tip: you can paste or drop images straight into the composer.',
     commandMenuHeading: 'Commands',
     commandMenuLabel: 'Commands',
+    commandMenuFailed: 'Could not load commands',
+    addMenuHeading: 'Add',
     queued: 'Queued',
     queuedHint: 'Sends when the current turn finishes.',
     imageUnavailable: 'This dsh host does not advertise image input',
@@ -762,6 +766,8 @@ const ZH: PanelCopy = {
     pasteOrDropHint: '提示：可直接粘贴或拖入图片。',
     commandMenuHeading: '指令',
     commandMenuLabel: '指令',
+    commandMenuFailed: '无法加载指令列表',
+    addMenuHeading: '添加',
     queued: '排队中',
     queuedHint: '当前回合结束后自动发送。',
     imageUnavailable: '当前 dsh 宿主未声明图片输入能力',

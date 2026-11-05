@@ -180,6 +180,36 @@ describe('composer slash commands', () => {
     expect(document.querySelector<HTMLTextAreaElement>('.composer textarea')!.value).toBe('/goal')
   })
 
+  it('offers the same commands from the plus menu and completes the draft', async () => {
+    await startPanel()
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('button.plus-menu-trigger')!.click()
+    })
+    await vi.waitFor(() => { expect(rpc).toHaveBeenCalledWith('commands.list', { sessionId: 'session-current' }) })
+    await vi.waitFor(() => {
+      expect([...document.querySelectorAll('.plus-menu-command')].map((row) => row.textContent))
+        .toEqual([expect.stringContaining('goal'), expect.stringContaining('compact')])
+    })
+    await act(async () => {
+      document.querySelectorAll<HTMLButtonElement>('.plus-menu-command')[1]!.click()
+    })
+    expect(document.querySelector<HTMLTextAreaElement>('.composer textarea')!.value).toBe('/compact ')
+    expect(document.querySelector('.plus-menu')).toBeNull()
+  })
+
+  it('surfaces a catalogue failure instead of looking empty', async () => {
+    await startPanel()
+    rpc.mockImplementation(async (method: string) => {
+      if (method === 'commands.list') throw new Error('gateway/lookup-not-found')
+      return {}
+    })
+    await type('/')
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain('Could not load commands')
+    })
+    expect(document.body.textContent).toContain('gateway/lookup-not-found')
+  })
+
   it('keeps an unknown slash line as plain text', async () => {
     await startPanel()
     await type('/not-a-command')

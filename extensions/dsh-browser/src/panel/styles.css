@@ -2098,6 +2098,35 @@ textarea:focus-visible {
   cursor: default;
 }
 
+.plus-menu-section {
+  padding: 8px 10px 2px;
+  color: var(--muted);
+  font-size: calc(10px * var(--ui-scale));
+  line-height: 1.4;
+}
+
+.plus-menu-item.plus-menu-command {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.plus-menu-command-label {
+  font-size: calc(12px * var(--ui-scale));
+  font-weight: 560;
+}
+
+.plus-menu-command-name,
+.plus-menu-command-description {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: calc(10.5px * var(--ui-scale));
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .plus-menu-reason,
 .plus-menu-hint {
   padding: 4px 10px 6px;
