@@ -765,6 +765,8 @@ const TAB_GROUP_TITLES: readonly string[] = [TAB_GROUP_TITLE, 'DSH Browser']
 const TAB_GROUP_NONE = -1
 /** Groups this connection labelled; user-owned groups are never restyled. */
 const labelledTabGroups = new Set<number>()
+/** Tabs this connection put into a group, so idle cleanup releases only those. */
+const groupedTabIds = new Set<number>()
 /** Windows whose groups already went through the one-time merge. */
 const mergedGroupWindows = new Set<number>()
 /** Tabs currently carrying a live dot, so a mode switch cannot leave one behind. */
@@ -885,25 +887,57 @@ async function labelWorkTabGroup(tabId: number): Promise<void> {
     }
     if (groupId === undefined || groupId < 0) return
     labelledTabGroups.add(groupId)
+    groupedTabIds.add(tabId)
     await groups.update(groupId, { title: TAB_GROUP_TITLE, color: 'blue' })
   } catch {
     // Grouping is cosmetic; a Chrome build without tab groups must not fail a tool call.
   }
 }
 
-/** Drop labels from groups that no longer hold an owned tab. */
-async function clearIdleTabGroups(): Promise<void> {
+/**
+ * Release the groups this extension created once no work is running.
+ *
+ * Chrome has no "delete group": a group disappears when its last tab leaves it,
+ * so release the tabs and let the group dissolve. Clearing only the title leaves
+ * a bare colour chip in the tab strip, which reads as a rendering fault.
+ *
+ * The title is the only marker that survives a service-worker restart, so the
+ * release covers both the tabs this worker grouped and every member of a group
+ * carrying this extension's title. A tab the user dragged into that group leaves
+ * with it: the group itself only exists because this extension made it.
+ */
+async function clearIdleTabGroups(ownedTabIds: Iterable<number> = []): Promise<void> {
   const groups = chrome.tabGroups as typeof chrome.tabGroups | undefined
-  const pending = [...labelledTabGroups]
+  // Tabs this extension operated belong to its own groups; a group left behind
+  // by an older build carries no title, so ownership is what identifies it.
+  const release = new Set<number>([...groupedTabIds, ...ownedTabIds])
+  groupedTabIds.clear()
   labelledTabGroups.clear()
-  if (groups === undefined || typeof groups.update !== 'function') return
-  for (const groupId of pending) {
-    try {
-      await groups.update(groupId, { title: '' })
-    } catch {
-      // Chrome already removed the group, or the tab left it.
+  const tabsApi = chrome.tabs as typeof chrome.tabs & { ungroup?: (tabIds: number[]) => Promise<void> }
+  if (groups === undefined || typeof groups.query !== 'function') return
+  try {
+    const windows = await chrome.windows.getAll()
+    for (const window of windows) {
+      if (window.id === undefined) continue
+      for (const group of await ownGroups(window.id)) {
+        for (const tab of await chrome.tabs.query({ groupId: group.id })) {
+          if (tab.id !== undefined) release.add(tab.id)
+        }
+      }
     }
+  } catch {
+    // A window that closed mid-enumeration leaves the tracked tabs as the only
+    // release candidates; those are still worth freeing.
   }
+  if (release.size === 0 || typeof tabsApi.ungroup !== 'function') return
+  try {
+    await tabsApi.ungroup([...release])
+  } catch {
+    // A closed tab fails the whole call; the next reset retries the survivors.
+  }
+  // The title is never blanked: Chrome renders an untitled group as a bare
+  // colour chip, which reads as a rendering fault. If the release above did not
+  // run, the window keeps a labelled group instead of a nameless one.
 }
 
 /**
@@ -989,8 +1023,8 @@ function resetSessionScopedState(reason: 'disconnected'): void {
     void postIndicatorState(tabId, 'off')
     forgetTab(tabId)
   }
+  void clearIdleTabGroups([...owned])
   tabAffinity.clearOwnedTabs()
-  void clearIdleTabGroups()
   console.log(`browser: session-scoped visibility reset (${reason})`)
 }
 

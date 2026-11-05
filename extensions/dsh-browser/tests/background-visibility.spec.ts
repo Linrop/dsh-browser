@@ -80,6 +80,7 @@ function mockChrome(options: StubOptions = {}) {
   const tabGroups = { update: tabGroupsUpdate, query: tabGroupsQuery }
   const tabsQuery = vi.fn(async (_query: unknown): Promise<unknown[]> => [tab])
   const tabsGroup = vi.fn(async (_options: unknown): Promise<number> => 41)
+  const tabsUngroup = vi.fn(async (_tabIds: number[]): Promise<void> => undefined)
   const sessionData: Record<string, unknown> = {}
   vi.stubGlobal('chrome', {
     action,
@@ -115,6 +116,7 @@ function mockChrome(options: StubOptions = {}) {
       query: tabsQuery,
       remove: vi.fn(async () => undefined),
       group: tabsGroup,
+      ungroup: tabsUngroup,
       sendMessage: vi.fn(async () => ({ ok: true, result: { text: 'page' } })),
       onActivated: chromeEvent<[{ tabId: number; windowId: number }]>(),
       onUpdated: chromeEvent<[number, chrome.tabs.TabChangeInfo, chrome.tabs.Tab]>(),
@@ -134,12 +136,13 @@ function mockChrome(options: StubOptions = {}) {
     scripting: { executeScript: vi.fn(async () => []) },
     windows: {
       WINDOW_ID_NONE: -1,
+      getAll: vi.fn(async () => [{ id: 1 }]),
       getLastFocused: vi.fn(async () => ({ id: 1 })),
       onFocusChanged: chromeEvent<[number]>(),
       onRemoved: chromeEvent<[number]>(),
     },
   } as unknown as typeof chrome)
-  return { action, onConnect, sessionData, tabGroups, tabGroupsQuery, tabGroupsUpdate, tabs: chrome.tabs, tabsGroup, tabsQuery }
+  return { action, onConnect, sessionData, tabGroups, tabGroupsQuery, tabGroupsUpdate, tabs: chrome.tabs, tabsGroup, tabsQuery, tabsUngroup }
 }
 
 /** Open a panel, connect the socket, and bind the session to the active tab. */
@@ -320,7 +323,70 @@ describe('visible work indicator', () => {
 
     await vi.waitFor(() => { expect(indicatorStates(chromeMock)).toContain('off') })
     expect(chromeMock.action.setBadgeText).toHaveBeenLastCalledWith({ text: '' })
-    await vi.waitFor(() => { expect(chromeMock.tabGroupsUpdate).toHaveBeenCalledWith(41, { title: '' }) })
+    // Releasing the tab is what removes the group; a bare empty title would
+    // leave a colour chip in the tab strip.
+    await vi.waitFor(() => { expect(chromeMock.tabsUngroup).toHaveBeenCalledWith([1]) })
+  })
+
+  it('releases a group it created in an earlier worker run, identified by its title', async () => {
+    const chromeMock = mockChrome({
+      settings: { trustedActionOrigins: ['https://app.example'], indicatorMode: 'badge-overlay' },
+    })
+    // No in-memory tracking survives a worker restart; the title is the only
+    // durable marker, and every member of that group belongs to the release.
+    chromeMock.tabGroupsQuery.mockImplementation(async (filter) => (
+      (filter as { title?: string }).title === 'DSH'
+        ? [{ id: 41, title: 'DSH', color: 'blue', windowId: 1 }]
+        : []
+    ))
+    chromeMock.tabsQuery.mockImplementation(async (query) => (
+      (query as { groupId?: number }).groupId === 41
+        ? [{ id: 7, windowId: 1 }, { id: 8, windowId: 1 }]
+        : [{ id: 1, windowId: 1, index: 0, active: true, groupId: -1, title: 'Page', url: 'https://app.example/page' }]
+    ))
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    await import('../src/background/index.ts')
+    const { socket, sessionId } = await connectWithSession(chromeMock)
+
+    socket.receive({
+      t: 'tool.call',
+      id: 'call-title-group',
+      name: 'browser_click',
+      args: { index: 1 },
+      expiresAt: Date.now() + 10_000,
+      sessionId,
+    })
+    await vi.waitFor(() => { expect(socket.sent).toContainEqual(expect.objectContaining({ t: 'tool.result', id: 'call-title-group' })) })
+
+    socket.close(4000, 'replaced')
+
+    await vi.waitFor(() => { expect(chromeMock.tabsUngroup).toHaveBeenCalledWith([1, 7, 8]) })
+  })
+
+  it('releases an owned tab left in an untitled group by an older build', async () => {
+    const chromeMock = mockChrome({
+      settings: { trustedActionOrigins: ['https://app.example'], indicatorMode: 'badge-overlay' },
+    })
+    // The old build blanked the title instead of releasing the tab, so the group
+    // is invisible to title matching; the tab being owned is what identifies it.
+    chromeMock.tabGroupsQuery.mockImplementation(async () => [])
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    await import('../src/background/index.ts')
+    const { socket, sessionId } = await connectWithSession(chromeMock)
+
+    socket.receive({
+      t: 'tool.call',
+      id: 'call-legacy-group',
+      name: 'browser_click',
+      args: { index: 1 },
+      expiresAt: Date.now() + 10_000,
+      sessionId,
+    })
+    await vi.waitFor(() => { expect(socket.sent).toContainEqual(expect.objectContaining({ t: 'tool.result', id: 'call-legacy-group' })) })
+
+    socket.close(4000, 'replaced')
+
+    await vi.waitFor(() => { expect(chromeMock.tabsUngroup).toHaveBeenCalledWith([1]) })
   })
 
   it('never auto-approves a cross-origin navigation even when both origins are trusted', async () => {
