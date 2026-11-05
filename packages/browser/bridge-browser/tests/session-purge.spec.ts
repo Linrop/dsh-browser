@@ -7,7 +7,14 @@ import { pathToFileURL } from 'node:url'
 import path from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { SESSION_FORMAT_VERSION, SessionId } from '@deepseek-ai/dsh-session'
-import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import * as JsonlPersistenceModule from '@deepseek-ai/dsh-session-persistence-jsonl'
+
+/**
+ * The persistence package ships a default export on the 0.2.0 line and named
+ * exports (`apply`) on the 0.2.1 line, so resolve the plugin face both ways.
+ */
+const JsonlSessionPersistence = (JsonlPersistenceModule as unknown as { default?: unknown }).default
+  ?? JsonlPersistenceModule.apply
 import Storage from '@deepseek-ai/dsh-storage'
 import * as StorageJson from '@deepseek-ai/dsh-storage-json'
 import { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
@@ -47,7 +54,8 @@ async function makeSession(root: string, workspace: string, sessionId: string): 
 async function contendForSession(root: string): Promise<unknown> {
   const child = spawn(process.execPath, ['--input-type=module', '-e', `
     import { Context } from ${JSON.stringify(resolveModule('@deepseek-ai/cordis'))}
-    import JsonlSessionPersistence from ${JSON.stringify(resolveModule('@deepseek-ai/dsh-session-persistence-jsonl'))}
+    import * as JsonlModule from ${JSON.stringify(resolveModule('@deepseek-ai/dsh-session-persistence-jsonl'))}
+    const JsonlSessionPersistence = JsonlModule.default ?? JsonlModule.apply
     import { SESSION_FORMAT_VERSION, SessionId } from ${JSON.stringify(resolveModule('@deepseek-ai/dsh-session'))}
     const ctx = new Context()
     try {
@@ -260,7 +268,8 @@ describe('purgeSessionFiles', () => {
     const root = await makeSessionsRoot()
     const holder = spawn(process.execPath, ['--input-type=module', '-e', `
       import { Context } from ${JSON.stringify(resolveModule('@deepseek-ai/cordis'))}
-      import JsonlSessionPersistence from ${JSON.stringify(resolveModule('@deepseek-ai/dsh-session-persistence-jsonl'))}
+      import * as JsonlModule from ${JSON.stringify(resolveModule('@deepseek-ai/dsh-session-persistence-jsonl'))}
+    const JsonlSessionPersistence = JsonlModule.default ?? JsonlModule.apply
       import { SESSION_FORMAT_VERSION, SessionId } from ${JSON.stringify(resolveModule('@deepseek-ai/dsh-session'))}
       const ctx = new Context()
       await ctx.plugin(JsonlSessionPersistence, { root: process.argv[1], compression: 'none' })
