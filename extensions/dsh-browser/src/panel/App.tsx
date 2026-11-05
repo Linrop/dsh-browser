@@ -27,6 +27,7 @@ import { COMMAND_MENU_ID, CommandMenu, optionId, type CommandMenuRow } from './C
 import {
   commandLabel,
   commandQuery,
+  fallbackCommands,
   filterCommands,
   parseCommandCatalog,
   parseCommandLine,
@@ -95,6 +96,12 @@ import {
   type SessionEventView,
 } from './events.ts'
 
+
+/** Whether a catalogue RPC failed only because the conversation is provisional. */
+function isProvisionalSessionError(cause: unknown): boolean {
+  const message = (cause instanceof Error ? cause.message : String(cause)).trim()
+  return /^session\b.*\bnot found\b/iu.test(message)
+}
 
 /** Localized failure text for a catalogue RPC, keeping the raw detail visible. */
 function commandErrorMessage(headline: string, cause: unknown): string {
@@ -620,9 +627,10 @@ export function App(): React.JSX.Element {
    * catalogue used to look identical to "this Host has no commands", which hid
    * real RPC errors from the user.
    */
-  const loadCommandCatalog = useCallback(async (): Promise<void> => {
+  const loadCommandCatalog = useCallback(async (force = false): Promise<void> => {
     const id = sessionRef.current
-    if (id === null || commandCatalogSession === id || commandLoadingRef.current === id) return
+    if (id === null || commandLoadingRef.current === id) return
+    if (!force && commandCatalogSession === id) return
     commandLoadingRef.current = id
     try {
       const value = await api.rpc<unknown>('commands.list', { sessionId: id })
@@ -630,14 +638,21 @@ export function App(): React.JSX.Element {
       setCommandCatalogSession(id)
       setError(null)
     } catch (cause: unknown) {
-      // Leave the catalogue uncached so the next open retries, and tell the user
-      // why the menu is empty rather than behaving as if there were no commands.
-      setCommandCatalog([])
-      setError(commandErrorMessage(copy.app.commandMenuFailed, cause))
+      // Before the first message the conversation is provisional: the bridge
+      // mints the id locally and `commands/list` answers "session not found".
+      // Offer the first-party list instead of an error, and refresh it once the
+      // conversation really exists.
+      if (isProvisionalSessionError(cause)) {
+        setCommandCatalog(fallbackCommands(locale))
+        setCommandCatalogSession(id)
+      } else {
+        setCommandCatalog([])
+        setError(commandErrorMessage(copy.app.commandMenuFailed, cause))
+      }
     } finally {
       if (commandLoadingRef.current === id) commandLoadingRef.current = null
     }
-  }, [api, commandCatalogSession, copy.app.commandMenuFailed, setError])
+  }, [api, commandCatalogSession, copy.app.commandMenuFailed, locale, setError])
 
   // The `/` menu needs the catalogue as soon as a slash line is typed. It must
   // not depend on the menu being open: rows need the catalogue, and the menu
@@ -1540,6 +1555,9 @@ export function App(): React.JSX.Element {
         ),
         ...(clientTimeZone === undefined ? {} : { clientTimeZone }),
       })
+      // The first prompt materializes a provisional conversation, so the Host
+      // catalogue that was unavailable on the menu is worth loading again.
+      void loadCommandCatalog(true)
       if (echoedWhileBusy && text !== '') {
         setQueuedEchoes((current) => addQueuedEcho(current, {
           key: crypto.randomUUID(),

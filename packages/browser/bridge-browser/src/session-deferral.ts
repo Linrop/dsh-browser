@@ -12,7 +12,8 @@
  * Provisional sessions also answer `session.models` from the host-wide
  * `session.modelCatalog` (via the Host API adapter, plus a pending switch)
  * and remember `session.selectModel` until materialization, so the composer can
- * show a model switcher before the first message.
+ * show a model switcher before the first message. `commands.execute` also
+ * materializes: a command is a real action, while `commands.list` never does.
  *
  * @module @yuxianglin/dsh-bridge-browser/src/session-deferral
  */
@@ -148,7 +149,11 @@ export function withSessionDeferral(
         entry.selection = selected
         return { ok: true, value: { selected: { ...selected } } }
       }
-      if (call.method !== 'session.prompt') return api.call(call)
+      // Running a command is a real action on a real conversation, so it
+      // materializes the provisional Session the same way a prompt does; asking
+      // for the catalogue alone must not, or merely opening a menu would leave a
+      // trace for a chat nobody used.
+      if (call.method !== 'session.prompt' && call.method !== 'commands.execute') return api.call(call)
       const sessionId = sessionIdOf(call.payload)
       if (sessionId === undefined) return api.call(call)
       const entry = provisional.get(sessionId)

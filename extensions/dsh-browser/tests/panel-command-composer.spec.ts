@@ -197,17 +197,36 @@ describe('composer slash commands', () => {
     expect(document.querySelector('.plus-menu')).toBeNull()
   })
 
-  it('surfaces a catalogue failure instead of looking empty', async () => {
+  it('offers the first-party list while the conversation is provisional', async () => {
+    await startPanel()
+    rpc.mockImplementation(async (method: string, payload?: unknown) => {
+      if (method === 'commands.list') {
+        const sessionId = (payload as { sessionId?: string } | undefined)?.sessionId
+        throw new Error(`session "${sessionId}" not found`)
+      }
+      if (method === 'session.prompt') return {}
+      return {}
+    })
+    await type('/')
+    await vi.waitFor(() => {
+      expect([...document.querySelectorAll('.command-menu [role="option"]')].map((row) => row.textContent))
+        .toEqual(expect.arrayContaining([expect.stringContaining('goal'), expect.stringContaining('compact')]))
+    })
+    // A provisional chat is normal, not an error worth a banner.
+    expect(document.body.textContent).not.toContain('Could not load commands')
+  })
+
+  it('surfaces other catalogue failures instead of looking empty', async () => {
     await startPanel()
     rpc.mockImplementation(async (method: string) => {
-      if (method === 'commands.list') throw new Error('gateway/lookup-not-found')
+      if (method === 'commands.list') throw new Error('gateway/invocation-unavailable')
       return {}
     })
     await type('/')
     await vi.waitFor(() => {
       expect(document.body.textContent).toContain('Could not load commands')
     })
-    expect(document.body.textContent).toContain('gateway/lookup-not-found')
+    expect(document.body.textContent).toContain('gateway/invocation-unavailable')
   })
 
   it('keeps an unknown slash line as plain text', async () => {

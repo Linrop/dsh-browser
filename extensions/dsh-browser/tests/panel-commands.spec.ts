@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
   commandLabel,
   commandQuery,
+  fallbackCommands,
   filterCommands,
   parseCommandCatalog,
   parseCommandLine,
@@ -52,6 +53,17 @@ describe('filterCommands', () => {
   it('returns every row in Host order for an empty query', () => {
     expect(filterCommands(CATALOG, '')).toEqual(CATALOG)
     expect(filterCommands(CATALOG, 'zzz')).toEqual([])
+  })
+})
+
+describe('fallbackCommands', () => {
+  it('offers the first-party commands with localized descriptions', () => {
+    const en = fallbackCommands('en')
+    const zh = fallbackCommands('zh')
+    expect(en.map((entry) => entry.name)).toEqual(['goal', 'plan', 'feedback', 'compact', 'permission', 'export'])
+    expect(en[0]?.description).toContain('goal')
+    expect(zh[0]?.description).toContain('目标')
+    expect(commandLabel(zh[1]!.name, 'zh')).toBe('计划')
   })
 })
 

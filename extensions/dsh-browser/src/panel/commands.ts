@@ -19,6 +19,31 @@ export interface CommandDescriptor {
   readonly description: string
 }
 
+/**
+ * First-party command names with their localized summaries.
+ *
+ * The menu falls back to this list while the conversation is still provisional
+ * (the bridge creates the real Session on the first prompt, so `commands/list`
+ * answers "session not found"); without it a brand-new chat had no menu at all.
+ */
+const BUILTIN_COMMANDS: Readonly<Record<string, { zh: string; en: string }>> = {
+  goal: { zh: '设置或查看长期任务目标', en: 'Set or view the goal for a long-running task' },
+  plan: { zh: '进入或退出计划模式', en: 'Enter or leave plan mode' },
+  feedback: { zh: '发送关于当前会话的反馈', en: 'Record feedback about this session' },
+  compact: { zh: '压缩以上对话内容', en: 'Compact older conversation history' },
+  permission: { zh: '切换权限预设（沙箱模式与审批策略）', en: 'Switch the permission preset (sandbox mode + approval policy)' },
+  export: { zh: '将当前会话内容导出为 ZIP', en: 'Download this Session log as a ZIP archive' },
+}
+
+/**
+ * Catalogue used before the conversation exists on the Host.
+ * @param locale - UI locale.
+ * @returns first-party commands in menu order.
+ */
+export function fallbackCommands(locale: UiLocale): CommandDescriptor[] {
+  return Object.entries(BUILTIN_COMMANDS).map(([name, text]) => ({ name, description: text[locale] }))
+}
+
 /** Localized display labels for the first-party command names. */
 const BUILTIN_LABELS: Record<UiLocale, Readonly<Record<string, string>>> = {
   zh: { goal: '目标', plan: '计划', feedback: '反馈', compact: '压缩', permission: '权限', export: '导出' },

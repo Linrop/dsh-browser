@@ -115,6 +115,35 @@ describe('withSessionDeferral', () => {
     expect(sessionHistory).toHaveBeenCalledOnce()
   })
 
+  it('materializes for a command but not for a catalogue read', async () => {
+    const { api, call, sessionPrompt } = apiHarness()
+    call.mockImplementation(async (request: HostRpcCall): Promise<HostRpcResult> => {
+      if (request.method === 'session.create') {
+        return { ok: true, value: { sessionId: (request.payload as { sessionId: string }).sessionId } }
+      }
+      if (request.method === 'commands.list') {
+        return { ok: true, value: [{ name: 'compact', description: 'Compact' }] }
+      }
+      if (request.method === 'commands.execute') return { ok: true, value: { execution: null } }
+      return { ok: false, error: { code: 'not-found', message: request.method, details: {} } }
+    })
+    const wrapped = withSessionDeferral(api, true)
+    const id = await provisionalId(wrapped)
+
+    // A catalogue read must not create the Session.
+    await wrapped.call(request('commands.list', { sessionId: id }))
+    expect(call).not.toHaveBeenCalledWith(expect.objectContaining({ method: 'session.create' }))
+
+    await wrapped.call(request('commands.execute', { sessionId: id, line: '/compact' }))
+    expect(call).toHaveBeenCalledWith(expect.objectContaining({
+      method: 'session.create', payload: { sessionId: id },
+    }))
+    expect(sessionPrompt).not.toHaveBeenCalled()
+    expect(call).toHaveBeenCalledWith(expect.objectContaining({
+      method: 'commands.execute', payload: { sessionId: id, line: '/compact' },
+    }))
+  })
+
   it('deduplicates concurrent prompts into one materialization', async () => {
     const { api, sessionCreate, sessionPrompt } = apiHarness()
     let release: (() => void) | undefined
