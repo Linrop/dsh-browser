@@ -30,8 +30,11 @@ import {
   type VoicePhase,
 } from './voice-input.ts'
 
-/** ScriptProcessor buffer; 4096 frames is ~85 ms at 48 kHz. */
-const CAPTURE_BUFFER_FRAMES = 4096
+/** Worklet module the panel loads before it starts capturing. */
+const CAPTURE_WORKLET = 'pcm-capture.worklet.js'
+
+/** Registered processor name inside that module. */
+const CAPTURE_PROCESSOR = 'pcm-capture'
 
 /** Recording-timer refresh interval. */
 const TIMER_INTERVAL_MS = 250
@@ -41,7 +44,9 @@ interface Capture {
   stream: MediaStream
   context: AudioContext
   source: MediaStreamAudioSourceNode
-  processor: ScriptProcessorNode
+  node: AudioWorkletNode
+  /** Silent sink that keeps the worklet pulled without echoing the microphone. */
+  sink: GainNode
   chunks: Float32Array[]
   sampleRate: number
   startedAt: number
@@ -95,16 +100,17 @@ function describe(error: unknown): string {
  */
 async function releaseCapture(capture: Capture): Promise<void> {
   clearInterval(capture.timer)
-  capture.processor.onaudioprocess = null
+  capture.node.port.onmessage = null
   try {
     capture.source.disconnect()
   } catch (error) {
     console.warn('[voice-input] disconnecting the media source failed', error)
   }
   try {
-    capture.processor.disconnect()
+    capture.node.disconnect()
+    capture.sink.disconnect()
   } catch (error) {
-    console.warn('[voice-input] disconnecting the processor failed', error)
+    console.warn('[voice-input] disconnecting the capture graph failed', error)
   }
   for (const track of capture.stream.getTracks()) track.stop()
   if (capture.context.state === 'closed') return
@@ -253,14 +259,18 @@ export function VoiceInputButton({
     }
     let context: AudioContext
     let source: MediaStreamAudioSourceNode
-    let processor: ScriptProcessorNode
+    let node: AudioWorkletNode
+    let sink: GainNode
     try {
       context = new AudioContext()
-      if (typeof context.createScriptProcessor !== 'function') {
-        throw new Error('AudioContext has no createScriptProcessor')
-      }
+      // Worklets need a secure context (an extension page is one) and a loaded
+      // module; a build without the module file fails here instead of recording
+      // silence.
+      await context.audioWorklet.addModule(chrome.runtime.getURL(CAPTURE_WORKLET))
       source = context.createMediaStreamSource(stream)
-      processor = context.createScriptProcessor(CAPTURE_BUFFER_FRAMES, 1, 1)
+      node = new AudioWorkletNode(context, CAPTURE_PROCESSOR)
+      sink = context.createGain()
+      sink.gain.value = 0
     } catch (error) {
       for (const track of stream.getTracks()) track.stop()
       if (!mountedRef.current) return
@@ -271,7 +281,8 @@ export function VoiceInputButton({
       stream,
       context,
       source,
-      processor,
+      node,
+      sink,
       chunks: [],
       sampleRate: context.sampleRate,
       startedAt: performance.now(),
@@ -281,15 +292,20 @@ export function VoiceInputButton({
       selection: catalog.selection,
     }
     captureRef.current = capture
-    processor.onaudioprocess = (event: AudioProcessingEvent): void => {
+    node.port.onmessage = (event: MessageEvent): void => {
       if (captureRef.current !== capture) return
-      capture.chunks.push(new Float32Array(event.inputBuffer.getChannelData(0)))
+      const block = event.data
+      if (!(block instanceof Float32Array)) return
+      capture.chunks.push(block)
       const elapsed = (performance.now() - capture.startedAt) / 1000
       if (elapsed >= capture.maxDurationSeconds) void finish()
     }
     try {
-      source.connect(processor)
-      processor.connect(context.destination)
+      // The sink carries a zero gain so the graph is pulled without playing the
+      // microphone back through the user's speakers.
+      source.connect(node)
+      node.connect(sink)
+      sink.connect(context.destination)
       void context.resume()
     } catch (error) {
       captureRef.current = null

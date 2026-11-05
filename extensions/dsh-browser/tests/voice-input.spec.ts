@@ -222,19 +222,24 @@ describe('voice phase machine', () => {
   })
 })
 
-interface FakeProcessor {
-  onaudioprocess: ((event: AudioProcessingEvent) => void) | null
-  connect: () => void
+interface FakeWorkletNode {
+  readonly name: string
+  port: { onmessage: ((event: MessageEvent) => void) | null }
+  connect: (target?: unknown) => void
   disconnect: () => void
   emit: (samples: Float32Array) => void
 }
 
 class FakeAudioContext {
   static instances: FakeAudioContext[] = []
+  static modules: string[] = []
   sampleRate = 48_000
   state: AudioContextState = 'running'
   destination = {}
-  processors: FakeProcessor[] = []
+  nodes: FakeWorkletNode[] = []
+  readonly audioWorklet = {
+    addModule: async (url: string): Promise<void> => { FakeAudioContext.modules.push(url) },
+  }
 
   constructor() {
     FakeAudioContext.instances.push(this)
@@ -244,17 +249,8 @@ class FakeAudioContext {
     return { connect: () => undefined, disconnect: () => undefined }
   }
 
-  createScriptProcessor(): FakeProcessor {
-    const processor: FakeProcessor = {
-      onaudioprocess: null,
-      connect: () => undefined,
-      disconnect: () => undefined,
-      emit: (samples: Float32Array) => {
-        processor.onaudioprocess?.({ inputBuffer: { getChannelData: () => samples } } as unknown as AudioProcessingEvent)
-      },
-    }
-    this.processors.push(processor)
-    return processor
+  createGain(): { gain: { value: number }; connect: () => void; disconnect: () => void } {
+    return { gain: { value: 1 }, connect: () => undefined, disconnect: () => undefined }
   }
 
   resume(): Promise<void> {
@@ -264,6 +260,22 @@ class FakeAudioContext {
   close(): Promise<void> {
     this.state = 'closed'
     return Promise.resolve()
+  }
+}
+
+class FakeAudioWorkletNode implements FakeWorkletNode {
+  port: { onmessage: ((event: MessageEvent) => void) | null } = { onmessage: null }
+
+  constructor(readonly context: FakeAudioContext, readonly name: string) {
+    context.nodes.push(this)
+  }
+
+  connect(): void {}
+
+  disconnect(): void {}
+
+  emit(samples: Float32Array): void {
+    this.port.onmessage?.({ data: samples } as MessageEvent)
   }
 }
 
@@ -348,6 +360,9 @@ describe('microphone button', () => {
     Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
     FakeAudioContext.instances = []
     vi.stubGlobal('AudioContext', FakeAudioContext)
+    vi.stubGlobal('AudioWorkletNode', FakeAudioWorkletNode)
+    vi.stubGlobal('chrome', { runtime: { getURL: (path: string) => `chrome-extension://test/${path}` } })
+    FakeAudioContext.modules = []
     onTranscript = vi.fn() as unknown as TranscriptSpy
     const tracks = [{ stop: vi.fn() }]
     Object.defineProperty(navigator, 'mediaDevices', {
@@ -373,8 +388,11 @@ describe('microphone button', () => {
     expect(button().getAttribute('aria-label')).toBe('Stop and transcribe')
 
     const context = FakeAudioContext.instances[0]
-    const processor = context?.processors[0]
+    const processor = context?.nodes[0]
     if (context === undefined || processor === undefined) throw new Error('capture did not start')
+    // The panel loads the capture module once before the first recording.
+    expect(FakeAudioContext.modules).toEqual(['chrome-extension://test/pcm-capture.worklet.js'])
+    expect(processor.name).toBe('pcm-capture')
     const captured = sine(48_000, 440, 4_800)
     act(() => { processor.emit(captured) })
     await flush()
