@@ -31,13 +31,13 @@ describe('registerBrowserTools', () => {
     const registeredNames = registered.map((r) => r.name)
     expect(registeredNames).toEqual([...BROWSER_TOOL_NAMES])
     expect([...registeredNames].sort()).toEqual([...BROWSER_TOOL_NAMES].sort())
-    expect(registeredNames).toHaveLength(27)
+    expect(registeredNames).toHaveLength(29)
     expect(disposers.size).toBe(registeredNames.length)
     for (const dispose of disposers.values()) dispose()
   })
 
-  it('keeps BROWSER_TOOL_NAMES a duplicate-free list of 27 wire actions', () => {
-    expect(BROWSER_TOOL_NAMES).toHaveLength(27)
+  it('keeps BROWSER_TOOL_NAMES a duplicate-free list of 29 wire actions', () => {
+    expect(BROWSER_TOOL_NAMES).toHaveLength(29)
     expect(new Set(BROWSER_TOOL_NAMES).size).toBe(BROWSER_TOOL_NAMES.length)
     for (const name of BROWSER_TOOL_NAMES) expect(name).toMatch(/^browser_[a-z_]+$/)
   })
@@ -297,8 +297,8 @@ describe('registerBrowserTools', () => {
     const { ctx, bridge, registered } = makeHarness()
     registerBrowserTools(ctx, bridge, OPTIONS)
     const descriptionChars = registered.reduce((sum, { definition }) => sum + String(definition.description).length, 0)
-    // 27 tools: roughly 160 characters each keeps one-line contracts, not essays.
-    expect(descriptionChars).toBeLessThan(4_400)
+    // 29 tools: roughly 165 characters each keeps one-line contracts, not essays.
+    expect(descriptionChars).toBeLessThan(4_850)
   })
 
   it('exposes optional frame routing on frame-local tools only', () => {
@@ -313,7 +313,7 @@ describe('registerBrowserTools', () => {
       const params = byName.get(name)!.parameters as { properties: { frame?: unknown } }
       expect(params.properties.frame).toBeUndefined()
     }
-    for (const name of ['browser_evaluate', 'browser_screenshot', 'browser_resize', 'browser_console', 'browser_network', 'browser_batch']) {
+    for (const name of ['browser_evaluate', 'browser_screenshot', 'browser_pdf', 'browser_resize', 'browser_viewport', 'browser_console', 'browser_network', 'browser_batch']) {
       const params = byName.get(name)!.parameters as { properties: { frame?: unknown } }
       expect(params.properties.frame).toBeUndefined()
     }
@@ -482,6 +482,59 @@ describe('registerBrowserTools', () => {
     } finally {
       await rm(root, { recursive: true, force: true })
     }
+  })
+
+  it('prints the page to a PDF and stores it under the artifact pdf directory', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'dsh-pdf-'))
+    const directory = path.join(await realpath(root), 'pdf')
+    try {
+      const { ctx, bridge, requestTool, registered } = makeHarness()
+      const pdf = Buffer.from('%PDF-1.7\n%%EOF\n')
+      requestTool.mockResolvedValueOnce({
+        text: 'Printed tab 1 to PDF (1 KiB).',
+        pdf: { base64: pdf.toString('base64') },
+      })
+      registerBrowserTools(ctx, bridge, { ...OPTIONS, screenshotRoot: root, artifactBoundary: root })
+      const tool = registered.find((r) => r.name === 'browser_pdf')!
+      const exec = { signal: new AbortController().signal }
+      const result = await executable(tool.definition)({ landscape: true }, exec)
+
+      expect(requestTool).toHaveBeenLastCalledWith('browser_pdf', { landscape: true }, exec.signal, 1_000)
+      const files = await readdir(directory)
+      expect(files).toHaveLength(1)
+      expect(files[0]).toMatch(/^page-\d+-[0-9a-f]{6}\.pdf$/)
+      const saved = path.join(directory, files[0]!)
+      expect(result.text).toBe(`Printed tab 1 to PDF (1 KiB).\nSaved to ${saved} (${pdf.byteLength} bytes).`)
+      expect(await readFile(saved)).toEqual(pdf)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses a print with no bytes and a print with no artifact root', async () => {
+    const { ctx, bridge, requestTool, registered } = makeHarness()
+    registerBrowserTools(ctx, bridge, OPTIONS)
+    const tool = registered.find((r) => r.name === 'browser_pdf')!
+    const exec = { signal: new AbortController().signal }
+    requestTool.mockResolvedValueOnce({ text: 'Printed tab 1 to PDF (1 KiB).' })
+    await expect(executable(tool.definition)({}, exec)).rejects.toThrow(/no PDF bytes/)
+    requestTool.mockResolvedValueOnce({ pdf: { base64: '' } })
+    await expect(executable(tool.definition)({}, exec)).rejects.toThrow(/no PDF bytes/)
+    requestTool.mockResolvedValueOnce({ pdf: { base64: Buffer.from('%PDF-1.7').toString('base64') } })
+    await expect(executable(tool.definition)({}, exec)).rejects.toThrow(/no artifact directory is configured/)
+  })
+
+  it('passes a viewport override through and forwards reset', async () => {
+    const { ctx, bridge, requestTool, registered } = makeHarness()
+    registerBrowserTools(ctx, bridge, OPTIONS)
+    const tool = registered.find((r) => r.name === 'browser_viewport')!
+    const exec = { signal: new AbortController().signal }
+    requestTool.mockResolvedValueOnce({ text: 'emulated' })
+    expect((await executable(tool.definition)({ width: 390, height: 844, device_scale_factor: 3 }, exec)).text).toBe('emulated')
+    expect(requestTool).toHaveBeenLastCalledWith('browser_viewport', { width: 390, height: 844, device_scale_factor: 3 }, exec.signal, 1_000)
+    requestTool.mockResolvedValueOnce({ text: 'cleared' })
+    await executable(tool.definition)({ reset: true }, exec)
+    expect(requestTool).toHaveBeenLastCalledWith('browser_viewport', { reset: true }, exec.signal, 1_000)
   })
 
   it('rejects ambiguous hover and drag targets before calling the bridge', async () => {

@@ -32,6 +32,8 @@ dsh 的**浏览器操作端**：让模型直接读取并操作你在浏览器里
 | 实时画面 | 侧栏开关 | 可选显示受控标签页的 JPEG 实时画面，默认关闭：帧来自 CDP screencast，先 ack 再处理，旧帧按序号丢弃，切页或调试器断开即清图 |
 | console 与 network | `browser_console` / `browser_network` | 首次调用起按标签页缓冲；请求头与 URL 凭据脱敏，请求正文只记字节数 |
 | 调整窗口 | `browser_resize` | 调整承载受控标签页的窗口尺寸 |
+| 模拟视口 | `browser_viewport` | 通过调试器模拟视口（`mobile` 默认 false）；与窗口缩放不同，随调试器断开（空闲 60 秒）失效，`reset: true` 立即撤销 |
+| 打印 PDF | `browser_pdf` | 把受控标签页打印为 PDF，由宿主落盘并返回路径；需要调试器 |
 | 批量 | `browser_batch` | 顺序执行工具调用，首个失败即停 |
 | 图片对话 | `session.prompt` / `session.attachment` | 按宿主能力启用图片选择、纯图片发送和持久历史预览 |
 | 引用你划选的内容 | 侧栏输入框 | 你在页面里选中的文字会变成输入框里的引用，随下一条消息一起发送 |

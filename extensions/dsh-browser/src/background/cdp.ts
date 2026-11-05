@@ -50,8 +50,11 @@ export const MAX_CONSOLE_TEXT = 16_384
 /** Largest base64 screenshot accepted on the wire before the quality ladder. */
 export const MAX_SCREENSHOT_BASE64 = 4 * 1024 * 1024
 
+/** Upper bound on PDF payloads the bridge will carry, in base64 characters. */
+export const MAX_PDF_BASE64 = 8 * 1024 * 1024
+
 /** Ordered domains the tool layer may enable. */
-type ProtocolDomain = 'Runtime' | 'Page' | 'Network' | 'Log'
+type ProtocolDomain = 'Runtime' | 'Page' | 'Network' | 'Log' | 'Emulation'
 
 /** A `debugger-unavailable` failure carrying its bridge code. */
 export class DebuggerUnavailableError extends Error {
@@ -80,6 +83,16 @@ export class ScreenshotTooLargeError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'ScreenshotTooLargeError'
+  }
+}
+
+/** A printed PDF exceeded the wire budget. */
+export class PdfTooLargeError extends Error {
+  readonly code: ToolErrorCode = 'action-failed'
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'PdfTooLargeError'
   }
 }
 
@@ -330,8 +343,13 @@ function scheduleIdleDetach(tabId: number): void {
  * still reports what the page logged before the detach.
  * @param tabId - tab to detach.
  */
+/** Tabs carrying a device-metrics override this worker applied. */
+const viewportOverrides = new Set<number>()
+
 export async function detachTab(tabId: number): Promise<void> {
   bumpAttachGeneration(tabId)
+  // Chrome reverts the metrics with the session; the marker must go with it.
+  viewportOverrides.delete(tabId)
   liveViewHolds.delete(tabId)
   sessions.delete(tabId)
   pendingAttachments.delete(tabId)
@@ -385,9 +403,16 @@ async function send(tabId: number, method: string, params?: object): Promise<Rec
   }
 }
 
+/** Domains that expose no `enable` command; their commands work once attached. */
+const DOMAINS_WITHOUT_ENABLE: ReadonlySet<ProtocolDomain> = new Set(['Emulation'])
+
 async function ensureDomain(tabId: number, domain: ProtocolDomain): Promise<void> {
   const session = sessions.get(tabId)
   if (session?.enabled.has(domain) === true) return
+  if (DOMAINS_WITHOUT_ENABLE.has(domain)) {
+    sessions.get(tabId)?.enabled.add(domain)
+    return
+  }
   await send(tabId, `${domain}.enable`, {})
   sessions.get(tabId)?.enabled.add(domain)
 }
@@ -2116,6 +2141,100 @@ export async function captureScreenshot(tabId: number, options: ScreenshotOption
       ? {}
       : { quality: { requested: options.quality, effective: effectiveQuality, reduced: effectiveQuality < options.quality } }),
   }
+}
+
+/** Device metrics override applied to the controlled tab. */
+export interface ViewportOverride {
+  /** Overridden viewport width in CSS pixels. */
+  width: number
+  /** Overridden viewport height in CSS pixels. */
+  height: number
+  /** Overridden device pixel ratio; omitted keeps the page's own ratio. */
+  deviceScaleFactor?: number
+  /** Whether the page sees a mobile viewport. */
+  mobile: boolean
+}
+
+/**
+ * Apply a device-metrics override to one tab.
+ *
+ * The override lives in the debugger session: Chrome reverts the tab to its
+ * real metrics when the session detaches (idle timeout or an explicit clear
+ * through {@link clearViewportOverride}), so callers must re-apply it after
+ * such a transition instead of assuming it persists. A same-target navigation
+ * keeps the attached session, so it keeps the override.
+ * @param tabId - target tab.
+ * @param override - validated width, height, optional scale, and mobile flag.
+ */
+export async function applyViewportOverride(tabId: number, override: ViewportOverride): Promise<void> {
+  await ensureAttached(tabId)
+  await ensureDomain(tabId, 'Emulation')
+  await send(tabId, 'Emulation.setDeviceMetricsOverride', {
+    width: override.width,
+    height: override.height,
+    deviceScaleFactor: override.deviceScaleFactor ?? 0,
+    mobile: override.mobile,
+  })
+  viewportOverrides.add(tabId)
+}
+
+/**
+ * Drop a device-metrics override so the tab lays out at its real viewport.
+ * @param tabId - target tab.
+ */
+export async function clearViewportOverride(tabId: number): Promise<boolean> {
+  // Nothing to undo without an override: attaching a debugger only to clear one
+  // nobody applied would show the debugging infobar for no effect, and a tab
+  // whose session already detached reverted on its own.
+  if (!viewportOverrides.has(tabId)) {
+    if (!sessions.has(tabId)) return false
+    // A surviving session may still carry an override from an earlier worker;
+    // clearing is cheap and idempotent, so drop it without claiming an effect.
+    await ensureDomain(tabId, 'Emulation')
+    await send(tabId, 'Emulation.clearDeviceMetricsOverride', {})
+    return false
+  }
+  await ensureDomain(tabId, 'Emulation')
+  await send(tabId, 'Emulation.clearDeviceMetricsOverride', {})
+  viewportOverrides.delete(tabId)
+  return true
+}
+
+/** Print options the pager forwards to `Page.printToPDF`. */
+export interface PrintToPdfOptions {
+  /** Render CSS backgrounds; defaults to true so the print matches the screen. */
+  printBackground: boolean
+  /** Landscape orientation. */
+  landscape: boolean
+  /** Use the page's own `@page` size instead of the letter default. */
+  preferCSSPageSize: boolean
+}
+
+/**
+ * Print the controlled tab to a PDF through CDP.
+ * @param tabId - target tab.
+ * @param options - validated print options.
+ * @returns base64 of the PDF bytes.
+ * @throws {DebuggerUnavailableError} when the debugger cannot print this tab.
+ * @throws {PdfTooLargeError} when the result exceeds {@link MAX_PDF_BASE64}.
+ */
+export async function printToPdf(tabId: number, options: PrintToPdfOptions): Promise<string> {
+  await ensureAttached(tabId)
+  await ensureDomain(tabId, 'Page')
+  const response = await send(tabId, 'Page.printToPDF', {
+    printBackground: options.printBackground,
+    landscape: options.landscape,
+    preferCSSPageSize: options.preferCSSPageSize,
+    transferMode: 'ReturnAsBase64',
+  }) as { data?: unknown }
+  const data = typeof response.data === 'string' ? response.data : ''
+  if (data === '') throw new Error('browser_pdf: the browser returned an empty PDF.')
+  if (data.length > MAX_PDF_BASE64) {
+    throw new PdfTooLargeError(
+      `The printed PDF is ${Math.round(data.length / 1024)} KiB of base64, above the ${MAX_PDF_BASE64 / 1024 / 1024} MiB wire budget. Print a shorter document or capture screenshots instead.`,
+    )
+  }
+  return data
 }
 
 /**

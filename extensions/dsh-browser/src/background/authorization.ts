@@ -22,6 +22,8 @@ export const PAGE_READS = new Set([
   // A screenshot returns page pixels; it belongs to the same read boundary as
   // the textual readers even though the contract lists only the four tools.
   'browser_screenshot',
+  // A printed PDF is the same page content in another container.
+  'browser_pdf',
 ])
 const STATE_CHANGING_ACTIONS = new Set([
   'browser_click',
@@ -37,6 +39,7 @@ const STATE_CHANGING_ACTIONS = new Set([
   'browser_drag',
   'browser_evaluate',
   'browser_resize',
+  'browser_viewport',
 ])
 
 /** A prompt that crosses from the page's origin to a different one. */
@@ -113,6 +116,7 @@ export function approvalPromptForCall(
     && call.name !== 'browser_back'
     && call.name !== 'browser_forward'
     && call.name !== 'browser_resize'
+    && call.name !== 'browser_viewport'
   let destinationOrigin: string | undefined
   if (call.name === 'browser_navigate') {
     destinationOrigin = originFromUrl(typeof call.args.url === 'string' ? call.args.url : '')
@@ -303,6 +307,22 @@ function summarizeAction(call: ToolCall, locale: UiLocale): string {
       'Run JavaScript in the current page (the code is not shown in this dialog)',
       '在当前页面中执行 JavaScript（代码不会显示在确认框）',
     )
+    case 'browser_viewport': {
+      if (call.args.reset === true) {
+        return localized(
+          locale,
+          'Drop the emulated viewport on the controlled tab',
+          '撤销受控标签页的模拟视口',
+        )
+      }
+      const width = typeof call.args.width === 'number' ? Math.floor(call.args.width) : '?'
+      const height = typeof call.args.height === 'number' ? Math.floor(call.args.height) : '?'
+      return localized(
+        locale,
+        `Emulate a ${width}x${height} viewport on the controlled tab`,
+        `把受控标签页模拟为 ${width}x${height} 的视口`,
+      )
+    }
     case 'browser_resize': return localized(
       locale,
       `Resize the browser window to ${typeof call.args.width === 'number' ? Math.floor(call.args.width) : '?'}x${typeof call.args.height === 'number' ? Math.floor(call.args.height) : '?'}`,

@@ -27,6 +27,7 @@ export const ARTIFACT_EXTENSIONS: ReadonlySet<string> = new Set([
   '.bmp',
   '.ppm',
   '.gif',
+  '.pdf',
 ])
 
 /** Roots whose `.git` subtree already produced its one-time warning. */

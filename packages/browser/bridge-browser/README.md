@@ -91,6 +91,8 @@ Each `respond` carries a globally unique transport id as well as the host intera
 | `browser_batch` | Run up to 25 tool calls sequentially and stop at the first failure. |
 | `browser_scroll` / `browser_navigate` / `browser_open_tab` / `browser_back` / `browser_forward` / `browser_reload` | Page movement. |
 | `browser_resize` | Resize the window holding the controlled tab. |
+| `browser_viewport` | Emulate a device viewport (width, height, optional device scale, `mobile` defaulting to false) on the controlled tab through the debugger. It is not a window resize: the page lays out at the emulated size, the override ends with the debugger session (60 s idle detach), and `reset` drops it immediately. |
+| `browser_pdf` | Print the controlled tab to a PDF under `<artifactRoot>/<sessionId>/pdf/` and report the path. Requires the debugger; the print honours the page's own `@page` size and CSS backgrounds by default. |
 | `browser_get_text` / `browser_wait` | Read regions / settle detection. |
 
 Tools added in 0.1.0 require extension 0.3.0. Against an older extension they fail with an explicit "reload or update the extension" result instead of a raw `Unknown action` error; the original fifteen tools keep their previous behavior.
@@ -110,7 +112,7 @@ Tools added in 0.1.0 require extension 0.3.0. Against an older extension they fa
 ## Known Limitations and Deferred Work
 
 - One active extension connection (a second window replaces the first).
-- `browser_screenshot` writes files under `<artifactRoot>/<sessionId>/screenshots/`; without a configured artifact root the tool reports that no directory is available. Images are returned as a path, never as an inline image block, so the model reads them back with `read_image`. Accepted `scale` values are 1, 2, and 3; a `scale` below 1 (the earlier 0.1–1 range) is rejected as an invalid argument.
+- `browser_screenshot` writes files under `<artifactRoot>/<sessionId>/screenshots/`, and `browser_pdf` under the sibling `pdf/` directory (same artifact root and retention sweep; the extension caps one print at 8 MiB of base64 on the wire, and the host refuses a decoded payload above 8 MiB instead of splitting it); without a configured artifact root the tool reports that no directory is available. Images are returned as a path, never as an inline image block, so the model reads them back with `read_image`. Accepted `scale` values are 1, 2, and 3; a `scale` below 1 (the earlier 0.1–1 range) is rejected as an invalid argument.
 - `browser_console` and `browser_network` capture only from the moment they are first called on a tab; the buffers are memory-only, cleared when the main-frame document is replaced (reload or cross-document navigation), kept across same-document hash, query, and SPA changes, and dropped when the tab closes.
 - `browser_evaluate` and `browser_upload_file` are state-changing tools and follow the extension's approval flow; `browser_evaluate` runs in the page world and cannot run on protected pages.
 - `browser_hover`, `browser_drag`, and `browser_click` with `button`/`count`/`modifiers` use real input events when the extension holds a debugger session on the controlled tab, and fall back to synthesized DOM events otherwise; the fallback result says so.

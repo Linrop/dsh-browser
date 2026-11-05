@@ -25,9 +25,12 @@ import {
   DebuggerUnavailableError,
   JsResultNotSerializableError,
   NativeDragUnavailableError,
+  PdfTooLargeError,
   ScreenshotTooLargeError,
   captureScreenshot,
+  applyViewportOverride,
   captureVisibleTabScreenshot,
+  clearViewportOverride,
   clickPointer,
   dragPointer,
   ensureAttached,
@@ -38,6 +41,7 @@ import {
   installPageInstrumentation,
   modifierMask,
   movePointer,
+  printToPdf,
   NAMED_KEY_NAMES,
   parseKeyStroke,
   pressKey,
@@ -54,6 +58,7 @@ import {
   type DragPointerMode,
   type EvaluateOutcome,
   type KeyStroke,
+  type PrintToPdfOptions,
   type ScreenshotCapture,
   type ScreenshotOptions,
 } from './cdp.ts'
@@ -133,7 +138,9 @@ const TAB_NATIVE_TOOLS = new Set([
   'browser_forward',
   'browser_reload',
   'browser_screenshot',
+  'browser_pdf',
   'browser_resize',
+  'browser_viewport',
   'browser_console',
   'browser_network',
   'browser_evaluate',
@@ -156,6 +163,8 @@ const STATE_CHANGING_PAGE_TOOLS = new Set([
 const BACKGROUND_PAGE_TOOLS = new Set([
   'browser_evaluate',
   'browser_screenshot',
+  'browser_pdf',
+  'browser_viewport',
   'browser_console',
   'browser_network',
   'browser_resize',
@@ -1722,7 +1731,7 @@ export async function dispatchToolCall(
     if ('error' in parsedPress) return parsedPress.error
   }
   if (!isInjectablePage(tab.url) && !TAB_NATIVE_TOOLS.has(call.name)) {
-    return unavailable('The current page DOM is protected by the browser. DOM actions and text reads that need the content script are unavailable on this page, while snapshot metadata, navigate, back, forward, reload, screenshot, resize, console and network telemetry, and JavaScript evaluation remain available.')
+    return unavailable('The current page DOM is protected by the browser. DOM actions and text reads that need the content script are unavailable on this page, while snapshot metadata, navigate, back, forward, reload, screenshot, pdf, resize, viewport emulation, console and network telemetry, and JavaScript evaluation remain available.')
   }
   const targetError = validateElementTarget(call, tab.id, frames)
   if (targetError !== undefined) return targetError
@@ -1884,6 +1893,7 @@ function toolFailure(error: unknown): ToolAnswer {
   if (error instanceof DebuggerUnavailableError
     || error instanceof JsResultNotSerializableError
     || error instanceof ScreenshotTooLargeError
+    || error instanceof PdfTooLargeError
     || error instanceof ScreenshotPlanError) {
     return { ok: false, error: { code: error.code, message: error.message } }
   }
@@ -2222,6 +2232,107 @@ async function dispatchResizeTool(tabId: number, call: ToolCall, commitAction?: 
   }
 }
 
+/** Viewport bounds, kept in step with browser_resize's window limits. */
+const VIEWPORT_MAX_WIDTH = 7_680
+const VIEWPORT_MAX_HEIGHT = 4_320
+
+/**
+ * Apply or clear a device-metrics override on the controlled tab.
+ * @param tabId - target tab.
+ * @param call - tool arguments: width/height[/device_scale_factor/mobile] or reset.
+ * @param commitAction - marks the call as an approved state change.
+ */
+async function dispatchViewportTool(tabId: number, call: ToolCall, commitAction?: () => void): Promise<ToolAnswer> {
+  if (call.args.reset === true) {
+    const sizing = ['width', 'height', 'device_scale_factor', 'mobile']
+      .filter((key) => call.args[key] !== undefined)
+    if (sizing.length > 0) {
+      return badArgs(`reset=true clears the emulated viewport; omit ${sizing.join(', ')}, or omit reset to apply a new one.`)
+    }
+    commitAction?.()
+    let cleared: boolean
+    try {
+      cleared = await clearViewportOverride(tabId)
+    } catch (error: unknown) {
+      return toolFailure(error)
+    }
+    return {
+      ok: true,
+      result: {
+        text: cleared
+          ? `Cleared the emulated viewport on tab ${tabId}. It lays out at its real size again; take a new snapshot when the layout matters.`
+          : `No emulated viewport was active on tab ${tabId}, so nothing changed.`,
+      },
+    }
+  }
+  const width = call.args.width
+  const height = call.args.height
+  const scale = call.args.device_scale_factor
+  if (typeof width !== 'number' || !Number.isFinite(width) || width < 1 || width > VIEWPORT_MAX_WIDTH) {
+    return badArgs(`width must be a number within 1..${VIEWPORT_MAX_WIDTH}.`)
+  }
+  if (typeof height !== 'number' || !Number.isFinite(height) || height < 1 || height > VIEWPORT_MAX_HEIGHT) {
+    return badArgs(`height must be a number within 1..${VIEWPORT_MAX_HEIGHT}.`)
+  }
+  if (scale !== undefined && (typeof scale !== 'number' || !Number.isFinite(scale) || scale < 1 || scale > 4)) {
+    return badArgs('device_scale_factor must be a number within 1..4 when given.')
+  }
+  const mobile = call.args.mobile === true
+  const override = {
+    width: Math.floor(width),
+    height: Math.floor(height),
+    mobile,
+    ...(typeof scale === 'number' ? { deviceScaleFactor: scale } : {}),
+  }
+  commitAction?.()
+  try {
+    await applyViewportOverride(tabId, override)
+  } catch (error: unknown) {
+    return toolFailure(error)
+  }
+  const scaleText = override.deviceScaleFactor === undefined ? '' : `, device scale ${override.deviceScaleFactor}`
+  return {
+    ok: true,
+    result: {
+      text: `Emulated a ${override.width}x${override.height} ${mobile ? 'mobile' : 'desktop'} viewport${scaleText} on tab ${tabId}. `
+        + 'The override belongs to the debugger session: it ends when the debugger detaches after 60 s idle, and reset=true drops it now. '
+        + 'Take a new snapshot because the layout changed.',
+    },
+  }
+}
+
+/** Print options accepted from the model, with defaults that match the screen. */
+function parsePrintOptions(args: Record<string, unknown>): PrintToPdfOptions {
+  return {
+    printBackground: args.print_background !== false,
+    landscape: args.landscape === true,
+    preferCSSPageSize: args.prefer_css_page_size !== false,
+  }
+}
+
+/**
+ * Print the controlled tab to a PDF and hand the bytes to the host.
+ * @param tabId - target tab.
+ * @param call - tool arguments with the optional print options.
+ */
+async function dispatchPdfTool(tabId: number, call: ToolCall): Promise<ToolAnswer> {
+  const options = parsePrintOptions(call.args)
+  let base64: string
+  try {
+    base64 = await printToPdf(tabId, options)
+  } catch (error: unknown) {
+    return toolFailure(error)
+  }
+  const bytes = Math.floor(base64.length * 3 / 4)
+  return {
+    ok: true,
+    result: {
+      text: `Printed tab ${tabId} to PDF (${Math.round(bytes / 1024)} KiB${options.landscape ? ', landscape' : ''}${options.printBackground ? '' : ', no CSS backgrounds'}). The host writes the file and returns its path; the bytes never enter the conversation.`,
+      pdf: { base64 },
+    },
+  }
+}
+
 /**
  * Dispatch a tool the background worker executes itself.
  *
@@ -2246,6 +2357,8 @@ async function dispatchBackgroundPageTool(
       case 'browser_console': return await dispatchConsoleTool(tab, call, budget)
       case 'browser_network': return await dispatchNetworkTool(tab, call, budget)
       case 'browser_resize': return await dispatchResizeTool(tab.id, call, commitAction)
+      case 'browser_viewport': return await dispatchViewportTool(tab.id, call, commitAction)
+      case 'browser_pdf': return await dispatchPdfTool(tab.id, call)
       default: return undefined
     }
   } catch (error: unknown) {

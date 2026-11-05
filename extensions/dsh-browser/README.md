@@ -32,6 +32,8 @@ The **browser-operation end** of dsh: the model reads and operates the browser p
 | Live view | side panel toggle | Optional JPEG view of the controlled tab, off by default: frames from a CDP screencast are acknowledged before handling, stale frames are dropped by sequence, and switching tabs or losing the debugger clears the image |
 | Console and network | `browser_console` / `browser_network` | Buffered per tab from the first call; headers and URL credentials redacted, request bodies recorded as byte counts only |
 | Resize the window | `browser_resize` | Resize the window holding the controlled tab |
+| Emulate a viewport | `browser_viewport` | Emulate a viewport through the debugger (`mobile` defaults to false); separate from window resize, ends when the debugger detaches (60 s idle), and `reset: true` drops it now |
+| Print to PDF | `browser_pdf` | Print the controlled tab to a PDF the host saves as a file path; requires the debugger |
 | Batch | `browser_batch` | Sequential tool calls with stop-on-first-error |
 | Chat with images | `session.prompt` / `session.attachment` | Host-gated image selection, image-only sends, and durable history previews |
 | Quote what you highlight | side panel composer | The text you select in the page becomes a quote in the composer and rides along with your next message |

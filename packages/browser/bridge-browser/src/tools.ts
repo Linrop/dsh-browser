@@ -24,6 +24,7 @@ import { BridgeToolError, type BridgeServer } from './server.ts'
 import { MAX_FRAME_BYTES } from './protocol.ts'
 import { isRecord } from './host-api.ts'
 import { saveScreenshotImage, type SavedScreenshot, type ScreenshotImage } from './screenshot-artifact.ts'
+import { savePdf } from './pdf-artifact.ts'
 
 /** Options resolved from plugin config before tool registration. */
 export interface BrowserToolsOptions {
@@ -149,7 +150,9 @@ export const BROWSER_TOOL_NAMES = [
   'browser_wait',
   'browser_evaluate',
   'browser_screenshot',
+  'browser_pdf',
   'browser_resize',
+  'browser_viewport',
   'browser_upload_file',
   'browser_select',
   'browser_hover',
@@ -418,6 +421,44 @@ function buildHandlers(
     })
   })
 
+  handlers.set('browser_viewport', (exec, args) => {
+    const a = args as {
+      width?: number
+      height?: number
+      device_scale_factor?: number
+      mobile?: boolean
+      reset?: boolean
+    }
+    return call(exec, 'browser_viewport', {
+      ...a.width !== undefined ? { width: a.width } : {},
+      ...a.height !== undefined ? { height: a.height } : {},
+      ...a.device_scale_factor !== undefined ? { device_scale_factor: a.device_scale_factor } : {},
+      ...a.mobile !== undefined ? { mobile: a.mobile } : {},
+      ...a.reset !== undefined ? { reset: a.reset } : {},
+    })
+  })
+
+  // The PDF bytes are page content, so they follow the same boundary as the
+  // screenshot: the host writes the file and only the path reaches the model.
+  handlers.set('browser_pdf', async (exec, args) => {
+    const a = args as {
+      print_background?: boolean
+      landscape?: boolean
+      prefer_css_page_size?: boolean
+    }
+    const raw = await request(exec, 'browser_pdf', {
+      ...a.print_background !== undefined ? { print_background: a.print_background } : {},
+      ...a.landscape !== undefined ? { landscape: a.landscape } : {},
+      ...a.prefer_css_page_size !== undefined ? { prefer_css_page_size: a.prefer_css_page_size } : {},
+    })
+    const parsed = parsePdfResult(raw)
+    const saved = await savePdf(parsed.base64, {
+      workspaceRoot: sessionArtifactRoot(exec, options.screenshotRoot),
+      ...options.artifactBoundary.trim() !== '' ? { boundary: options.artifactBoundary } : {},
+    })
+    return { text: `${parsed.text}\nSaved to ${saved.path} (${saved.byteLength} bytes).` }
+  })
+
   handlers.set('browser_upload_file', async (exec, args) => {
     const a = args as { index?: unknown; files?: unknown }
     if (typeof a.index !== 'number' || !Number.isFinite(a.index)) {
@@ -545,7 +586,7 @@ function defineTools(call: Call, request: Request, options: BrowserToolsOptions)
 
   const snapshot = (): ToolDefinition => defineTool({
     name: 'browser_snapshot',
-    description: `Read the page and accessible iframes as structured text with numbered action targets. Use frame for iframe targets and delta=true for changes only. ${UNTRUSTED_CONTENT_WARNING}`,
+    description: `Read the page and accessible iframes as structured text with numbered action targets. Every accessible frame is included, so this tool takes no frame argument; use delta=true for changes only. ${UNTRUSTED_CONTENT_WARNING}`,
     parameters: {
       delta: { type: 'boolean', description: 'Return changes since the previous snapshot.' },
       region: { type: 'string', description: 'CSS selector or "main" to read only that region.' },
@@ -762,6 +803,34 @@ function defineTools(call: Call, request: Request, options: BrowserToolsOptions)
     execute: (args, exec) => dispatch('browser_resize', args as Record<string, unknown>, exec),
   })
 
+  const viewport = (): ToolDefinition => defineTool({
+    name: 'browser_viewport',
+    description: 'Emulate a device viewport through the debugger (mobile=false is the desktop default), distinct from browser_resize. Ends when the debugger detaches (60 s idle); reset=true drops it now.',
+    parameters: {
+      width: { type: 'number', description: 'Viewport width in CSS pixels, 1..7680; required unless reset=true.' },
+      height: { type: 'number', description: 'Viewport height in CSS pixels, 1..4320; required unless reset=true.' },
+      device_scale_factor: { type: 'number', description: 'Device pixel ratio to emulate, 1..4. Omit to keep the page default.' },
+      mobile: { type: 'boolean', description: 'Emulate a mobile viewport; defaults to false (desktop).' },
+      reset: { type: 'boolean', description: 'Drop the emulated viewport and return to the real layout.' },
+    },
+    timeoutMs: options.toolTimeoutMs,
+    output: TEXT_OUTPUT,
+    execute: (args, exec) => dispatch('browser_viewport', args as Record<string, unknown>, exec),
+  })
+
+  const pdf = (): ToolDefinition => defineTool({
+    name: 'browser_pdf',
+    description: 'Print the controlled tab to a PDF and save it in the artifact workspace; read the returned path with a file reader. Requires the debugger.',
+    parameters: {
+      print_background: { type: 'boolean', description: 'Render CSS backgrounds and colours. Defaults to true.' },
+      landscape: { type: 'boolean', description: 'Print landscape instead of portrait. Defaults to false.' },
+      prefer_css_page_size: { type: 'boolean', description: 'Honour the page\'s @page size instead of the letter default. Defaults to true.' },
+    },
+    timeoutMs: options.toolTimeoutMs,
+    output: TEXT_OUTPUT,
+    execute: (args, exec) => dispatch('browser_pdf', args as Record<string, unknown>, exec),
+  })
+
   const uploadFile = (): ToolDefinition => defineTool({
     name: 'browser_upload_file',
     description: `Set a file input from the snapshot; this changes the form and may require the user\'s approval first. Include frame when the input is inside an iframe; omit it for the top page. Each entry is { path } (inside the session working directory or this session\'s artifact directory) or { name, mime_type?, base64 }. At most ${MAX_UPLOAD_FILES} files and 10 MB per call.`,
@@ -916,7 +985,9 @@ function defineTools(call: Call, request: Request, options: BrowserToolsOptions)
     wait(),
     evaluate(),
     screenshot(),
+    pdf(),
     resize(),
+    viewport(),
     uploadFile(),
     select(),
     hover(),
@@ -1345,6 +1416,25 @@ function parseScreenshotResult(raw: unknown): ParsedScreenshot {
     ...image === undefined ? {} : { image },
     ...frame === undefined ? {} : { frame },
   }
+}
+
+/**
+ * Narrow one printed page payload.
+ * @param raw - tool result as the extension sent it.
+ * @returns the PDF bytes and the text that belongs above the saved path.
+ */
+function parsePdfResult(raw: unknown): { base64: string; text: string } {
+  if (!isRecord(raw)) {
+    throw new Error(`browser_pdf returned an unexpected payload: ${JSON.stringify(raw)}`)
+  }
+  const pdf = isRecord(raw.pdf) ? raw.pdf : undefined
+  const base64 = typeof pdf?.base64 === 'string' ? pdf.base64 : ''
+  if (base64 === '') {
+    throw new Error(`browser_pdf returned no PDF bytes${typeof raw.text === 'string' ? `: ${raw.text}` : ''}`)
+  }
+  const fallback = `Printed ${Math.round((base64.length * 3) / 4 / 1024)} KiB of PDF.`
+  const text = typeof raw.text === 'string' && raw.text.trim() !== '' ? raw.text : fallback
+  return { base64, text }
 }
 
 /** Narrow the image block; an incomplete block is treated as absent. */

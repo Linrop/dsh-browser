@@ -94,6 +94,7 @@ describe('privacy gate covers every page reader', () => {
     'browser_network',
     'browser_evaluate',
     'browser_screenshot',
+    'browser_pdf',
   ])('refuses %s while page content sharing is off', async (name) => {
     mockChrome({ tab: {} })
     const answer = await dispatchToolCall(call(name, { code: '1', query: 'x' }), 'off', undefined, undefined, undefined, undefined, undefined, {
@@ -190,6 +191,161 @@ describe('browser_resize dispatch', () => {
     mockChrome({ tab: {} })
     const answer = await dispatch(call('browser_resize', { width: 0, height: 600 }))
     expect(answer).toMatchObject({ ok: false, error: { code: 'bad-args' } })
+  })
+})
+
+describe('browser_viewport dispatch', () => {
+  /** Drive the Emulation domain and record the methods the handler sends. */
+  function mockEmulation(): ReturnType<typeof vi.fn> {
+    const sendCommand = vi.fn(async (_target: { tabId: number }, _method: string, _params?: unknown) => ({}))
+    mockChrome({
+      tab: {},
+      debuggerApi: {
+        attach: vi.fn(async () => undefined),
+        detach: vi.fn(async () => undefined),
+        sendCommand,
+        onDetach: { addListener: () => undefined },
+        onEvent: { addListener: () => undefined },
+      },
+    })
+    return sendCommand
+  }
+
+  /** Methods one dispatch sent, in order, so an extra `*.enable` cannot hide. */
+  function methods(sendCommand: ReturnType<typeof vi.fn>): unknown[] {
+    return sendCommand.mock.calls.map((call) => call[1])
+  }
+
+  it('applies a mobile viewport override without enabling the Emulation domain', async () => {
+    const sendCommand = mockEmulation()
+    const answer = await dispatch(call('browser_viewport', { width: 390.9, height: 844, device_scale_factor: 3, mobile: true }))
+    expect(answer.ok).toBe(true)
+    // Emulation exposes no `enable` command; any such call fails on a real browser.
+    expect(methods(sendCommand)).toEqual(['Emulation.setDeviceMetricsOverride'])
+    expect(sendCommand).toHaveBeenCalledWith(
+      expect.anything(),
+      'Emulation.setDeviceMetricsOverride',
+      { width: 390, height: 844, deviceScaleFactor: 3, mobile: true },
+    )
+    expect((answer.result as { text: string }).text).toContain('390x844 mobile viewport')
+  })
+
+  it('emulates a desktop viewport by default and keeps the page scale when omitted', async () => {
+    const sendCommand = mockEmulation()
+    await dispatch(call('browser_viewport', { width: 1280, height: 800 }))
+    expect(sendCommand).toHaveBeenCalledWith(
+      expect.anything(),
+      'Emulation.setDeviceMetricsOverride',
+      { width: 1280, height: 800, deviceScaleFactor: 0, mobile: false },
+    )
+  })
+
+  it('reports nothing to clear when no debugger session was attached', async () => {
+    const sendCommand = mockEmulation()
+    const answer = await dispatch(call('browser_viewport', { reset: true }))
+    expect(answer.ok).toBe(true)
+    // Clearing must not attach a debugger (and show its infobar) just to undo nothing.
+    expect(methods(sendCommand)).toEqual([])
+    expect((answer.result as { text: string }).text).toContain('nothing changed')
+  })
+
+  it('clears an applied override with reset', async () => {
+    const sendCommand = mockEmulation()
+    await dispatch(call('browser_viewport', { width: 800, height: 600 }))
+    sendCommand.mockClear()
+    const answer = await dispatch(call('browser_viewport', { reset: true }))
+    expect(answer.ok).toBe(true)
+    expect(methods(sendCommand)).toEqual(['Emulation.clearDeviceMetricsOverride'])
+    expect(sendCommand).toHaveBeenCalledWith(expect.anything(), 'Emulation.clearDeviceMetricsOverride', {})
+  })
+
+  it('rejects reset combined with a size', async () => {
+    const sendCommand = mockEmulation()
+    const answer = await dispatch(call('browser_viewport', { reset: true, width: 800, height: 600 }))
+    expect(answer).toMatchObject({ ok: false, error: { code: 'bad-args' } })
+    expect(sendCommand).not.toHaveBeenCalled()
+  })
+
+  it('rejects out-of-range sizes and scales before touching the debugger', async () => {
+    const sendCommand = mockEmulation()
+    expect(await dispatch(call('browser_viewport', { width: 0, height: 800 })))
+      .toMatchObject({ ok: false, error: { code: 'bad-args' } })
+    expect(await dispatch(call('browser_viewport', { width: 800, height: 600, device_scale_factor: 9 })))
+      .toMatchObject({ ok: false, error: { code: 'bad-args' } })
+    expect(sendCommand).not.toHaveBeenCalled()
+  })
+})
+
+describe('browser_pdf dispatch', () => {
+  it('returns the printed bytes to the bridge', async () => {
+    const sendCommand = vi.fn(async (_target: { tabId: number }, method: string) => (
+      method === 'Page.printToPDF' ? { data: 'JVBERi0xLjQK' } : {}
+    ))
+    mockChrome({
+      tab: {},
+      debuggerApi: {
+        attach: vi.fn(async () => undefined),
+        detach: vi.fn(async () => undefined),
+        sendCommand,
+        onDetach: { addListener: () => undefined },
+        onEvent: { addListener: () => undefined },
+      },
+    })
+    const answer = await dispatch(call('browser_pdf', { landscape: true }))
+    expect(answer.ok).toBe(true)
+    const result = answer.result as { text: string; pdf: { base64: string } }
+    expect(result.pdf.base64).toBe('JVBERi0xLjQK')
+    expect(result.text).toContain('landscape')
+    expect(sendCommand).toHaveBeenCalledWith(
+      expect.anything(),
+      'Page.printToPDF',
+      expect.objectContaining({ landscape: true, printBackground: true, preferCSSPageSize: true }),
+    )
+  })
+
+  it('treats an empty print result as an action failure, not a debugger problem', async () => {
+    const sendCommand = vi.fn(async (_target: { tabId: number }, method: string) => (
+      method === 'Page.printToPDF' ? {} : {}
+    ))
+    mockChrome({
+      tab: {},
+      debuggerApi: {
+        attach: vi.fn(async () => undefined),
+        detach: vi.fn(async () => undefined),
+        sendCommand,
+        onDetach: { addListener: () => undefined },
+        onEvent: { addListener: () => undefined },
+      },
+    })
+    const answer = await dispatch(call('browser_pdf', {}))
+    expect(answer).toMatchObject({ ok: false, error: { code: 'action-failed' } })
+    expect((answer.error as { message: string }).message).toMatch(/empty PDF/)
+  })
+
+  it('refuses a print above the wire budget', async () => {
+    const oversized = 'A'.repeat(8 * 1024 * 1024 + 4)
+    const sendCommand = vi.fn(async (_target: { tabId: number }, method: string) => (
+      method === 'Page.printToPDF' ? { data: oversized } : {}
+    ))
+    mockChrome({
+      tab: {},
+      debuggerApi: {
+        attach: vi.fn(async () => undefined),
+        detach: vi.fn(async () => undefined),
+        sendCommand,
+        onDetach: { addListener: () => undefined },
+        onEvent: { addListener: () => undefined },
+      },
+    })
+    const answer = await dispatch(call('browser_pdf', {}))
+    expect(answer).toMatchObject({ ok: false, error: { code: 'action-failed' } })
+    expect((answer.error as { message: string }).message).toMatch(/wire budget/)
+  })
+
+  it('reports debugger-unavailable without a debugger', async () => {
+    mockChrome({ tab: {} })
+    const answer = await dispatch(call('browser_pdf', {}))
+    expect(answer).toMatchObject({ ok: false, error: { code: 'debugger-unavailable' } })
   })
 })
 

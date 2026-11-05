@@ -91,6 +91,8 @@ npx @deepseek-ai/dsh@0.2.0-rc.2 web
 | `browser_batch` | 顺序执行最多 25 个工具调用，首个失败即停。 |
 | `browser_scroll` / `browser_navigate` / `browser_open_tab` / `browser_back` / `browser_forward` / `browser_reload` | 页面移动。 |
 | `browser_resize` | 调整承载受控标签页的窗口尺寸。 |
+| `browser_viewport` | 通过调试器在受控标签页上模拟设备视口（宽高、可选设备缩放，`mobile` 默认 false）。它不是窗口缩放：页面按模拟尺寸布局，覆盖随调试会话结束（空闲 60 秒 detach）失效，`reset` 立即撤销。 |
+| `browser_pdf` | 把受控标签页打印为 PDF，写入 `<artifactRoot>/<sessionId>/pdf/` 并返回路径。需要调试器；默认遵循页面自身的 `@page` 尺寸并渲染 CSS 背景。 |
 | `browser_get_text` / `browser_wait` | 读区域文本 / 稳定检测。 |
 
 0.1.0 新增的工具需要扩展 0.3.0：对旧扩展调用时会返回明确的「请 reload 或更新扩展」结果，而不是原始 `Unknown action` 错误；原有 15 个工具行为保持不变。
@@ -110,7 +112,7 @@ npx @deepseek-ai/dsh@0.2.0-rc.2 web
 ## 已知限制与后续工作
 
 - 仅一个活动扩展连接（第二个窗口顶替第一个）。
-- `browser_screenshot` 把文件写到 `<artifactRoot>/<sessionId>/screenshots/`；没有配置 artifact 根时工具会明确报告没有可用目录。图像以路径返回、不返回内联图片块，模型需用 `read_image` 读回。`scale` 只接受 1/2/3；小于 1 的取值（此前 0.1–1 区间）会作为非法参数报错。
+- `browser_screenshot` 把文件写到 `<artifactRoot>/<sessionId>/screenshots/`，`browser_pdf` 写到同级的 `pdf/` 目录（同一 artifact 根与同一清理策略；扩展侧单次打印的 base64 上限为 8 MiB，宿主再按解码后字节拒绝超过 8 MiB 的载荷，不拆分）；没有配置 artifact 根时工具会明确报告没有可用目录。图像以路径返回、不返回内联图片块，模型需用 `read_image` 读回。`scale` 只接受 1/2/3；小于 1 的取值（此前 0.1–1 区间）会作为非法参数报错。
 - `browser_console` 与 `browser_network` 只从首次在某个标签页调用时开始采集；缓冲只在内存，主框架文档被替换（刷新或跨文档导航）时清空，同一文档内的 hash、query 与 SPA 变化则保留，标签页关闭即丢弃。
 - `browser_evaluate` 与 `browser_upload_file` 属状态变更类工具，走扩展的审批流程；`browser_evaluate` 在页面主世界执行，受保护页面不可用。
 - `browser_hover`、`browser_drag` 以及带 `button`/`count`/`modifiers` 的 `browser_click`，在扩展对受控标签页持有调试会话时发送真实输入事件，否则退化为合成 DOM 事件并在结果中说明。
