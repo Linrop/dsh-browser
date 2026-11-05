@@ -75,6 +75,10 @@ Frames are JSON objects discriminated by `t`, defined in [`protocol.ts`](src/pro
 
 Each `respond` carries a globally unique transport id as well as the host interaction's `rpcId`. The extension routes its receipt only to the panel that initiated it and rejects pending responses on timeout, panel closure, or bridge disconnection.
 
+## Panel RPCs beyond the tool surface
+
+The side panel reaches a small Host surface through the same bridge: `session.*`, `settings.*`, `credentials.*`, `llm.discoverModels`, `speech.catalog`, `speech.transcribe`, and — for the composer's `/` menu — `commands.list` (catalogue for one session) and `commands.execute` (one slash line; `submittedAttachments` is empty unless the panel supplies an array). The bridge validates the session id and the Host's own slash-line grammar, then forwards to the Host's `commands` namespace, so command semantics stay the Host's. The catalogue needs a materialized agent, so a restored session lists commands after its first prompt.
+
 ## Tools
 
 | Tool | Purpose |

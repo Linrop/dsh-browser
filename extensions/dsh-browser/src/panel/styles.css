@@ -3377,3 +3377,74 @@ textarea:focus-visible {
   color: var(--muted);
   font-size: calc(10.5px * var(--ui-scale));
 }
+
+/* `/` command menu: floats above the composer card, with the Web GUI's
+   heading-plus-row rhythm. It is a sibling of the card (not a child) because
+   the card clips its own overflow. */
+.composer {
+  position: relative;
+}
+
+.command-menu {
+  position: absolute;
+  z-index: 40;
+  right: 8px;
+  bottom: calc(100% + 4px);
+  left: 8px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  max-height: min(280px, 50vh);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: inset 0 0 0 1px var(--inset-line), var(--shadow-soft);
+}
+
+.command-menu-heading {
+  flex: 0 0 auto;
+  padding: 8px 12px 4px;
+  color: var(--text-muted);
+  font-size: calc(12px * var(--ui-scale));
+  line-height: 1.4;
+}
+
+.command-menu-rows {
+  overflow-y: auto;
+  padding-bottom: 6px;
+}
+
+.command-menu-row {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.command-menu-row[data-active="true"] {
+  background: color-mix(in srgb, var(--blue) 18%, transparent);
+}
+
+.command-menu-label {
+  font-size: calc(13px * var(--ui-scale));
+}
+
+.command-menu-name {
+  color: var(--text-muted);
+  font-size: calc(12px * var(--ui-scale));
+}
+
+.command-menu-description {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: calc(12px * var(--ui-scale));
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

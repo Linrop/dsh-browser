@@ -23,6 +23,15 @@ import { PANEL_COPY, type PanelCopy } from './strings.ts'
 import type { LiveViewFrame, LiveViewState } from '../background/live-view.ts'
 import { isNewerLiveFrame, LiveViewPanel, LiveViewToggle } from './LiveView.tsx'
 import { PlusMenu } from './PlusMenu.tsx'
+import { COMMAND_MENU_ID, CommandMenu, optionId, type CommandMenuRow } from './CommandMenu.tsx'
+import {
+  commandLabel,
+  commandQuery,
+  filterCommands,
+  parseCommandCatalog,
+  parseCommandLine,
+  type CommandDescriptor,
+} from './commands.ts'
 import { VoiceInputButton } from './VoiceInputButton.tsx'
 import { mergeTranscript } from './voice-input.ts'
 import { addQueuedEcho, pruneQueuedEchoes, type QueuedEcho } from './queued-echo.ts'
@@ -86,6 +95,16 @@ import {
   type SessionEventView,
 } from './events.ts'
 
+
+/** Error text of a command execution that finished unsuccessfully, if any. */
+function commandResultText(execution: unknown): string | undefined {
+  if (typeof execution !== 'object' || execution === null) return undefined
+  const result = (execution as { result?: unknown }).result
+  if (typeof result !== 'object' || result === null) return undefined
+  if ((result as { kind?: unknown }).kind !== 'error') return undefined
+  const text = (result as { text?: unknown }).text
+  return typeof text === 'string' && text.trim() !== '' ? text : undefined
+}
 
 /** One selectable entry from `session.models` for the composer chip list. */
 interface SessionModelOption {
@@ -451,6 +470,14 @@ export function App(): React.JSX.Element {
   const draftImages = draft.images
   const [selection, setSelection] = useState<PageSelection | null>(null)
   const [imageLimits, setImageLimits] = useState<ImageAttachmentLimits | null>(null)
+  // Host command catalogue for the `/` menu, cached per session.
+  const [commandCatalog, setCommandCatalog] = useState<CommandDescriptor[]>([])
+  const [commandCatalogSession, setCommandCatalogSession] = useState<string | null>(null)
+  const [commandActive, setCommandActive] = useState(0)
+  /** Draft text whose menu the user dismissed with Escape. */
+  const commandDismissedRef = useRef<string | null>(null)
+  /** Session whose catalogue request is in flight, so typing cannot fan out. */
+  const commandLoadingRef = useRef<string | null>(null)
   const [addingImages, setAddingImages] = useState(false)
   const [busy, setBusy] = useState(false)
   const [working, setWorking] = useState(false)
@@ -562,6 +589,55 @@ export function App(): React.JSX.Element {
     sessionChanging,
     sessionRef.current,
   )
+  const commandTyping = commandQuery(input)
+  const commandRows: CommandMenuRow[] = commandTyping === undefined || !sessionReady || busy
+    ? []
+    : filterCommands(commandCatalog, commandTyping).map((entry) => ({
+      name: entry.name,
+      label: commandLabel(entry.name, locale),
+      description: entry.description,
+    }))
+  const commandMenuOpen = commandRows.length > 0 && commandDismissedRef.current !== input
+
+  // Fetch the catalogue once per session, as soon as a slash line is typed.
+  // It must not depend on the menu being open: rows need the catalogue, and the
+  // menu needs rows, so gating the fetch on the menu deadlocks the first open.
+  useEffect(() => {
+    if (commandTyping === undefined || !sessionReady) return
+    const id = sessionRef.current
+    if (id === null || id === commandCatalogSession || commandLoadingRef.current === id) return
+    commandLoadingRef.current = id
+    let alive = true
+    void api.rpc<unknown>('commands.list', { sessionId: id })
+      .then((value) => {
+        if (!alive) return
+        setCommandCatalog(parseCommandCatalog(value))
+        setCommandCatalogSession(id)
+      })
+      .catch(() => {
+        // A Host without the commands remote, or a session whose agent is not
+        // materialized yet, leaves the composer as plain text. Leave the
+        // catalogue uncached so a later open retries after the first prompt.
+        if (!alive) return
+        setCommandCatalog([])
+      })
+      .finally(() => {
+        if (commandLoadingRef.current === id) commandLoadingRef.current = null
+      })
+    return () => { alive = false }
+  }, [api, commandTyping, sessionReady, commandCatalogSession])
+
+  useEffect(() => {
+    setCommandActive((current) => (current >= commandRows.length ? 0 : current))
+  }, [commandRows.length])
+
+  /** Complete the draft with one command name and keep the caret in the box. */
+  function pickCommand(row: CommandMenuRow): void {
+    setDraft((current) => ({ ...current, text: `/${row.name} ` }))
+    setCommandActive(0)
+    commandDismissedRef.current = null
+    requestAnimationFrame(() => textareaRef.current?.focus())
+  }
 
   function replaceQuestions(next: PendingQuestion[]): void {
     questionsRef.current = next
@@ -1349,6 +1425,11 @@ export function App(): React.JSX.Element {
       void api.clearSelection().catch(() => {})
     }
     setImageLimits(null)
+    // The command catalogue belongs to one conversation; keep it from routing a
+    // slash line typed in the next one before that catalogue is loaded.
+    setCommandCatalog([])
+    setCommandCatalogSession(null)
+    setCommandActive(0)
     imageProjectionRef.current = { sessionId: null, seq: Number.NEGATIVE_INFINITY, limits: null }
     setWorking(nextWorking)
     setStopping(false)
@@ -1405,6 +1486,30 @@ export function App(): React.JSX.Element {
     setError(null)
     // 不渲染乐观行：live user/message 事件即时回显，避免同一消息出现两行。
     try {
+      const command = parseCommandLine(text)
+      if (command !== undefined
+        && submittedImages.length === 0
+        && submittedSelection === null
+        && commandCatalogSession === id
+        && commandCatalog.some((entry) => entry.name === command.name)) {
+        const executed = await api.rpc<{ execution?: unknown }>('commands.execute', { sessionId: id, line: text })
+        // `execution: null` means the Host did not claim the line; it then goes
+        // down the ordinary prompt path so an unknown slash stays plain text.
+        if (executed?.execution !== null && executed?.execution !== undefined) {
+          // A command ends no turn of its own: restore the turn state the panel
+          // had before this submit instead of pretending the turn stopped.
+          setWorking(echoedWhileBusy)
+          const failure = commandResultText(executed.execution)
+          if (failure !== undefined) {
+            setError(failure)
+            // Keep the draft so the user can retry or fix the arguments.
+            if (textOverride === undefined) {
+              setDraft((current) => restoreSubmittedDraft(current, submittedDraft))
+            }
+          }
+          return
+        }
+      }
       const clientTimeZone = browserTimeZone()
       await api.rpc('session.prompt', {
         sessionId: id,
@@ -1714,6 +1819,19 @@ export function App(): React.JSX.Element {
         </div>
       )}
       <footer className="composer">
+        {commandMenuOpen && (
+          <CommandMenu
+            heading={copy.app.commandMenuHeading}
+            label={copy.app.commandMenuLabel}
+            rows={commandRows}
+            activeIndex={commandActive}
+            onPick={(index) => {
+              const row = commandRows[index]
+              if (row !== undefined) pickCommand(row)
+            }}
+            onHover={setCommandActive}
+          />
+        )}
         <div className="composer-box">
           {selection !== null && (
             <SelectionQuote
@@ -1749,9 +1867,35 @@ export function App(): React.JSX.Element {
             ref={textareaRef}
             value={input}
             onChange={(e) => {
+              // Any edit re-opens a menu the user dismissed with Escape.
+              commandDismissedRef.current = null
               if (!sendingRef.current) setDraft((current) => ({ ...current, text: e.target.value }))
             }}
             onKeyDown={(e) => {
+              if (commandMenuOpen) {
+                if (e.key === 'ArrowDown') {
+                  e.preventDefault()
+                  setCommandActive((current) => (current + 1) % commandRows.length)
+                  return
+                }
+                if (e.key === 'ArrowUp') {
+                  e.preventDefault()
+                  setCommandActive((current) => (current - 1 + commandRows.length) % commandRows.length)
+                  return
+                }
+                if (e.key === 'Escape') {
+                  e.preventDefault()
+                  commandDismissedRef.current = input
+                  return
+                }
+                if ((e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing)
+                  || (e.key === 'Tab' && !e.nativeEvent.isComposing)) {
+                  e.preventDefault()
+                  const row = commandRows[commandActive] ?? commandRows[0]
+                  if (row !== undefined) pickCommand(row)
+                  return
+                }
+              }
               // isComposing：输入法组词中的回车是确认选字，不是发送。
               if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault()
@@ -1768,6 +1912,13 @@ export function App(): React.JSX.Element {
             placeholder={state === 'connected' ? copy.app.connectedPlaceholder : copy.app.disconnectedPlaceholder}
             disabled={!sessionReady || busy}
             rows={2}
+            role={commandMenuOpen ? 'combobox' : undefined}
+            aria-haspopup={commandMenuOpen ? 'listbox' : undefined}
+            aria-expanded={commandMenuOpen}
+            aria-controls={commandMenuOpen ? COMMAND_MENU_ID : undefined}
+            aria-activedescendant={commandMenuOpen && commandRows[commandActive] !== undefined
+              ? optionId(commandRows[commandActive]!.name)
+              : undefined}
           />
           <div className="composer-actions">
             <span className="composer-actions-start">

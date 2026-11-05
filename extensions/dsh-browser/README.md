@@ -37,6 +37,7 @@ The **browser-operation end** of dsh: the model reads and operates the browser p
 | Batch | `browser_batch` | Sequential tool calls with stop-on-first-error |
 | Chat with images | `session.prompt` / `session.attachment` | Host-gated image selection, image-only sends, and durable history previews |
 | Quote what you highlight | side panel composer | The text you select in the page becomes a quote in the composer and rides along with your next message |
+| Slash commands | side panel composer | Typing `/` lists the Host's command catalogue (goal, plan, feedback, compact, …) with localized labels; picking one completes the draft and Enter runs it through the Host's own command service (image and quote attachments bypass the command path and send a normal message); a failed command shows its error text, while a successful one leaves no extra row because its effect on the session is what the conversation already shows |
 
 ## Architecture
 

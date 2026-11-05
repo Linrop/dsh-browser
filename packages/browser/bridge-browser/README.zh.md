@@ -75,6 +75,10 @@ npx @deepseek-ai/dsh@0.2.0-rc.2 web
 
 每个 `respond` 同时携带全局唯一的传输 id 与宿主交互的 `rpcId`。扩展只把回执路由给发起操作的面板，并在超时、面板关闭或桥断线时拒绝尚未完成的响应。
 
+## 面板自有的 Host RPC
+
+侧栏经同一座桥访问一小片 Host 能力：`session.*`、`settings.*`、`credentials.*`、`llm.discoverModels`、`speech.catalog`、`speech.transcribe`，以及输入框 `/` 菜单用的 `commands.list`（单个会话的指令目录）与 `commands.execute`（一条斜杠指令；`submittedAttachments` 仅在面板显式提供数组时非空）。桥校验会话 id 与 Host 自身的斜杠语法，随后转给 Host 的 `commands` 命名空间，指令语义仍由 Host 决定。指令目录需要 Agent 已物化，因此恢复但尚未发过消息的会话会在首条消息之后才列出指令。
+
 ## 工具
 
 | 工具 | 用途 |

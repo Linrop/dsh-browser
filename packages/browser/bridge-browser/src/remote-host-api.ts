@@ -739,6 +739,38 @@ function invokeTarget(call: HostRpcCall): InvokeTarget | { readonly error: HostR
         adapt: value => ({ models: value }),
       }
     }
+    case 'commands.list': {
+      const sessionId = sessionIdOf(call.payload)
+      if (sessionId === undefined) return { error: badRequestFailure('commands.list requires a sessionId') }
+      return {
+        namespace: 'commands',
+        method: 'list',
+        args: { agentId: sessionId },
+        adapt: value => ({ commands: value }),
+      }
+    }
+    case 'commands.execute': {
+      const sessionId = sessionIdOf(call.payload)
+      if (sessionId === undefined) return { error: badRequestFailure('commands.execute requires a sessionId') }
+      const line = call.payload.line
+      // Mirror the Host's own command-line grammar exactly (it delimits with
+      // [\t\n\r ] rather than \s): a leading slash, then a lowercase name token,
+      // so the bridge never forwards a line the Host would decline as unparsed.
+      if (typeof line !== 'string' || !/^\/[a-z][a-z0-9_-]*(?=$|[\t\n\r ])/u.test(line)) {
+        return { error: badRequestFailure('commands.execute requires a slash command line such as /compact') }
+      }
+      const attachments = call.payload.attachments
+      return {
+        namespace: 'commands',
+        method: 'execute',
+        args: {
+          agentId: sessionId,
+          line,
+          submittedAttachments: Array.isArray(attachments) ? attachments : [],
+        },
+        adapt: value => ({ execution: value ?? null }),
+      }
+    }
     case 'speech.catalog':
       return { namespace: 'speech', method: 'catalog', args: {} }
     case 'speech.transcribe':

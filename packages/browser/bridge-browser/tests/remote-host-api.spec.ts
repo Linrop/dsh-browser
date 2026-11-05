@@ -52,6 +52,117 @@ function harness(options: {
   return { api: createRemoteHostApi(gateway, connection), invoke, open, fetch, requestBodies, peer }
 }
 
+describe('command RPCs', () => {
+  it('lists the session catalogue under the commands namespace', async () => {
+    const descriptors = [{ name: 'compact', description: 'Compact the conversation' }]
+    const { api, invoke } = harness({ invoke: async () => descriptors })
+    const result = await api.call({
+      rpcId: 'c1',
+      method: 'commands.list',
+      payload: { sessionId: 'session-1' },
+      signal: new AbortController().signal,
+    })
+    expect(result).toEqual({ ok: true, value: { commands: descriptors } })
+    expect(invoke).toHaveBeenCalledWith(expect.objectContaining({
+      namespace: 'commands',
+      method: 'list',
+      args: { agentId: 'session-1' },
+    }))
+  })
+
+  it('executes one slash line with an empty attachment list by default', async () => {
+    const execution = { commandId: 'cmd-1', name: 'compact' }
+    const { api, invoke } = harness({ invoke: async () => execution })
+    const result = await api.call({
+      rpcId: 'c2',
+      method: 'commands.execute',
+      payload: { sessionId: 'session-1', line: '/compact' },
+      signal: new AbortController().signal,
+    })
+    expect(result).toEqual({ ok: true, value: { execution } })
+    expect(invoke).toHaveBeenCalledWith(expect.objectContaining({
+      namespace: 'commands',
+      method: 'execute',
+      args: { agentId: 'session-1', line: '/compact', submittedAttachments: [] },
+    }))
+  })
+
+  it('treats an unclaimed line as a null execution', async () => {
+    const { api } = harness({ invoke: async () => undefined })
+    const unclaimed = await api.call({
+      rpcId: 'c3',
+      method: 'commands.execute',
+      payload: { sessionId: 'session-1', line: '/unknown' },
+      signal: new AbortController().signal,
+    })
+    expect(unclaimed).toEqual({ ok: true, value: { execution: null } })
+  })
+
+  it('refuses lines the Host grammar would not parse, without calling it', async () => {
+    const { api, invoke } = harness({ invoke: async () => ({}) })
+    for (const line of ['plain text', '/ ', '/Compact', ' /compact', '/', '/compact\u3000x', '/compact\u00a0']) {
+      const refused = await api.call({
+        rpcId: 'c4',
+        method: 'commands.execute',
+        payload: { sessionId: 'session-1', line },
+        signal: new AbortController().signal,
+      })
+      expect(refused).toMatchObject({ ok: false, error: { code: 'bad-request' } })
+    }
+    expect(invoke).not.toHaveBeenCalled()
+  })
+
+  it('requires a session on both methods and forwards an explicit attachment list', async () => {
+    const { api, invoke } = harness({ invoke: async () => [] })
+    for (const method of ['commands.list', 'commands.execute']) {
+      const refused = await api.call({
+        rpcId: 'c5',
+        method,
+        payload: { line: '/compact' },
+        signal: new AbortController().signal,
+      })
+      expect(refused).toMatchObject({ ok: false, error: { code: 'bad-request' } })
+    }
+    expect(invoke).not.toHaveBeenCalled()
+
+    const attachments = [{ name: 'a.txt', mimeType: 'text/plain', dataBase64: 'AAAA' }]
+    await api.call({
+      rpcId: 'c6',
+      method: 'commands.execute',
+      payload: { sessionId: 'session-1', line: '/export', attachments },
+      signal: new AbortController().signal,
+    })
+    expect(invoke).toHaveBeenCalledWith(expect.objectContaining({
+      args: { agentId: 'session-1', line: '/export', submittedAttachments: attachments },
+    }))
+
+    // A non-array attachment value degrades to the empty list instead of failing.
+    await api.call({
+      rpcId: 'c8',
+      method: 'commands.execute',
+      payload: { sessionId: 'session-1', line: '/export', attachments: 'nope' },
+      signal: new AbortController().signal,
+    })
+    expect(invoke).toHaveBeenLastCalledWith(expect.objectContaining({
+      args: { agentId: 'session-1', line: '/export', submittedAttachments: [] },
+    }))
+  })
+
+  it('maps a Host failure onto the bridge error result', async () => {
+    const { api } = harness({
+      invoke: async () => { throw Object.assign(new Error('agent is not materialized'), { code: 'lookup-not-found' }) },
+    })
+    const result = await api.call({
+      rpcId: 'c7',
+      method: 'commands.list',
+      payload: { sessionId: 'session-1' },
+      signal: new AbortController().signal,
+    })
+    expect(result.ok).toBe(false)
+    expect(result).toMatchObject({ error: { message: expect.stringContaining('not materialized') } })
+  })
+})
+
 describe('speech RPCs', () => {
   it('reads the recognition catalog without a request payload', async () => {
     const { api, invoke } = harness({ invoke: async () => ({ providers: [], maxAudioBytes: 1024 }) })
