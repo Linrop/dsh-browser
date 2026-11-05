@@ -904,24 +904,27 @@ async function labelWorkTabGroup(tabId: number): Promise<void> {
  * The title is the only marker that survives a service-worker restart, so the
  * release covers both the tabs this worker grouped and every member of a group
  * carrying this extension's title. A tab the user dragged into that group leaves
- * with it: the group itself only exists because this extension made it.
+ * with it: the group itself only exists because this extension made it. A tab
+ * this extension adopted from a user-named group keeps that group, matching
+ * `labelWorkTabGroup`'s own rule that a user's group is never restyled.
  */
 async function clearIdleTabGroups(ownedTabIds: Iterable<number> = []): Promise<void> {
   const groups = chrome.tabGroups as typeof chrome.tabGroups | undefined
+  const tabsApi = chrome.tabs as typeof chrome.tabs & { ungroup?: (tabIds: number[]) => Promise<void> }
   // Tabs this extension operated belong to its own groups; a group left behind
   // by an older build carries no title, so ownership is what identifies it.
-  const release = new Set<number>([...groupedTabIds, ...ownedTabIds])
+  const candidates = new Set<number>([...groupedTabIds, ...ownedTabIds])
+  const ownGroupIds = new Set<number>()
   groupedTabIds.clear()
   labelledTabGroups.clear()
-  const tabsApi = chrome.tabs as typeof chrome.tabs & { ungroup?: (tabIds: number[]) => Promise<void> }
-  if (groups === undefined || typeof groups.query !== 'function') return
+  if (groups === undefined || typeof groups.query !== 'function' || typeof tabsApi.ungroup !== 'function') return
   try {
-    const windows = await chrome.windows.getAll()
-    for (const window of windows) {
+    for (const window of await chrome.windows.getAll()) {
       if (window.id === undefined) continue
       for (const group of await ownGroups(window.id)) {
+        ownGroupIds.add(group.id)
         for (const tab of await chrome.tabs.query({ groupId: group.id })) {
-          if (tab.id !== undefined) release.add(tab.id)
+          if (tab.id !== undefined) candidates.add(tab.id)
         }
       }
     }
@@ -929,15 +932,57 @@ async function clearIdleTabGroups(ownedTabIds: Iterable<number> = []): Promise<v
     // A window that closed mid-enumeration leaves the tracked tabs as the only
     // release candidates; those are still worth freeing.
   }
-  if (release.size === 0 || typeof tabsApi.ungroup !== 'function') return
-  try {
-    await tabsApi.ungroup([...release])
-  } catch {
-    // A closed tab fails the whole call; the next reset retries the survivors.
+  if (candidates.size === 0) return
+  const titles = new Map<number, string>()
+  for (const tabId of candidates) {
+    let groupId: number | undefined
+    try {
+      groupId = (await chrome.tabs.get(tabId)).groupId
+    } catch {
+      continue // the tab closed
+    }
+    if (typeof groupId !== 'number' || groupId < 0) continue
+    const ownedGroup = ownGroupIds.has(groupId)
+    const title = ownedGroup ? undefined : await groupTitle(groups, groupId, titles)
+    // A tab the user moved into a named group keeps that group: only our titled
+    // groups and untitled legacy groups are ours to dissolve.
+    if (!ownedGroup && title !== '') {
+      if (title === undefined) groupedTabIds.add(tabId) // a transient read failure retries later
+      continue
+    }
+    try {
+      // One closed tab must not block the rest, so every release stands alone.
+      await tabsApi.ungroup([tabId])
+    } catch {
+      // A failed release keeps the tab for the next cleanup; a titled group is
+      // re-enumerated by title, and an untitled legacy group has no other marker.
+      groupedTabIds.add(tabId)
+    }
   }
-  // The title is never blanked: Chrome renders an untitled group as a bare
-  // colour chip, which reads as a rendering fault. If the release above did not
-  // run, the window keeps a labelled group instead of a nameless one.
+}
+
+/**
+ * Read one tab-group title, cached for a single cleanup pass.
+ * @param groups - the tab-group API, when the build exposes it.
+ * @param groupId - the group whose title decides ownership.
+ * @param cache - per-pass title memo.
+ * @returns the title, or `undefined` when the build or group cannot answer.
+ */
+async function groupTitle(
+  groups: typeof chrome.tabGroups,
+  groupId: number,
+  cache: Map<number, string>,
+): Promise<string | undefined> {
+  const cached = cache.get(groupId)
+  if (cached !== undefined) return cached
+  if (typeof groups.get !== 'function') return undefined
+  try {
+    const title = (await groups.get(groupId)).title ?? ''
+    cache.set(groupId, title)
+    return title
+  } catch {
+    return undefined // the group is gone
+  }
 }
 
 /**

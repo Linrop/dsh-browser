@@ -137,8 +137,7 @@ Chrome 使用 `sidePanel`，Firefox 使用 `sidebar_action`。两者都申请 `s
 
 - 同时只有一个扩展连接桥。未打开侧栏的浏览器 Profile 不会抢占连接；另一个已打开的侧栏顶替连接后，被替换的一端会主动让权，不再反复重连互踢。
 - 标签页绑定属于整个扩展连接，而不是单个对话会话。
-- 可访问的跨源 iframe 会进入快照，并通过稳定的 `(frame, index)` 地址执行操作；受保护或已销毁的 frame 会标记为不可访问，不影响整页快照。
-- 带 `frame` 参数并按编号寻址的工具是 snapshot、click、type、press、get_text 与 wait；select、hover、drag、upload_file、find 只作用于主框架。
+- 可访问的跨源 iframe 会进入快照，并通过稳定的 `(frame, index)` 地址执行操作；受保护或已销毁的 frame 会标记为不可访问，不影响整页快照。快照始终覆盖全部可访问 frame；其余按编号寻址的工具接受该地址里的可选 `frame`——find、get_text、click、type、press、hover、select、drag、upload_file、scroll 与 wait——缺省作用于顶层页面。
 - 历史前进/后退恢复的页面仍保留 iframe：当 Chrome 的 frame 枚举漏掉 bfcache 文档的子 frame 时，按 frame id 复用该文档上一次的 frame 树。
 - 验证码/纯图片按钮无法处理——工具结果会标注"存在无文本可访问名的元素"，提示用户手动完成该步。
 - 令牌无自动轮换。

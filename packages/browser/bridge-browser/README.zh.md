@@ -115,7 +115,7 @@ npx @deepseek-ai/dsh@0.2.0-rc.2 web
 - `browser_evaluate` 与 `browser_upload_file` 属状态变更类工具，走扩展的审批流程；`browser_evaluate` 在页面主世界执行，受保护页面不可用。
 - `browser_hover`、`browser_drag` 以及带 `button`/`count`/`modifiers` 的 `browser_click`，在扩展对受控标签页持有调试会话时发送真实输入事件，否则退化为合成 DOM 事件并在结果中说明。
 - 侧栏可选的实时画面（默认关闭）把受控标签页的 `Page.startScreencast` JPEG 帧送到面板：帧先 ack 再处理，旧帧按序号丢弃，切换受控标签页或调试器断开即清图。后台标签页、无 debugger 与 Firefox 上的实际停帧时序尚未真机验证。
-- 可访问的跨源 iframe 会进入快照，并通过稳定的 `(frame, index)` 地址执行操作；受保护或已销毁的 frame 会标记为不可访问，不影响整页快照。
+- 可访问的跨源 iframe 会进入快照，并通过稳定的 `(frame, index)` 地址执行操作；受保护或已销毁的 frame 会标记为不可访问，不影响整页快照。快照始终覆盖全部可访问 frame；其余按编号寻址的工具接受该地址里的可选 `frame`——find、get_text、click、type、press、hover、select、drag、upload_file、scroll 与 wait——缺省作用于顶层页面。
 - token 手动轮换（改 `~/.dsh/ext-bridge-token` 或配置 `token`），无过期。
 - Playwright 驱动的扩展 e2e 会在缺少可用的 Chromium 可执行文件或构建完成的扩展包时自行跳过。
 - 审批由扩展 service worker 强制执行，而不是依赖模型自觉。未来接入 dsh 工具管线时可以把同一策略暴露给其它客户端。

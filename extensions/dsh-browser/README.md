@@ -137,7 +137,7 @@ Chrome uses `sidePanel`; Firefox uses `sidebar_action`. Both request `storage` (
 
 - Only one extension connection at a time. An unopened browser profile never claims it; if another open panel replaces a live connection, the replaced client yields instead of starting a reconnect fight.
 - Tab affinity is global to that extension connection rather than per chat session.
-- Accessible cross-origin iframes are snapshotted and operated with stable `(frame, index)` addresses. Restricted or short-lived frames are reported as unavailable without failing the whole page snapshot. The tools that address elements by index and take a `frame` argument are snapshot, click, type, press, get_text and wait; select, hover, drag, upload_file and find act on the top frame only.
+- Accessible cross-origin iframes are snapshotted and operated with stable `(frame, index)` addresses. Restricted or short-lived frames are reported as unavailable without failing the whole page snapshot. A snapshot always covers every accessible frame, while every element-addressed tool takes the optional `frame` from that address — find, get_text, click, type, press, hover, select, drag, upload_file, scroll and wait — defaulting to the top page.
 - A restored history entry keeps its iframes in the snapshot: when Chrome's frame enumeration omits the subframes of a back/forward-cached document, the last frame tree for that document is re-used by frame id.
 - Captcha/image-only controls cannot be handled — the tool result reports "elements with no accessible name" and asks the user to complete that step manually.
 - No automatic token rotation.
