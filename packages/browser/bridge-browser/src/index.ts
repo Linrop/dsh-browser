@@ -18,6 +18,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { mkdir } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-attachment'
@@ -199,6 +200,17 @@ function mountBridge(
     resolved.deferSessionCreate,
     ctx.get('attachments')?.imageLimits,
   )
+  // The configured workspace may live in a purgeable cache directory, and it
+  // backs the cwd of every session this bridge created. Once it disappears those
+  // sessions fail with "directory does not exist" before their first turn, so
+  // recreate it when the plugin loads instead of waiting for the next create.
+  if (resolved.sessionWorkspacePath !== '') {
+    void mkdir(resolved.sessionWorkspacePath, { recursive: true }).catch((error: unknown) => {
+      ctx.logger.warn(
+        `browser bridge: could not create session workspace "${resolved.sessionWorkspacePath}": ${String(error)}`,
+      )
+    })
+  }
   const browserContext = new BrowserContextInjector(ctx.agents)
   // DSH 0.1.7+ replaced `agent/session-start` with `agent/created` as the
   // startup-driving extension point (agent registered with live session and

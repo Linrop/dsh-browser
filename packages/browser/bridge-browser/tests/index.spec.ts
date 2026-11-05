@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -161,6 +161,18 @@ describe('apply', () => {
       try { await readFile(artifact); return false } catch { return true }
     })
     expect(removed).toBe(true)
+  })
+
+  it('recreates a session workspace that a cache purge removed', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'dsh-bridge-workspace-parent-'))
+    dirs.push(parent)
+    // The configured directory does not exist yet, exactly as after a cache wipe.
+    const workspace = join(parent, 'dsh-browser-sessions')
+    await apply(stubContext(), { token: 'fixed-token', ...VALID, sessionWorkspacePath: workspace })
+    const rebuilt = await waitFor(async () => {
+      try { return (await stat(workspace)).isDirectory() } catch { return false }
+    })
+    expect(rebuilt).toBe(true)
   })
 
   it('leaves Remote event source ownership to the host composition', async () => {
