@@ -2057,7 +2057,9 @@ textarea:focus-visible {
   position: fixed;
   z-index: 40;
   display: flex;
+  overflow-y: auto;
   width: 240px;
+  max-height: min(58vh, 420px);
   flex-direction: column;
   gap: 2px;
   padding: 4px;
@@ -2069,6 +2071,40 @@ textarea:focus-visible {
 
 .plus-menu:focus {
   outline: none;
+}
+
+/*
+ * The composer's action-button rules are descendant selectors, so they also
+ * matched every row button inside this menu (34px solid-blue circles with white
+ * text, overlapping each other). Reset them at the same specificity, placed
+ * after those rules so source order decides; the row rules below then refine.
+ */
+.plus-menu button {
+  display: block;
+  width: 100%;
+  height: auto;
+  flex: 0 1 auto;
+  padding: 9px 10px;
+  place-items: normal;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+  transform: none;
+}
+
+.plus-menu button:hover:not(:disabled),
+.plus-menu button:focus-visible {
+  background: var(--blue-wash);
+  color: var(--blue-ink);
+  outline: none;
+}
+
+.plus-menu button:disabled {
+  background: transparent;
+  color: var(--faint);
+  cursor: default;
 }
 
 .plus-menu-item {
@@ -2107,24 +2143,37 @@ textarea:focus-visible {
 
 .plus-menu-item.plus-menu-command {
   display: grid;
-  grid-template-columns: auto auto 1fr;
-  align-items: baseline;
-  gap: 8px;
+  grid-template-areas:
+    'label name'
+    'description description';
+  grid-template-columns: auto auto;
+  justify-content: start;
+  column-gap: 6px;
+  row-gap: 2px;
 }
 
 .plus-menu-command-label {
+  grid-area: label;
   font-size: calc(12px * var(--ui-scale));
   font-weight: 560;
 }
 
-.plus-menu-command-name,
-.plus-menu-command-description {
-  overflow: hidden;
+.plus-menu-command-name {
+  grid-area: name;
   color: var(--muted);
   font-size: calc(10.5px * var(--ui-scale));
   font-weight: 400;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+}
+
+/* The menu is 240px wide, so the summary wraps under the label instead of
+   being truncated to an ellipsis nobody can read. */
+.plus-menu-command-description {
+  grid-area: description;
+  color: var(--muted);
+  font-size: calc(10.5px * var(--ui-scale));
+  font-weight: 400;
+  line-height: 1.35;
+  white-space: normal;
 }
 
 .plus-menu-reason,

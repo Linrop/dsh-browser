@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import type { CommandMenuRow } from './CommandMenu.tsx'
+import { showsName, type CommandMenuRow } from './CommandMenu.tsx'
 
 /**
  * Composer "add" entry: a round plus button that opens an upward menu, matching
@@ -217,7 +217,7 @@ export function PlusMenu({
                   }}
                 >
                   <span className="plus-menu-command-label">{row.label}</span>
-                  <span className="plus-menu-command-name">{row.name}</span>
+                  {showsName(row) && <span className="plus-menu-command-name">{row.name}</span>}
                   <span className="plus-menu-command-description">{row.description}</span>
                 </button>
               ))}

@@ -49,6 +49,16 @@ export function optionId(name: string): string {
   return `command-option-${name}`
 }
 
+/**
+ * Whether a row's raw name adds information next to its localized label.
+ *
+ * English labels are the command names, so showing both would render "goal
+ * goal"; only a localized label needs the name beside it.
+ */
+export function showsName(row: { label: string; name: string }): boolean {
+  return row.label.toLowerCase() !== row.name.toLowerCase()
+}
+
 /** The `/` command list above the composer. */
 export function CommandMenu(props: CommandMenuProps): React.JSX.Element {
   const listRef = useRef<HTMLDivElement | null>(null)
@@ -78,7 +88,7 @@ export function CommandMenu(props: CommandMenuProps): React.JSX.Element {
             onMouseEnter={() => props.onHover(index)}
           >
             <span className="command-menu-label">{row.label}</span>
-            <span className="command-menu-name">{row.name}</span>
+            {showsName(row) && <span className="command-menu-name">{row.name}</span>}
             {row.description === '' ? null : <span className="command-menu-description">{row.description}</span>}
           </button>
         ))}

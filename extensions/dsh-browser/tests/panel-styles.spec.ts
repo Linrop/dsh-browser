@@ -23,6 +23,35 @@ describe('panel stylesheet integrity', () => {
   })
 })
 
+describe('composer popup isolation', () => {
+  // The composer's action buttons are styled through descendant selectors, so a
+  // menu rendered inside that row inherits 34px blue circles unless the menu
+  // resets them at the same specificity, later in the sheet.
+  const styles = readFileSync(`${process.cwd()}/src/panel/styles.css`, 'utf8')
+
+  it('resets the composer action-button rules inside the plus menu', () => {
+    const base = styles.indexOf('.composer-actions button {')
+    const reset = styles.indexOf('.plus-menu button {')
+    expect(base).toBeGreaterThan(-1)
+    expect(reset).toBeGreaterThan(base)
+
+    const body = ruleBody(styles, '.plus-menu button') ?? ''
+    expect(body).toMatch(/(?:^|\n)\s*display:\s*block;/)
+    expect(body).toMatch(/(?:^|\n)\s*width:\s*100%;/)
+    expect(body).toMatch(/(?:^|\n)\s*background:\s*transparent;/)
+    expect(body).toMatch(/(?:^|\n)\s*transform:\s*none;/)
+    expect(body).not.toMatch(/border-radius:\s*999px/)
+  })
+
+  it('wraps a command summary instead of truncating it', () => {
+    const row = ruleBody(styles, '.plus-menu-item.plus-menu-command') ?? ''
+    expect(row).toMatch(/grid-template-areas/)
+    const description = ruleBody(styles, '.plus-menu-command-description') ?? ''
+    expect(description).toMatch(/(?:^|\n)\s*white-space:\s*normal;/)
+    expect(description).not.toMatch(/text-overflow/)
+  })
+})
+
 describe('panel layout styles', () => {
   it('places an upward model menu on its own row under the composer', () => {
     const styles = readFileSync(`${process.cwd()}/src/panel/styles.css`, 'utf8')

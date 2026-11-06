@@ -229,6 +229,17 @@ describe('composer slash commands', () => {
     expect(document.body.textContent).toContain('gateway/invocation-unavailable')
   })
 
+  it('shows the raw name only when it differs from the label', async () => {
+    await startPanel()
+    await type('/')
+    await vi.waitFor(() => { expect(document.querySelector('.command-menu [role="option"]')).not.toBeNull() })
+    const rows = [...document.querySelectorAll('.command-menu [role="option"]')]
+    // The panel runs with the English copy here, so label === name and the name
+    // column must not repeat it.
+    expect(rows[0]?.querySelector('.command-menu-name')).toBeNull()
+    expect(rows[0]?.querySelector('.command-menu-label')?.textContent).toBe('goal')
+  })
+
   it('keeps an unknown slash line as plain text', async () => {
     await startPanel()
     await type('/not-a-command')

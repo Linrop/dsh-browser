@@ -157,6 +157,17 @@ describe('composer plus menu command section', () => {
     expect(rows[0]?.textContent).toContain('Set or view the goal')
   })
 
+  it('does not repeat the name when the label already is the name', () => {
+    render({ commands: [
+      { name: 'goal', label: 'goal', description: 'Set or view the goal' },
+      { name: 'compact', label: '压缩', description: 'Compact' },
+    ] })
+    act(() => { trigger().click() })
+    const rows = [...container.querySelectorAll('.plus-menu-command')]
+    expect(rows[0]?.querySelectorAll('.plus-menu-command-name')).toHaveLength(0)
+    expect(rows[1]?.querySelector('.plus-menu-command-name')?.textContent).toBe('compact')
+  })
+
   it('completes the composer with the picked command and closes', () => {
     render({ commands })
     act(() => { trigger().click() })
